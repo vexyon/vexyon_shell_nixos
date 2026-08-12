@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Vexyon session launcher — the ONE entry point for starting the Hyprland
+# session (used by /usr/share/wayland-sessions/vexyon.desktop via the greeter,
+# and runnable by hand from a TTY).
+# GPU pinning + Wayland/Qt env live in ~/.config/hypr/vexyon-gpu.lua and
+# vexyon-env.lua (required by hyprland.lua), so this wrapper only needs the
+# session-type hints.
+export XDG_CURRENT_DESKTOP=Hyprland
+export XDG_SESSION_TYPE=wayland
+export XDG_SESSION_DESKTOP=Hyprland
+# Make sure a runtime dir exists for a launch outside a DM (bare TTY).
+[ -z "${XDG_RUNTIME_DIR:-}" ] && export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+
+# Hyprland's exec binds run through /bin/sh with THIS process's PATH, and on a
+# minimal install greetd's session env does not include ~/.local/bin — without
+# this, Super+B (`exec, vexyon-open-browser`) finds nothing. Idempotent.
+case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) export PATH="$HOME/.local/bin:$PATH" ;;
+esac
+
+# NixOS: el código vive en el store y en $HOME solo va el estado que el shell
+# reescribe (shell.json, temas, las raíces Lua). vexyon-seed lo siembra si
+# falta — copia-si-no-existe, así que en una sesión ya sembrada no hace nada.
+# En Arch VEXYON_SHARE no está definida e install.sh ya ha desplegado el árbol,
+# de modo que este bloque entero no existe.
+if [ -n "${VEXYON_SHARE:-}" ] && command -v vexyon-seed >/dev/null 2>&1; then
+    vexyon-seed || echo "vexyon-start: vexyon-seed falló — se sigue igualmente" >&2
+fi
+
+# vexyon-gpu-hotplug (udev, hybrid machines only) asks for an in-place
+# compositor restart by touching this flag and SIGTERMing Hyprland: the loop
+# below relaunches it inside the SAME login session, and Hyprland re-reads
+# vexyon-gpu.lua (the new GPU pin) on the way up. No flag -> normal exit
+# (logout) passes through. This is not a poller: the shell sits blocked in
+# wait() on Hyprland the whole time.
+FLAG="$XDG_RUNTIME_DIR/vexyon-gpu-restart"
+rm -f "$FLAG"
+while :; do
+    rc=0
+    # Hyprland >= 0.51 ships the start-hyprland watchdog wrapper and warns
+    # ("highly not recommended") when the Hyprland binary is launched
+    # directly. Go through the wrapper when it exists; it only relaunches on
+    # CRASH (unclean exit), a clean `exit` dispatch passes through, so
+    # session logout still works.
+    if command -v start-hyprland >/dev/null 2>&1; then
+        start-hyprland -- "$@" || rc=$?
+    else
+        Hyprland "$@" || rc=$?
+    fi
+    [ -e "$FLAG" ] || exit "$rc"
+    rm -f "$FLAG"
+done
