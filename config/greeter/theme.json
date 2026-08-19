@@ -1,0 +1,30 @@
+{
+  "id": "crimson-voltage",
+  "name": "Crimson Voltage",
+  "dark": true,
+  "colors": {
+    "base": "#0d0d12",
+    "mantle": "#0a0a0e",
+    "crust": "#070709",
+    "text": "#ececf2",
+    "subtext0": "#9a9aae",
+    "subtext1": "#c4c4d2",
+    "surface0": "#16161e",
+    "surface1": "#20202c",
+    "surface2": "#2c2c3a",
+    "overlay0": "#3a3a4c",
+    "overlay1": "#50505f",
+    "overlay2": "#6e6e82",
+    "accent": "#e11d48",
+    "accent2": "#fb7185",
+    "onAccent": "#ffffff",
+    "red": "#ff5470",
+    "green": "#4ade80",
+    "yellow": "#fbbf24",
+    "blue": "#60a5fa",
+    "peach": "#fb923c",
+    "mauve": "#c084fc",
+    "teal": "#2dd4bf",
+    "pink": "#f472b6"
+  }
+}
