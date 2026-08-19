@@ -1,0 +1,12 @@
+-- ============================================================================
+--  VEXYON — WINDOW & LAYER RULES
+--
+--  Lua API (Hyprland >= 0.55): reglas con tabla nombrada —
+--      hl.layer_rule({ name = "…", match = { namespace = "…" }, <efecto> = <valor> })
+--
+--  El blur de la barra (appearance.barBlur en shell.json) lo emite el BRIDGE
+--  en vexyon-settings.lua: decoration.blur.enabled = true/false + las dos
+--  hl.layer_rule (blur + ignore_alpha) sobre el namespace vexyon-bar.
+--  Los popups usan otros namespaces sin regla => no se desenfocan (spec).
+--  No dupliques esas reglas aquí.
+-- ============================================================================
