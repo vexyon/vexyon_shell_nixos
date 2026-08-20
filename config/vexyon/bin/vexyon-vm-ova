@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""
+vexyon-vm-ova — exporta e importa VMs en formato OVA.
+
+Un .ova es un TAR (sin comprimir) con un descriptor .ovf, opcionalmente un .mf
+con hashes, y los discos, normalmente en VMDK. No es un formato nativo de
+libvirt, así que la conversión es explícita y NO es fiel al 100 % — lo que no
+se puede trasladar se avisa por stderr en vez de perderse en silencio.
+
+Solo usa `tar` y `xml.etree` de la biblioteca ESTÁNDAR de python3 (que ya es
+dependencia del shell) más `qemu-img`, que viene con QEMU: el mismo paquete que
+hace falta para tener VMs. Nada de virt-v2v (arrastra media distro) ni de
+virt-manager.
+
+    export <dominio.xml> <disco.qcow2> <salida.ova> [tmpdir]
+    inspect <entrada.ova>
+    import  <entrada.ova> <nombre> <dir-destino>
+"""
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import xml.etree.ElementTree as ET
+
+OVF_NS = "http://schemas.dmtf.org/ovf/envelope/1"
+RASD = ("http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/"
+        "CIM_ResourceAllocationSettingData")
+VSSD = ("http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/"
+        "CIM_VirtualSystemSettingData")
+XSI = "http://www.w3.org/2001/XMLSchema-instance"
+
+
+def die(msg):
+    sys.stderr.write("%s\n" % msg)
+    raise SystemExit(1)
+
+
+def warn(msg):
+    sys.stderr.write("@@WARN %s\n" % msg)
+
+
+def run(cmd):
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        die("%s failed: %s" % (cmd[0], (p.stderr or p.stdout).strip()))
+    return p.stdout
+
+
+def qemu_img():
+    for c in ("qemu-img",):
+        if shutil.which(c):
+            return c
+    die("qemu-img not found — it ships with QEMU, which a VM host needs anyway")
+
+
+# ---------------------------------------------------------------------------
+# exportar
+# ---------------------------------------------------------------------------
+
+def domain_facts(dom_xml_path):
+    root = ET.parse(dom_xml_path).getroot()
+    name = (root.findtext("name") or "vm").strip()
+    mem_el = root.find("memory")
+    mem_mib = 1024
+    if mem_el is not None:
+        try:
+            v = int((mem_el.text or "0").strip())
+            unit = (mem_el.get("unit") or "KiB").lower()
+            mem_mib = {"kib": v // 1024, "mib": v, "gib": v * 1024,
+                       "b": v // (1024 * 1024)}.get(unit, v // 1024)
+        except ValueError:
+            pass
+    try:
+        vcpus = int((root.findtext("vcpu") or "1").strip())
+    except ValueError:
+        vcpus = 1
+    desc = (root.findtext("description") or "").strip()
+    osn = root.find("os")
+    firmware = (osn.get("firmware") if osn is not None else "") or "bios"
+    return name, mem_mib, vcpus, desc, firmware
+
+
+def build_ovf(name, mem_mib, vcpus, disk_file, disk_bytes, desc):
+    ET.register_namespace("ovf", OVF_NS)
+    ET.register_namespace("rasd", RASD)
+    ET.register_namespace("vssd", VSSD)
+    ET.register_namespace("xsi", XSI)
+    q = lambda t: "{%s}%s" % (OVF_NS, t)
+    r = lambda t: "{%s}%s" % (RASD, t)
+    v = lambda t: "{%s}%s" % (VSSD, t)
+
+    env = ET.Element(q("Envelope"), {q("version"): "1.0",
+                                     "xml:lang": "en-US"})
+
+    refs = ET.SubElement(env, q("References"))
+    ET.SubElement(refs, q("File"), {q("href"): disk_file,
+                                    q("id"): "file1",
+                                    q("size"): str(disk_bytes)})
+
+    dsec = ET.SubElement(env, q("DiskSection"))
+    ET.SubElement(dsec, q("Info")).text = "Virtual disk information"
+    ET.SubElement(dsec, q("Disk"), {
+        q("capacity"): str(disk_bytes),
+        q("diskId"): "vmdisk1",
+        q("fileRef"): "file1",
+        q("format"): "http://www.vmware.com/interfaces/specifications/"
+                     "vmdk.html#streamOptimized"})
+
+    nsec = ET.SubElement(env, q("NetworkSection"))
+    ET.SubElement(nsec, q("Info")).text = "The list of logical networks"
+    net = ET.SubElement(nsec, q("Network"), {q("name"): "NAT"})
+    ET.SubElement(net, q("Description")).text = "NAT network"
+
+    vs = ET.SubElement(env, q("VirtualSystem"), {q("id"): name})
+    ET.SubElement(vs, q("Info")).text = "A virtual machine"
+    ET.SubElement(vs, q("Name")).text = name
+    if desc:
+        ET.SubElement(vs, q("Annotation")).text = desc
+
+    osec = ET.SubElement(vs, q("OperatingSystemSection"),
+                         {q("id"): "94", q("osType"): "otherGuest"})
+    ET.SubElement(osec, q("Info")).text = "The kind of installed guest OS"
+
+    vhw = ET.SubElement(vs, q("VirtualHardwareSection"))
+    ET.SubElement(vhw, q("Info")).text = "Virtual hardware requirements"
+    sysel = ET.SubElement(vhw, q("System"))
+    ET.SubElement(sysel, v("ElementName")).text = "Virtual Hardware Family"
+    ET.SubElement(sysel, v("InstanceID")).text = "0"
+    ET.SubElement(sysel, v("VirtualSystemIdentifier")).text = name
+    ET.SubElement(sysel, v("VirtualSystemType")).text = "virtualbox-2.2"
+
+    def item(inst, rtype, name_, qty=None, extra=None):
+        it = ET.SubElement(vhw, q("Item"))
+        ET.SubElement(it, r("ElementName")).text = name_
+        ET.SubElement(it, r("InstanceID")).text = str(inst)
+        ET.SubElement(it, r("ResourceType")).text = str(rtype)
+        if qty is not None:
+            ET.SubElement(it, r("VirtualQuantity")).text = str(qty)
+        for k, val in (extra or {}).items():
+            ET.SubElement(it, r(k)).text = str(val)
+        return it
+
+    item(1, 3, "%d virtual CPU(s)" % vcpus, vcpus)
+    item(2, 4, "%d MB of memory" % mem_mib, mem_mib,
+         {"AllocationUnits": "byte * 2^20"})
+    item(3, 6, "SCSI Controller", None,
+         {"ResourceSubType": "VirtualSCSI"})
+    item(4, 17, "Hard Disk 1", None,
+         {"HostResource": "ovf:/disk/vmdisk1", "Parent": "3",
+          "AddressOnParent": "0"})
+    item(5, 10, "Ethernet adapter on NAT", None,
+         {"Connection": "NAT", "ResourceSubType": "E1000"})
+
+    return ET.tostring(env, encoding="UTF-8", xml_declaration=True)
+
+
+def cmd_export(argv):
+    if len(argv) < 3:
+        die("usage: export <domain.xml> <disk> <out.ova> [tmpdir]")
+    dom_xml, disk, out = argv[0], argv[1], argv[2]
+    tmp = argv[3] if len(argv) > 3 else out + ".tmpdir"
+    name, mem, vcpus, desc, firmware = domain_facts(dom_xml)
+
+    if firmware == "efi":
+        warn("This VM boots with UEFI. VirtualBox/VMware need EFI turned on "
+             "manually after importing, and the NVRAM contents are not carried "
+             "over.")
+
+    os.makedirs(tmp, exist_ok=True)
+    vmdk = os.path.join(tmp, name + "-disk1.vmdk")
+    # streamOptimized es el subformato que VirtualBox y VMware esperan dentro
+    # de un OVA; un vmdk "normal" lo rechazan muchas versiones.
+    run([qemu_img(), "convert", "-p", "-O", "vmdk",
+         "-o", "subformat=streamOptimized", disk, vmdk])
+
+    ovf_bytes = build_ovf(name, mem, vcpus, os.path.basename(vmdk),
+                          os.path.getsize(vmdk), desc)
+    ovf_path = os.path.join(tmp, name + ".ovf")
+    with open(ovf_path, "wb") as f:
+        f.write(ovf_bytes)
+
+    # El ORDEN importa: el .ovf tiene que ir primero en el tar, si no muchos
+    # importadores no encuentran el descriptor.
+    with tarfile.open(out, "w", format=tarfile.GNU_FORMAT) as tf:
+        tf.add(ovf_path, arcname=os.path.basename(ovf_path))
+        tf.add(vmdk, arcname=os.path.basename(vmdk))
+    shutil.rmtree(tmp, ignore_errors=True)
+
+    warn("Snapshots, shared folders, USB assignments and host-specific devices "
+         "are not part of the OVA and were left out.")
+    sys.stdout.write(out + "\n")
+
+
+# ---------------------------------------------------------------------------
+# importar
+# ---------------------------------------------------------------------------
+
+def find_ovf(members):
+    for m in members:
+        if m.lower().endswith(".ovf"):
+            return m
+    return None
+
+
+def parse_ovf(data):
+    root = ET.fromstring(data)
+    q = lambda t: ".//{%s}%s" % (OVF_NS, t)
+    name = None
+    for el in root.iter("{%s}VirtualSystem" % OVF_NS):
+        name = el.get("{%s}id" % OVF_NS)
+        n = el.find("{%s}Name" % OVF_NS)
+        if n is not None and (n.text or "").strip():
+            name = n.text.strip()
+        break
+    mem_mib, vcpus = 1024, 1
+    for it in root.iter("{%s}Item" % OVF_NS):
+        rt = it.findtext("{%s}ResourceType" % RASD)
+        qty = it.findtext("{%s}VirtualQuantity" % RASD)
+        units = (it.findtext("{%s}AllocationUnits" % RASD) or "").lower()
+        if not qty:
+            continue
+        try:
+            qv = int(float(qty))
+        except ValueError:
+            continue
+        if rt == "3":
+            vcpus = max(1, qv)
+        elif rt == "4":
+            if "2^30" in units or "gigabyte" in units:
+                qv *= 1024
+            elif "2^10" in units or "kilobyte" in units:
+                qv //= 1024
+            mem_mib = max(64, qv)
+    disks = []
+    for f in root.iter("{%s}File" % OVF_NS):
+        href = f.get("{%s}href" % OVF_NS)
+        if href:
+            disks.append(href)
+    return name or "imported", mem_mib, vcpus, disks
+
+
+def cmd_inspect(argv):
+    if not argv:
+        die("usage: inspect <in.ova>")
+    with tarfile.open(argv[0], "r") as tf:
+        names = tf.getnames()
+        ovf = find_ovf(names)
+        if not ovf:
+            die("this .ova has no .ovf descriptor inside — it may be corrupt")
+        name, mem, vcpus, disks = parse_ovf(tf.extractfile(ovf).read())
+    sys.stdout.write("name\t%s\nmem\t%s\nvcpus\t%s\n" % (name, mem, vcpus))
+    for d in disks:
+        sys.stdout.write("disk\t%s\n" % d)
+
+
+def cmd_import(argv):
+    if len(argv) < 3:
+        die("usage: import <in.ova> <name> <dest-dir>")
+    ova, want_name, dest = argv[0], argv[1], argv[2]
+    tmp = os.path.join(dest, ".vexyon-ova-tmp")
+    os.makedirs(tmp, exist_ok=True)
+    try:
+        with tarfile.open(ova, "r") as tf:
+            names = tf.getnames()
+            ovf = find_ovf(names)
+            if not ovf:
+                die("this .ova has no .ovf descriptor inside — it may be corrupt")
+            ovf_data = tf.extractfile(ovf).read()
+            name, mem, vcpus, disks = parse_ovf(ovf_data)
+            if not disks:
+                die("the .ovf lists no disks")
+            # Solo se extrae el PRIMER disco: el XML que se genera define una VM
+            # de un disco. Si hay más, se avisa en vez de perderlos callando.
+            if len(disks) > 1:
+                warn("This OVA has %d disks; only the first was imported. "
+                     "Attach the rest by hand if you need them." % len(disks))
+            member = None
+            for m in names:
+                if os.path.basename(m) == os.path.basename(disks[0]):
+                    member = m
+                    break
+            if member is None:
+                die("the disk named in the .ovf is not inside the .ova: %s" % disks[0])
+            # extracción acotada a un solo miembro, a una ruta que elegimos
+            src = os.path.join(tmp, os.path.basename(member))
+            with tf.extractfile(member) as fin, open(src, "wb") as fout:
+                shutil.copyfileobj(fin, fout)
+
+        out_qcow = os.path.join(dest, want_name + ".qcow2")
+        run([qemu_img(), "convert", "-p", "-O", "qcow2", src, out_qcow])
+        warn("Network cards, sound, USB and firmware settings from the OVF are "
+             "approximated: the VM is created with libvirt's usual defaults "
+             "(virtio disk, NAT network, BIOS). Check them before first boot.")
+        sys.stdout.write("name\t%s\nmem\t%s\nvcpus\t%s\ndisk\t%s\n"
+                         % (want_name, mem, vcpus, out_qcow))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+COMMANDS = {"export": cmd_export, "inspect": cmd_inspect, "import": cmd_import}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        die("usage: vexyon-vm-ova <%s> …" % "|".join(sorted(COMMANDS)))
+    COMMANDS[sys.argv[1]](sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()
