@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  Installs /etc/pam.d/vexyon so the lock screen can authenticate.
+#  Needed on machines deployed via rsync (which never touches /etc). Safe to
+#  re-run. Requires sudo once.
+# ============================================================================
+set -euo pipefail
+
+SRC="$HOME/.config/vexyon/pam/vexyon"
+DEST="/etc/pam.d/vexyon"
+
+if [ ! -f "$SRC" ]; then
+  echo "!! Source PAM file missing: $SRC (re-deploy the shell first)" >&2
+  exit 1
+fi
+
+if [ -f "$DEST" ] && cmp -s "$SRC" "$DEST"; then
+  echo ":: $DEST already installed and current."
+  exit 0
+fi
+
+echo ":: Installing $DEST (sudo)..."
+sudo install -Dm644 "$SRC" "$DEST"
+echo ":: Done. The lock screen (Super+L) can now authenticate."

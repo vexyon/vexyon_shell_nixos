@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Open the user's default browser. Honors shell.json behavior.defaultBrowser;
+# "auto" (default) probes for Brave -> Chrome -> Zen -> Firefox -> Chromium.
+set -euo pipefail
+
+CFG="$HOME/.config/vexyon/shell.json"
+pref="auto"
+if command -v jq >/dev/null 2>&1 && [ -f "$CFG" ]; then
+    pref="$(jq -r '.behavior.defaultBrowser // "auto"' "$CFG" 2>/dev/null || echo auto)"
+fi
+
+launch() { command -v "$1" >/dev/null 2>&1 && exec "$1" "$@"; }
+
+if [ "$pref" != "auto" ] && [ -n "$pref" ]; then
+    if command -v "$pref" >/dev/null 2>&1; then exec "$pref"; fi
+fi
+
+for b in brave brave-browser google-chrome-stable google-chrome chromium \
+         zen-browser zen firefox-developer-edition firefox; do
+    if command -v "$b" >/dev/null 2>&1; then exec "$b"; fi
+done
+
+# Last resort: xdg-open a blank page.
+if command -v xdg-open >/dev/null 2>&1; then exec xdg-open "about:blank"; fi
+
+notify-send "Vexyon" "No web browser found" 2>/dev/null || true
+exit 1
