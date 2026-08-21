@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Vexyon — decisión de GPU, COMPARTIDA por install.sh y el handler udev de
+# hotplug (vexyon-gpu-hotplug). Lee sysfs (sin lspci) y decide en qué GPU debe
+# correr el shell DADO el estado actual de conectores. Sin estado, sin daemon:
+# se ejecuta, imprime y muere.
+#
+#   vexyon-gpu-detect env    # variables VEXYON_GPU_* eval-ables (install.sh)
+#   vexyon-gpu-detect lua    # contenido de vexyon-gpu.lua por stdout
+#   vexyon-gpu-detect is-igpu cardN   # exit 0 SOLO si cardN es la iGPU electa
+#
+# `is-igpu` existe para que la regla udev del symlink no tenga que llevar el
+# slot PCI horneado dentro (lo que hace install.sh en Arch). Una regla estática
+#   PROGRAM="vexyon-gpu-detect is-igpu %k", SYMLINK+="dri/vexyon-igpu"
+# pregunta en vez de saber: vale en cualquier máquina, se reevalúa en cada boot
+# y en cada hotplug, y no caduca si el disco cambia de equipo o aparece otra
+# GPU. Es el modo que usa el módulo de NixOS (donde /etc/udev/rules.d lo maneja
+# Nix y no se puede generar por hardware en tiempo de instalación).
+#
+# Modos:
+#   pin             híbrida y todas las pantallas conectadas cuelgan de la
+#                   iGPU -> AQ_DRM_DEVICES=<symlink iGPU> (la dGPU ni se abre)
+#   nopin-external  híbrida con una pantalla CONECTADA en otra card (HDMI/DP
+#                   cableado a la dGPU) -> pin levantado: Hyprland abre todas
+#                   las GPUs y esa salida funciona. Vuelve a `pin` solo al
+#                   desenchufar (lo decide este mismo script en el hotplug).
+#   static-single   0-1 GPUs               -> sin pin, sin maquinaria dinámica
+#   static-nvidia   boot_vga es la Nvidia  -> sin pin (pin = pantalla negra)
+#   static-none     sin candidata a iGPU   -> sin pin
+#
+# IMPORTANTE para el hotplug: la salida de `lua` es CANÓNICA por modo (no
+# incluye el nombre del conector) — el handler compara byte a byte y solo
+# reinicia el compositor si el texto cambia; dos externos a la vez o cambiar
+# de puerto dentro de la dGPU no deben provocar reinicios.
+set -u
+
+GPU_SYS="${VEXYON_GPU_SYS:-/sys/class/drm}"       # override solo para tests
+GPU_LINK="${VEXYON_GPU_LINK:-/dev/dri/vexyon-igpu}"
+
+gpu_n=0 gpu_nvidia=0 gpu_bootvga_vendor=""
+pick_slot="" pick_vendor="" pick_card="" pick_rank=99 pick_vram=0
+for c in "$GPU_SYS"/card*; do
+  b=${c##*/}
+  [[ $b =~ ^card[0-9]+$ ]] || continue            # fuera conectores card0-eDP-1
+  [ -r "$c/device/vendor" ] || continue           # fuera dispositivos sin PCI id
+  v=$(<"$c/device/vendor")
+  slot=$(basename "$(readlink -f "$c/device")")
+  bv=$(cat "$c/device/boot_vga" 2>/dev/null || echo 0)
+  vram=$(cat "$c/device/mem_info_vram_total" 2>/dev/null || echo 0)
+  gpu_n=$((gpu_n + 1))
+  if [ "$v" = 0x10de ]; then
+    gpu_nvidia=1
+    [ "$bv" = 1 ] && gpu_bootvga_vendor=$v
+    continue                                      # Nvidia nunca es candidata a iGPU
+  fi
+  [ "$bv" = 1 ] && gpu_bootvga_vendor=$v
+  # Ranking de "integrada": boot_vga (la que enciende el firmware) > Intel >
+  # AMD > otras. Empate (p.ej. AMD iGPU + AMD dGPU sin boot_vga): la de MENOS
+  # VRAM dedicada (la APU expone un carve-out pequeño; la dGPU, gigas).
+  rank=3
+  if [ "$bv" = 1 ]; then rank=0
+  elif [ "$v" = 0x8086 ]; then rank=1
+  elif [ "$v" = 0x1002 ]; then rank=2
+  fi
+  if [ "$rank" -lt "$pick_rank" ] || { [ "$rank" -eq "$pick_rank" ] && [ "$vram" -lt "$pick_vram" ]; }; then
+    pick_slot=$slot pick_vendor=$v pick_card=$b pick_rank=$rank pick_vram=$vram
+  fi
+done
+
+mode="" why=""
+if [ "$gpu_n" -le 1 ]; then
+  mode=static-single why="single GPU — default device selection is already correct"
+elif [ "$gpu_bootvga_vendor" = 0x10de ]; then
+  mode=static-nvidia why="displays are owned by the Nvidia dGPU (boot_vga) — pinning the iGPU would kill the output"
+elif [ -z "$pick_slot" ]; then
+  mode=static-none why="no integrated-GPU candidate found among $gpu_n GPUs"
+else
+  # ¿Hay alguna pantalla CONECTADA colgando de una card que NO es la candidata?
+  # (los conectores viven en $GPU_SYS/cardN-<conector>/status)
+  ext=""
+  for st in "$GPU_SYS"/card*-*/status; do
+    [ -r "$st" ] || continue
+    con=${st%/status}; con=${con##*/}
+    [ "${con%%-*}" = "$pick_card" ] && continue
+    if [ "$(cat "$st")" = connected ]; then ext=$con; break; fi
+  done
+  if [ -n "$ext" ]; then
+    mode=nopin-external why="display connected on the discrete GPU ($ext) — pin lifted so that output works"
+  else
+    mode=pin why="all connected displays are on the integrated GPU"
+  fi
+fi
+
+case "$pick_vendor" in
+  0x8086) gpu_name="Intel" ;;
+  0x1002) gpu_name="AMD" ;;
+  0x1af4) gpu_name="virtio" ;;
+  "")     gpu_name="" ;;
+  *)      gpu_name="vendor $pick_vendor" ;;
+esac
+
+case "${1:-env}" in
+  env)
+    printf 'VEXYON_GPU_MODE=%q\n'   "$mode"
+    printf 'VEXYON_GPU_WHY=%q\n'    "$why"
+    printf 'VEXYON_GPU_N=%q\n'      "$gpu_n"
+    printf 'VEXYON_GPU_NVIDIA=%q\n' "$gpu_nvidia"
+    printf 'VEXYON_GPU_SLOT=%q\n'   "$pick_slot"
+    printf 'VEXYON_GPU_CARD=%q\n'   "$pick_card"
+    printf 'VEXYON_GPU_NAME=%q\n'   "$gpu_name"
+    ;;
+  lua)
+    # Gramática Lua (Hyprland >= 0.55; hyprlang desaparece en 0.57). Salida
+    # CANÓNICA por modo: el handler de hotplug compara byte a byte.
+    echo "-- Vexyon — GPU pin (GENERATED; do not edit — managed by install.sh and"
+    echo "-- vexyon-gpu-hotplug, which rewrites it on iGPU/dGPU display hotplug)"
+    case "$mode" in
+      pin)
+        echo "-- Integrated GPU: $gpu_name @ PCI $pick_slot ($GPU_LINK via udev rule)."
+        echo "-- Only this device is listed, so Hyprland never opens the discrete GPU."
+        echo "hl.env(\"AQ_DRM_DEVICES\", \"$GPU_LINK\")"
+        echo "hl.env(\"WLR_DRM_DEVICES\", \"$GPU_LINK\")"
+        if [ "$gpu_nvidia" = 1 ]; then
+          echo "-- Keep the shell's own GL/Vulkan off the Nvidia dGPU. prime-run overrides"
+          echo "-- all three per app, so manual dGPU offload still works."
+          echo "hl.env(\"__GLX_VENDOR_LIBRARY_NAME\", \"mesa\")"
+          echo "hl.env(\"__NV_PRIME_RENDER_OFFLOAD\", \"0\")"
+          echo "hl.env(\"__VK_LAYER_NV_optimus\", \"non_NVIDIA_only\")"
+        fi
+        ;;
+      nopin-external)
+        echo "-- An external display is connected to the discrete GPU — the iGPU pin is"
+        echo "-- lifted so Hyprland opens every GPU and can drive that output. It reverts"
+        echo "-- to the iGPU pin automatically when the display is unplugged."
+        ;;
+      *)
+        echo "-- No GPU pin: $why"
+        ;;
+    esac
+    ;;
+  is-igpu)
+    # Para la regla udev del symlink. Solo hay iGPU electa en los modos
+    # dinámicos (pin / nopin-external): en static-* no debe existir symlink —
+    # ni en máquinas de una GPU ni cuando manda la Nvidia — igual que en Arch,
+    # donde install.sh borra la regla en cuanto el modo es static-*.
+    case "$mode" in pin|nopin-external) ;; *) exit 1 ;; esac
+    [ -n "$pick_card" ] && [ "${2:-}" = "$pick_card" ]
+    ;;
+  *)
+    echo "usage: vexyon-gpu-detect [env|lua|is-igpu cardN]" >&2
+    exit 2
+    ;;
+esac
