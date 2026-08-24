@@ -1,0 +1,7 @@
+-- ============================================================================
+--  VEXYON — MONITORS (user override)
+--  Safe to edit by hand. Examples:
+--    hl.monitor({ output = "eDP-1",    mode = "1920x1080@60",  position = "0x0",    scale = "1" })
+--    hl.monitor({ output = "HDMI-A-1", mode = "2560x1440@144", position = "1920x0", scale = "1" })
+--  Default (empty) falls back to the catch-all hl.monitor in hyprland.lua.
+-- ============================================================================

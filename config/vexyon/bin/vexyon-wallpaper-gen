@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""vexyon-wallpaper-gen — procedural theme-matched default wallpaper.
+
+Genera el fondo "por defecto" de Vexyon a partir de la paleta del tema
+activo (o el pasado con --theme): degradado base→mantle→crust, dos brillos
+radiales suaves con accent/accent2, anillos concéntricos sutiles (el mismo
+motivo del greeter) y la marca Vexyon ("V" en caja redondeada, como el
+Onboarding/LauncherIcon) centrada con el wordmark debajo.
+
+Cache: ~/.local/share/vexyon/wallpapers/generated/<tema>-<WxH>.png.
+Solo regenera si falta el PNG, si el JSON del tema es más nuevo o si este
+script cambió (los ajustes de diseño se propagan). Imprime la ruta final
+por stdout — el servicio Wallpaper (QML) la pasa a swww/awww.
+
+Dependencia: python-pillow (instalada por install.sh). Sin numpy: los
+degradados se calculan en miniatura y se reescalan (rápido y sin picos de
+RAM). Resolución: monitor más grande según `hyprctl monitors -j`; fuera de
+sesión (install) cae a 2560x1440, que escala limpio.
+"""
+
+import json
+import os
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+THEMES_DIR = os.path.join(HOME, ".local/share/vexyon/themes")
+OUT_DIR = os.path.join(HOME, ".local/share/vexyon/wallpapers/generated")
+SHELL_JSON = os.path.join(HOME, ".config/vexyon/shell.json")
+FALLBACK_RES = (2560, 1440)
+
+# Paleta de reserva = fallbacks de Theme.qml (la UI nunca queda en blanco;
+# el fondo tampoco).
+FALLBACK = {
+    "base": "#0d0d12", "mantle": "#0a0a0e", "crust": "#070709",
+    "text": "#e6e6ef", "subtext0": "#a6a6c0", "overlay0": "#3a3a4a",
+    "accent": "#e11d48", "accent2": "#f43f5e",
+}
+
+
+def hex_rgb(s, fallback=(255, 255, 255)):
+    try:
+        s = s.lstrip("#")
+        return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+    except Exception:
+        return fallback
+
+
+def active_theme_id():
+    try:
+        with open(SHELL_JSON) as f:
+            return json.load(f).get("theme", {}).get("active", "crimson-voltage")
+    except Exception:
+        return "crimson-voltage"
+
+
+def screen_res():
+    """Monitor más grande en píxeles físicos; fallback si no hay sesión."""
+    try:
+        out = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True,
+                             text=True, timeout=3)
+        mons = json.loads(out.stdout)
+        best = max(mons, key=lambda m: m["width"] * m["height"])
+        return int(best["width"]), int(best["height"])
+    except Exception:
+        return FALLBACK_RES
+
+
+def find_font(bold=True):
+    """Ruta del ttf del tema vía fontconfig (JetBrainsMono NF = fuente del
+    shell); si fc-match no está o falla, Pillow caerá al default."""
+    q = "JetBrainsMono Nerd Font" + (":bold" if bold else "")
+    try:
+        out = subprocess.run(["fc-match", "-f", "%{file}", q],
+                             capture_output=True, text=True, timeout=3)
+        p = out.stdout.strip()
+        return p if p and os.path.isfile(p) else None
+    except Exception:
+        return None
+
+
+def main():
+    theme = None
+    force = False
+    res = None
+    args = sys.argv[1:]
+    while args:
+        a = args.pop(0)
+        if a == "--theme" and args:
+            theme = args.pop(0)
+        elif a == "--force":
+            force = True
+        elif a == "--res" and args:
+            try:
+                w, h = args.pop(0).lower().split("x")
+                res = (int(w), int(h))
+            except ValueError:
+                pass
+    theme = theme or active_theme_id()
+    W, H = res or screen_res()
+
+    theme_json = os.path.join(THEMES_DIR, theme + ".json")
+    out_png = os.path.join(OUT_DIR, "%s-%dx%d.png" % (theme, W, H))
+
+    # ---- cache: regenerar solo si falta / tema más nuevo / script cambió ----
+    if not force and os.path.isfile(out_png):
+        png_m = os.path.getmtime(out_png)
+        theme_m = os.path.getmtime(theme_json) if os.path.isfile(theme_json) else 0
+        script_m = os.path.getmtime(os.path.realpath(__file__))
+        if png_m >= theme_m and png_m >= script_m:
+            print(out_png)
+            return 0
+
+    try:
+        with open(theme_json) as f:
+            colors = json.load(f).get("colors", {})
+    except Exception:
+        colors = {}
+
+    def col(key):
+        return hex_rgb(colors.get(key, FALLBACK.get(key, "#808080")))
+
+    base, mantle, crust = col("base"), col("mantle"), col("crust")
+    text, subtext0 = col("text"), col("subtext0")
+    overlay0, accent, accent2 = col("overlay0"), col("accent"), col("accent2")
+
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+    # ---- fondo: degradado diagonal mantle → base → crust --------------------
+    # Calculado en 64x64 (bilineal por píxel) y reescalado con BICUBIC: suave,
+    # instantáneo y sin numpy.
+    g = Image.new("RGB", (64, 64))
+    px = g.load()
+    for y in range(64):
+        for x in range(64):
+            t = (x + y) / 126.0            # 0 arriba-izq → 1 abajo-der
+            if t < 0.5:
+                a, b, u = mantle, base, t * 2
+            else:
+                a, b, u = base, crust, (t - 0.5) * 2
+            px[x, y] = tuple(round(a[i] + (b[i] - a[i]) * u) for i in range(3))
+    img = g.resize((W, H), Image.BICUBIC).convert("RGBA")
+
+    # ---- brillos radiales (accent arriba-dcha, accent2 abajo-izq) ----------
+    # En miniatura (÷8) y reescalados: el blur queda gratis en el resize.
+    def glow(cx, cy, radius, rgb, alpha):
+        sw, sh = W // 8, H // 8
+        layer = Image.new("L", (sw, sh), 0)
+        lp = layer.load()
+        r = radius / 8.0
+        for y in range(sh):
+            for x in range(sw):
+                d = ((x - cx / 8) ** 2 + (y - cy / 8) ** 2) ** 0.5
+                v = max(0.0, 1.0 - d / r)
+                lp[x, y] = round(alpha * (v * v))   # caída cuadrática
+        mask = layer.resize((W, H), Image.BICUBIC)
+        solid = Image.new("RGBA", (W, H), rgb + (255,))
+        solid.putalpha(mask)
+        return solid
+
+    img = Image.alpha_composite(img, glow(0.80 * W, 0.16 * H, 0.62 * H, accent, 26))
+    img = Image.alpha_composite(img, glow(0.14 * W, 0.88 * H, 0.55 * H, accent2, 18))
+
+    # ---- anillos concéntricos (motivo del greeter), casi subliminales ------
+    rings = Image.new("L", (W, H), 0)
+    rd = ImageDraw.Draw(rings)
+    cx, cy = W // 2, H // 2
+    for r in (0.22, 0.38, 0.56, 0.76):
+        rr = r * H
+        rd.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], outline=255,
+                   width=max(2, H // 500))
+    rings = rings.filter(ImageFilter.GaussianBlur(1.2))   # suaviza el borde
+    ring_layer = Image.new("RGBA", (W, H), overlay0 + (255,))
+    ring_layer.putalpha(rings.point(lambda v: v * 22 // 255))
+    img = Image.alpha_composite(img, ring_layer)
+
+    # ---- marca Vexyon (misma receta que Onboarding: caja redondeada con
+    #      borde accent + "V" bold) — dibujada a 4x y reducida (antialias) ---
+    S = 4
+    s = round(0.115 * H)                   # lado de la caja
+    box_r = round(s * 0.25)                # radius 25% (LauncherIcon)
+    bw = max(2, round(s * 0.038))          # ~border 3 @ caja 96 del Onboarding
+    pad = s                                # margen del lienzo 4x para el glow
+    ls = (s + 2 * pad) * S
+    logo = Image.new("RGBA", (ls, ls), (0, 0, 0, 0))
+    ld = ImageDraw.Draw(logo)
+    x0, y0 = pad * S, pad * S
+    ld.rounded_rectangle([x0, y0, x0 + s * S, y0 + s * S], radius=box_r * S,
+                         outline=accent + (235,), width=bw * S)
+    font_path = find_font(bold=True)
+    vsize = round(s * 0.62 * S)
+    try:
+        fnt = ImageFont.truetype(font_path, vsize) if font_path else None
+    except Exception:
+        fnt = None
+    if fnt is not None:
+        bb = ld.textbbox((0, 0), "V", font=fnt)
+        ld.text((x0 + (s * S - (bb[2] - bb[0])) / 2 - bb[0],
+                 y0 + (s * S - (bb[3] - bb[1])) / 2 - bb[1]),
+                "V", font=fnt, fill=text + (235,))
+    else:
+        # sin fontconfig/ttf: "V" geométrica (dos trazos), mismo peso visual
+        vw = max(2, round(s * 0.085)) * S
+        mx, my = x0 + s * S // 2, y0 + s * S // 2
+        vh, vt = round(s * 0.30 * S), round(s * 0.26 * S)
+        ld.line([(mx - vt, my - vh), (mx, my + vh)], fill=text + (235,), width=vw)
+        ld.line([(mx + vt, my - vh), (mx, my + vh)], fill=text + (235,), width=vw)
+    logo = logo.resize((ls // S, ls // S), Image.LANCZOS)
+    img.alpha_composite(logo, (W // 2 - logo.width // 2, H // 2 - logo.height // 2))
+
+    # ---- wordmark "V E X Y O N" bajo la marca, muy discreto ----------------
+    wm_size = max(10, round(0.024 * H))
+    try:
+        wm_font = ImageFont.truetype(font_path, wm_size) if font_path else None
+    except Exception:
+        wm_font = None
+    if wm_font is not None:
+        wm = Image.new("RGBA", (W, wm_size * 3), (0, 0, 0, 0))
+        wd = ImageDraw.Draw(wm)
+        label = " ".join("VEXYON")
+        bb = wd.textbbox((0, 0), label, font=wm_font)
+        wd.text(((W - (bb[2] - bb[0])) / 2 - bb[0], 0), label, font=wm_font,
+                fill=subtext0 + (140,))
+        img.alpha_composite(wm, (0, H // 2 + logo.height // 2 - round(0.055 * H)))
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    tmp = out_png + ".tmp"
+    img.convert("RGB").save(tmp, "PNG")    # RGB: swww no necesita alfa
+    os.replace(tmp, out_png)               # escritura atómica
+    print(out_png)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

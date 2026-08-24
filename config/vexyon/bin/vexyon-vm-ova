@@ -1,0 +1,614 @@
+#!/usr/bin/env python3
+"""
+vexyon-vm-ova — exporta e importa VMs en formato OVA.
+
+Un .ova es un TAR (sin comprimir) con un descriptor .ovf, opcionalmente un .mf
+con hashes, y los discos, normalmente en VMDK. No es un formato nativo de
+libvirt, así que la conversión es explícita y NO es fiel al 100 % — lo que no
+se puede trasladar se avisa por stderr en vez de perderse en silencio.
+
+Solo usa `tar` y `xml.etree` de la biblioteca ESTÁNDAR de python3 (que ya es
+dependencia del shell) más `qemu-img`, que viene con QEMU: el mismo paquete que
+hace falta para tener VMs. Nada de virt-v2v (arrastra media distro) ni de
+virt-manager.
+
+    export <dominio.xml> <disco.qcow2> <salida.ova> [tmpdir]
+    inspect <entrada.ova>
+    import  <entrada.ova> <nombre> <dir-destino>
+    meter   <bytes-totales> <origen|-> <destino>
+
+PROGRESO. Las dos operaciones tardan minutos con discos de verdad, así que cada
+fase larga dice por STDOUT cuánto lleva, en líneas sueltas que el shell parsea
+según llegan (SplitParser). No hay sondeo por ninguna parte: lo que empuja cada
+línea es el propio dato que está pasando.
+
+    @@PHASE <n> <de> <clave>   empieza la fase n de <de>; <clave> se traduce
+    @@PROG  <hechos> <total>   bytes (total 0 = desconocido)
+    @@PCT   <0..100>           porcentaje, cuando quien informa es qemu-img -p
+
+`meter` es la pieza que da bytes reales a los trasiegos de libvirt: `virsh
+vol-download`/`vol-upload` no saben informar de progreso (comprobado: no tienen
+ninguna opción para ello), pero SÍ aceptan leer o escribir por una tubería, así
+que el dato pasa por aquí de camino y se cuenta al vuelo.
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import xml.etree.ElementTree as ET
+
+OVF_NS = "http://schemas.dmtf.org/ovf/envelope/1"
+RASD = ("http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/"
+        "CIM_ResourceAllocationSettingData")
+VSSD = ("http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/"
+        "CIM_VirtualSystemSettingData")
+XSI = "http://www.w3.org/2001/XMLSchema-instance"
+
+
+# Numeración GLOBAL de fases. Una parte del trabajo la hace el shell (los
+# vol-download/vol-upload de libvirt) y otra este ayudante, así que quien lanza
+# el proceso dice por dónde va la cuenta para que el usuario vea "2 de 3" y no
+# dos numeraciones distintas peleándose.
+PHASE_BASE = int(os.environ.get("VEXYON_PHASE_BASE") or 0)
+PHASE_TOTAL = int(os.environ.get("VEXYON_PHASE_TOTAL") or 0)
+
+
+def emit(line):
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()          # sin esto el shell no ve nada hasta el final
+
+
+def step(i, key):
+    if PHASE_TOTAL:
+        emit("@@PHASE\t%d\t%d\t%s" % (PHASE_BASE + i, PHASE_TOTAL, key))
+
+
+def emit_prog(done, total):
+    emit("@@PROG\t%d\t%d" % (done, total))
+
+
+def emit_pct(pct):
+    emit("@@PCT\t%.2f" % pct)
+
+
+def die(msg):
+    sys.stderr.write("%s\n" % msg)
+    raise SystemExit(1)
+
+
+def warn(msg):
+    sys.stderr.write("@@WARN %s\n" % msg)
+
+
+# `qemu-img convert -p` escribe "    (12.34/100%)" seguido de un RETORNO DE
+# CARRO (no un salto de línea) por stdout. Se lee carácter a carácter porque el
+# progreso hay que verlo AHORA, no cuando el proceso acabe — que es justo lo que
+# hacía `run()` con capture_output y por eso no se enteraba nadie.
+#
+# stderr va MEZCLADO a stdout a propósito: con dos tuberías y leyendo solo una,
+# un error largo llenaría el buffer de la otra y bloquearía a qemu-img. Las
+# líneas que no son progreso se guardan para poder contarlas si falla.
+def convert(src, dst, fmt, opts=None):
+    cmd = [qemu_img(), "convert", "-p", "-O", fmt]
+    if opts:
+        cmd += ["-o", opts]
+    cmd += [src, dst]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    noise, buf = [], ""
+    while True:
+        ch = p.stdout.read(1)
+        if not ch:
+            break
+        c = ch.decode("utf-8", "replace")
+        if c in "\r\n":
+            m = re.search(r"\(([0-9.]+)/100%\)", buf)
+            if m:
+                emit_pct(float(m.group(1)))
+            elif buf.strip():
+                noise.append(buf.strip())
+            buf = ""
+        else:
+            buf += c
+    if buf.strip():
+        noise.append(buf.strip())
+    p.stdout.close()
+    if p.wait() != 0:
+        die("qemu-img convert failed: %s" % ("; ".join(noise) or "unknown error"))
+    emit_pct(100.0)
+
+
+# Copia contando. Se usa para dar bytes reales a lo que libvirt no sabe medir.
+CHUNK = 1 << 20
+TICK = 4 << 20          # una línea cada 4 MiB: informa sin inundar la tubería
+
+
+def copy_metered(fin, fout, total):
+    done, last = 0, 0
+    while True:
+        chunk = fin.read(CHUNK)
+        if not chunk:
+            break
+        fout.write(chunk)
+        done += len(chunk)
+        if done - last >= TICK:
+            last = done
+            emit_prog(done, total)
+    emit_prog(done, total or done)
+    return done
+
+
+def qemu_img():
+    for c in ("qemu-img",):
+        if shutil.which(c):
+            return c
+    die("qemu-img not found — it ships with QEMU, which a VM host needs anyway")
+
+
+# ---------------------------------------------------------------------------
+# exportar
+# ---------------------------------------------------------------------------
+
+def domain_facts(dom_xml_path):
+    root = ET.parse(dom_xml_path).getroot()
+    name = (root.findtext("name") or "vm").strip()
+    mem_el = root.find("memory")
+    mem_mib = 1024
+    if mem_el is not None:
+        try:
+            v = int((mem_el.text or "0").strip())
+            unit = (mem_el.get("unit") or "KiB").lower()
+            mem_mib = {"kib": v // 1024, "mib": v, "gib": v * 1024,
+                       "b": v // (1024 * 1024)}.get(unit, v // 1024)
+        except ValueError:
+            pass
+    try:
+        vcpus = int((root.findtext("vcpu") or "1").strip())
+    except ValueError:
+        vcpus = 1
+    desc = (root.findtext("description") or "").strip()
+    osn = root.find("os")
+    firmware = (osn.get("firmware") if osn is not None else "") or "bios"
+    return name, mem_mib, vcpus, desc, firmware
+
+
+def build_ovf(name, mem_mib, vcpus, disk_file, disk_bytes, desc):
+    ET.register_namespace("ovf", OVF_NS)
+    ET.register_namespace("rasd", RASD)
+    ET.register_namespace("vssd", VSSD)
+    ET.register_namespace("xsi", XSI)
+    q = lambda t: "{%s}%s" % (OVF_NS, t)
+    r = lambda t: "{%s}%s" % (RASD, t)
+    v = lambda t: "{%s}%s" % (VSSD, t)
+
+    env = ET.Element(q("Envelope"), {q("version"): "1.0",
+                                     "xml:lang": "en-US"})
+
+    refs = ET.SubElement(env, q("References"))
+    ET.SubElement(refs, q("File"), {q("href"): disk_file,
+                                    q("id"): "file1",
+                                    q("size"): str(disk_bytes)})
+
+    dsec = ET.SubElement(env, q("DiskSection"))
+    ET.SubElement(dsec, q("Info")).text = "Virtual disk information"
+    ET.SubElement(dsec, q("Disk"), {
+        q("capacity"): str(disk_bytes),
+        q("diskId"): "vmdisk1",
+        q("fileRef"): "file1",
+        q("format"): "http://www.vmware.com/interfaces/specifications/"
+                     "vmdk.html#streamOptimized"})
+
+    nsec = ET.SubElement(env, q("NetworkSection"))
+    ET.SubElement(nsec, q("Info")).text = "The list of logical networks"
+    net = ET.SubElement(nsec, q("Network"), {q("name"): "NAT"})
+    ET.SubElement(net, q("Description")).text = "NAT network"
+
+    vs = ET.SubElement(env, q("VirtualSystem"), {q("id"): name})
+    ET.SubElement(vs, q("Info")).text = "A virtual machine"
+    ET.SubElement(vs, q("Name")).text = name
+    if desc:
+        ET.SubElement(vs, q("Annotation")).text = desc
+
+    osec = ET.SubElement(vs, q("OperatingSystemSection"),
+                         {q("id"): "94", q("osType"): "otherGuest"})
+    ET.SubElement(osec, q("Info")).text = "The kind of installed guest OS"
+
+    vhw = ET.SubElement(vs, q("VirtualHardwareSection"))
+    ET.SubElement(vhw, q("Info")).text = "Virtual hardware requirements"
+    sysel = ET.SubElement(vhw, q("System"))
+    ET.SubElement(sysel, v("ElementName")).text = "Virtual Hardware Family"
+    ET.SubElement(sysel, v("InstanceID")).text = "0"
+    ET.SubElement(sysel, v("VirtualSystemIdentifier")).text = name
+    ET.SubElement(sysel, v("VirtualSystemType")).text = "virtualbox-2.2"
+
+    def item(inst, rtype, name_, qty=None, extra=None):
+        it = ET.SubElement(vhw, q("Item"))
+        ET.SubElement(it, r("ElementName")).text = name_
+        ET.SubElement(it, r("InstanceID")).text = str(inst)
+        ET.SubElement(it, r("ResourceType")).text = str(rtype)
+        if qty is not None:
+            ET.SubElement(it, r("VirtualQuantity")).text = str(qty)
+        for k, val in (extra or {}).items():
+            ET.SubElement(it, r(k)).text = str(val)
+        return it
+
+    item(1, 3, "%d virtual CPU(s)" % vcpus, vcpus)
+    item(2, 4, "%d MB of memory" % mem_mib, mem_mib,
+         {"AllocationUnits": "byte * 2^20"})
+    item(3, 6, "SCSI Controller", None,
+         {"ResourceSubType": "VirtualSCSI"})
+    item(4, 17, "Hard Disk 1", None,
+         {"HostResource": "ovf:/disk/vmdisk1", "Parent": "3",
+          "AddressOnParent": "0"})
+    item(5, 10, "Ethernet adapter on NAT", None,
+         {"Connection": "NAT", "ResourceSubType": "E1000"})
+
+    return ET.tostring(env, encoding="UTF-8", xml_declaration=True)
+
+
+def cmd_export(argv):
+    if len(argv) < 3:
+        die("usage: export <domain.xml> <disk> <out.ova> [tmpdir]")
+    dom_xml, disk, out = argv[0], argv[1], argv[2]
+    tmp = argv[3] if len(argv) > 3 else out + ".tmpdir"
+    name, mem, vcpus, desc, firmware = domain_facts(dom_xml)
+
+    if firmware == "efi":
+        warn("This VM boots with UEFI. VirtualBox/VMware need EFI turned on "
+             "manually after importing, and the NVRAM contents are not carried "
+             "over.")
+
+    os.makedirs(tmp, exist_ok=True)
+    vmdk = os.path.join(tmp, name + "-disk1.vmdk")
+    # streamOptimized es el subformato que VirtualBox y VMware esperan dentro
+    # de un OVA; un vmdk "normal" lo rechazan muchas versiones.
+    step(1, "convert-vmdk")
+    convert(disk, vmdk, "vmdk", "subformat=streamOptimized")
+
+    ovf_bytes = build_ovf(name, mem, vcpus, os.path.basename(vmdk),
+                          os.path.getsize(vmdk), desc)
+    ovf_path = os.path.join(tmp, name + ".ovf")
+    with open(ovf_path, "wb") as f:
+        f.write(ovf_bytes)
+
+    # El ORDEN importa: el .ovf tiene que ir primero en el tar, si no muchos
+    # importadores no encuentran el descriptor.
+    #
+    # El disco se mete con addfile() y no con add(): así la copia pasa por
+    # nuestras manos y se puede ir contando. tf.add() lo copiaría por dentro,
+    # sin decir nada, y es la parte que más tarda del empaquetado.
+    step(2, "package")
+    with tarfile.open(out, "w", format=tarfile.GNU_FORMAT) as tf:
+        tf.add(ovf_path, arcname=os.path.basename(ovf_path))
+        ti = tf.gettarinfo(vmdk, arcname=os.path.basename(vmdk))
+        with open(vmdk, "rb") as f:
+            tf.addfile(ti, Metered(f, ti.size))
+        # tarfile lee justo los bytes que dice la cabecera y NO hace una última
+        # lectura vacía, así que el medidor se queda a un pelo del final: se
+        # cierra a mano para que la barra llegue a tope y no muera en el 99 %.
+        emit_prog(ti.size, ti.size)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+    warn("Snapshots, shared folders, USB assignments and host-specific devices "
+         "are not part of the OVA and were left out.")
+    sys.stdout.write(out + "\n")
+
+
+# ---------------------------------------------------------------------------
+# importar
+# ---------------------------------------------------------------------------
+
+def find_ovf(members):
+    for m in members:
+        if m.lower().endswith(".ovf"):
+            return m
+    return None
+
+
+def parse_ovf(data):
+    root = ET.fromstring(data)
+    q = lambda t: ".//{%s}%s" % (OVF_NS, t)
+    name = None
+    for el in root.iter("{%s}VirtualSystem" % OVF_NS):
+        name = el.get("{%s}id" % OVF_NS)
+        n = el.find("{%s}Name" % OVF_NS)
+        if n is not None and (n.text or "").strip():
+            name = n.text.strip()
+        break
+    mem_mib, vcpus = 1024, 1
+    for it in root.iter("{%s}Item" % OVF_NS):
+        rt = it.findtext("{%s}ResourceType" % RASD)
+        qty = it.findtext("{%s}VirtualQuantity" % RASD)
+        units = (it.findtext("{%s}AllocationUnits" % RASD) or "").lower()
+        if not qty:
+            continue
+        try:
+            qv = int(float(qty))
+        except ValueError:
+            continue
+        if rt == "3":
+            vcpus = max(1, qv)
+        elif rt == "4":
+            if "2^30" in units or "gigabyte" in units:
+                qv *= 1024
+            elif "2^10" in units or "kilobyte" in units:
+                qv //= 1024
+            mem_mib = max(64, qv)
+    disks = []
+    for f in root.iter("{%s}File" % OVF_NS):
+        href = f.get("{%s}href" % OVF_NS)
+        if href:
+            disks.append(href)
+    return name or "imported", mem_mib, vcpus, disks, ovf_bus(root), ovf_firmware(root)
+
+
+# --------------------------------------------------------------------------
+# QUÉ CONTROLADORA DECLARA EL .ova  (la causa del pantallazo azul)
+# --------------------------------------------------------------------------
+#  Un Windows sale de VirtualBox/VMware con sus discos en SATA (AHCI) o IDE, y
+#  con controladores cargados SOLO para eso. Si al importarlo se le engancha el
+#  disco a virtio —que es lo que hacía esto— Windows arranca, no encuentra el
+#  disco de sistema y se para en INACCESSIBLE_BOOT_DEVICE. No es un fallo de
+#  Windows: es que le hemos cambiado la controladora por debajo.
+#
+#  Los códigos son los de CIM_ResourceAllocationSettingData (DSP0004), que es
+#  lo que OVF usa dentro de cada <Item>:
+#      5 = IDE Controller
+#      6 = SCSI Controller       (subtipo lsilogic / buslogic / VirtualSCSI…)
+#     20 = "Other storage device": lo que VirtualBox y VMware usan para SATA,
+#          con ResourceSubType AHCI / vmware.sata.ahci
+#
+#  Se mira el ResourceSubType además del tipo porque ahí es donde asoma
+#  "virtio" cuando el .ova viene de un sitio que ya lo usaba.
+RT_IDE, RT_SCSI, RT_SATA = "5", "6", "20"
+
+
+def ovf_bus(root):
+    """Devuelve 'sata' | 'ide' | 'scsi' | 'virtio' | None (si no lo declara)."""
+    found = []
+    for it in root.iter("{%s}Item" % OVF_NS):
+        rt = (it.findtext("{%s}ResourceType" % RASD) or "").strip()
+        sub = (it.findtext("{%s}ResourceSubType" % RASD) or "").strip().lower()
+        if "virtio" in sub:
+            found.append("virtio")
+        elif rt == RT_SATA or "ahci" in sub or "sata" in sub:
+            found.append("sata")
+        elif rt == RT_SCSI:
+            found.append("scsi")
+        elif rt == RT_IDE:
+            found.append("ide")
+    if not found:
+        return None
+    # Si declara varias, manda la que el disco de arranque suele usar: se
+    # prefiere la más específica antes que IDE, que casi siempre está ahí de
+    # relleno para el CD-ROM.
+    for pref in ("virtio", "sata", "scsi", "ide"):
+        if pref in found:
+            return pref
+    return None
+
+
+def ovf_firmware(root):
+    """'uefi' | 'bios' | None. OVF estándar no dice nada de firmware; cada
+    fabricante se lo inventa por su lado, así que se miran los dos sitios
+    conocidos. NO es la palabra final: la tabla de particiones del disco manda
+    (ver disk_firmware), porque es lo que de verdad decide si el disco arranca
+    por BIOS o por UEFI."""
+    for el in root.iter():
+        # VirtualBox: <vbox:Machine ... firmwareType="BIOS"|"EFI">
+        fw = el.get("firmwareType")
+        if fw:
+            return "uefi" if "efi" in fw.lower() else "bios"
+        # VMware: <vmw:Config ovf:key="firmware" ovf:value="efi"/>
+        key = el.get("{%s}key" % OVF_NS)
+        if key == "firmware":
+            val = (el.get("{%s}value" % OVF_NS) or "").lower()
+            return "uefi" if "efi" in val else "bios"
+    return None
+
+
+# --------------------------------------------------------------------------
+# QUÉ FIRMWARE PIDE EL DISCO DE VERDAD
+# --------------------------------------------------------------------------
+#  La tabla de particiones es la autoridad, no lo que diga el .ovf: un disco
+#  con GPT y su partición EFI arranca por UEFI, y uno con MBR arranca por BIOS.
+#  Equivocarse aquí da EXACTAMENTE el mismo síntoma que equivocarse de
+#  controladora (no encuentra desde dónde arrancar), así que se comprueban por
+#  separado.
+#
+#  Se leen los primeros sectores con `qemu-img dd` —que ya está— y se miran a
+#  mano: nada de montar, nada de qemu-nbd, nada de root.
+GPT_SIG = b"EFI PART"
+ESP_GUID = b"\x28\x73\x2a\xc1\x1f\xf8\xd2\x11\xba\x4b\x00\xa0\xc9\x3e\xc9\x3b"
+
+
+def disk_firmware(path):
+    """'uefi' | 'bios' | None mirando la tabla de particiones del disco."""
+    head = os.path.join(os.path.dirname(path) or ".", ".vexyon-head.raw")
+    try:
+        p = subprocess.run([qemu_img(), "dd", "bs=512", "count=68",
+                            "if=" + path, "of=" + head],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if p.returncode != 0:
+            return None
+        with open(head, "rb") as f:
+            data = f.read()
+    except Exception:
+        return None
+    finally:
+        try:
+            os.unlink(head)
+        except OSError:
+            pass
+    if len(data) < 1024:
+        return None
+    # LBA1 = cabecera GPT. Un disco con GPT se instala y arranca por UEFI; si
+    # además se ve la partición de sistema EFI, no hay ninguna duda.
+    if data[512:520] == GPT_SIG:
+        return "uefi"
+    # MBR: firma 0x55AA al final del primer sector. Un GPT protector también
+    # lleva esa firma, pero ese caso ya lo ha cazado la rama de arriba.
+    if data[510:512] == b"\x55\xaa":
+        return "bios"
+    return None
+
+
+def cmd_inspect(argv):
+    if not argv:
+        die("usage: inspect <in.ova>")
+    with tarfile.open(argv[0], "r") as tf:
+        names = tf.getnames()
+        ovf = find_ovf(names)
+        if not ovf:
+            die("this .ova has no .ovf descriptor inside — it may be corrupt")
+        name, mem, vcpus, disks, bus, fw = parse_ovf(tf.extractfile(ovf).read())
+    sys.stdout.write("name\t%s\nmem\t%s\nvcpus\t%s\nbus\t%s\nfirmware\t%s\n"
+                     % (name, mem, vcpus, bus or "", fw or ""))
+    for d in disks:
+        sys.stdout.write("disk\t%s\n" % d)
+
+
+def cmd_import(argv):
+    if len(argv) < 3:
+        die("usage: import <in.ova> <name> <dest-dir>")
+    ova, want_name, dest = argv[0], argv[1], argv[2]
+    tmp = os.path.join(dest, ".vexyon-ova-tmp")
+    os.makedirs(tmp, exist_ok=True)
+    try:
+        with tarfile.open(ova, "r") as tf:
+            names = tf.getnames()
+            ovf = find_ovf(names)
+            if not ovf:
+                die("this .ova has no .ovf descriptor inside — it may be corrupt")
+            ovf_data = tf.extractfile(ovf).read()
+            name, mem, vcpus, disks, ovfbus, ovffw = parse_ovf(ovf_data)
+            if not disks:
+                die("the .ovf lists no disks")
+            # Solo se extrae el PRIMER disco: el XML que se genera define una VM
+            # de un disco. Si hay más, se avisa en vez de perderlos callando.
+            if len(disks) > 1:
+                warn("This OVA has %d disks; only the first was imported. "
+                     "Attach the rest by hand if you need them." % len(disks))
+            member = None
+            for m in names:
+                if os.path.basename(m) == os.path.basename(disks[0]):
+                    member = m
+                    break
+            if member is None:
+                die("the disk named in the .ovf is not inside the .ova: %s" % disks[0])
+            # extracción acotada a un solo miembro, a una ruta que elegimos
+            src = os.path.join(tmp, os.path.basename(member))
+            step(1, "extract")
+            with tf.extractfile(member) as fin, open(src, "wb") as fout:
+                copy_metered(fin, fout, tf.getmember(member).size)
+
+        out_qcow = os.path.join(dest, want_name + ".qcow2")
+        step(2, "convert-qcow2")
+        convert(src, out_qcow, "qcow2")
+
+        # La controladora se CONSERVA. Antes se normalizaba a virtio siempre, y
+        # eso es lo que dejaba a Windows en INACCESSIBLE_BOOT_DEVICE.
+        bus = ovfbus or "sata"
+        if not ovfbus:
+            warn("The .ova does not say which disk controller it used, so the "
+                 "disk was attached as SATA — the safe choice, because every "
+                 "modern guest has drivers for it.")
+        # El firmware lo decide el DISCO, no el .ovf: GPT -> UEFI, MBR -> BIOS.
+        fw = disk_firmware(out_qcow) or ovffw or "bios"
+        if ovffw and fw != ovffw:
+            warn("The .ova declares %s firmware but the disk is partitioned for "
+                 "%s, which is what decides whether it can boot. Going with the "
+                 "disk." % (ovffw.upper(), fw.upper()))
+
+        warn("Network cards, sound and USB from the OVF are approximated: the "
+             "VM is created with libvirt's usual defaults (NAT network). Check "
+             "them before the first boot.")
+        sys.stdout.write("name\t%s\nmem\t%s\nvcpus\t%s\ndisk\t%s\nbus\t%s\nfirmware\t%s\n"
+                         % (want_name, mem, vcpus, out_qcow, bus, fw))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# medidor
+# ---------------------------------------------------------------------------
+
+class Metered(object):
+    """Fichero de solo-lectura que va contando lo que le sacan.
+
+    Lo usa el empaquetado: tarfile.addfile() lee de aquí, así que el progreso
+    lo empuja la propia copia — no hay nadie mirando el reloj ni el tamaño del
+    fichero de salida cada tanto."""
+
+    def __init__(self, fin, total):
+        self.fin = fin
+        self.total = total
+        self.done = 0
+        self.last = 0
+
+    def read(self, n=-1):
+        data = self.fin.read(n)
+        self.done += len(data)
+        if self.done - self.last >= TICK or not data:
+            self.last = self.done
+            emit_prog(self.done, self.total)
+        return data
+
+
+def cmd_meter(argv):
+    """Copia <origen> a <destino> contando bytes por el camino.
+
+    Existe porque `virsh vol-download` / `vol-upload` NO tienen forma de
+    informar de progreso (revisado su `virsh help`: solo --offset, --length y
+    --sparse), pero los dos aceptan una tubería:
+
+        vol-download vol /dev/stdout | vexyon-vm-ova meter N - disco.qcow2
+        vexyon-vm-ova meter N disco.qcow2 tubería   &   vol-upload vol tubería
+
+    Con <total> a 0 el progreso sale con total desconocido y quien lo pinta
+    enseña bytes en vez de un porcentaje."""
+    if len(argv) < 3:
+        die("usage: meter <total-bytes> <in|-> <out>")
+    try:
+        total = int(argv[0])
+    except ValueError:
+        total = 0
+    src, dst = argv[1], argv[2]
+    fin = sys.stdin.buffer if src == "-" else open(src, "rb")
+    try:
+        # Si <destino> es una tubería con nombre, este open() espera a que
+        # libvirt abra el otro extremo. Es lo que se quiere: sin lector no hay
+        # nada que copiar.
+        with open(dst, "wb") as fout:
+            copy_metered(fin, fout, total)
+    finally:
+        if fin is not sys.stdin.buffer:
+            fin.close()
+
+
+COMMANDS = {"export": cmd_export, "inspect": cmd_inspect, "import": cmd_import,
+            "meter": cmd_meter}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        die("usage: vexyon-vm-ova <%s> …" % "|".join(sorted(COMMANDS)))
+    # Cualquier excepción que se escape sale como UNA línea, no como un
+    # traceback. Lo que hay al otro lado de stderr es la banda roja de la
+    # ventana: un .ova truncado escupía ahí veinte líneas de rutas del store de
+    # Nix, que no le dicen nada a nadie. `die` ya sabe dar el formato correcto.
+    try:
+        COMMANDS[sys.argv[1]](sys.argv[2:])
+    except SystemExit:
+        raise
+    except tarfile.TarError as e:
+        die("this .ova could not be read (%s). It may be truncated or corrupt." % e)
+    except (IOError, OSError) as e:
+        die("%s" % e)
+    except Exception as e:
+        die("%s: %s" % (type(e).__name__, e))
+
+
+if __name__ == "__main__":
+    main()

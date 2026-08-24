@@ -1,0 +1,8 @@
+# PAM configuration for the Vexyon lock screen.
+# Installed to /etc/pam.d/vexyon by install.sh. Uses the distro's standard
+# auth stack (pam_unix via system-auth) so the current user's login password
+# unlocks the screen.
+auth       include   system-auth
+account    include   system-auth
+password   include   system-auth
+session    include   system-auth
