@@ -74,7 +74,7 @@ Item {
         bluetooth:1, microphone:1, power:1, controlcenter:1, weather:1,
         notifications:1, idleinhibitor:1, media:1, clipboard:1, cpu:1, memory:1,
         disk:1, cputemp:1, gputemp:1, vpn:1, keyboardlayout:1, notes:1,
-        colorpicker:1, sysupdate:1, vm:1
+        colorpicker:1, sysupdate:1, vm:1, recorder:1
     })
     readonly property bool hasPrimaryAction: _primaryTypes[type] === 1
     function primaryAction(button) {
@@ -97,6 +97,8 @@ Item {
         case "media":         openPanel("mediaPlayer"); break;
         case "clipboard":     openPanel("clipboardPanel"); break;
         case "vm":            openPanel("vmPanel"); break;
+        // Config primero: con el interruptor apagado no se toca Recorder.
+        case "recorder":      if (Config.get("recording", "enabled", false) === true) Recorder.stop(); break;
         case "cpu": case "memory": case "disk": case "cputemp": case "gputemp": openPanel("sysMonitor"); break;
         case "keyboardlayout": KeyboardState.cycle(); break;
         case "notes":         Quickshell.execDetached(["bash", "-c", "ghostty -e bash -c '${EDITOR:-nano} ~/notes.md' || true"]); break;
@@ -195,6 +197,7 @@ Item {
             : view.type === "sysupdate"      ? cSysUpdate
             : view.type === "appsdock"       ? cAppsDock
             : view.type === "vm"             ? cVm
+            : view.type === "recorder"       ? cRecorder
             : view.type === "spacer"         ? cSpacer
             : view.type === "separator"      ? cSeparator
             : cUnknown
@@ -718,6 +721,66 @@ Item {
             // pastilla es únicamente el glifo.
             label: Vm.runningVms.length > 1 ? "" + Vm.runningVms.length : ""
             labelSize: view.wFont - 2
+        }
+    }
+
+    // ---- grabación de pantalla ----------------------------------------------
+    //  Solo existe MIENTRAS SE GRABA: punto rojo, tiempo y botón de parar (la
+    //  pastilla entera para; ver primaryAction). Sin grabación `live` es false,
+    //  el Loader de dentro está inactivo y `selfHide` saca la pastilla de la
+    //  barra — mismo mecanismo que la de VMs y la batería en un sobremesa.
+    //
+    //  QUÉ LA ENCIENDE, SIN SONDEAR: `Recorder.recording` ES el estado
+    //  `running` del proceso de wf-recorder. Aparece cuando arranca y se va
+    //  cuando sale; no hay ningún Timer. El segundero sale del reloj
+    //  compartido (Time.now): mientras la pastilla existe sube
+    //  Time.ssWatchers y el reloj pasa a 1 s; al irse, vuelve a ir por minutos.
+    //
+    //  ⚠️ `live` lee Config PRIMERO: con el interruptor apagado la expresión se
+    //  corta ahí y el singleton Recorder no llega a crearse (la barra además
+    //  ni siquiera crea esta pastilla: WidgetRegistry.barSection la filtra).
+    Component { id: cRecorder
+        Item {
+            id: recW
+            readonly property bool live: Config.get("recording", "enabled", false) === true && Recorder.recording
+            readonly property bool selfHide: !recW.live
+            implicitWidth: recLd.item ? recLd.item.implicitWidth : 0
+            implicitHeight: recLd.item ? recLd.item.implicitHeight : 0
+            Loader {
+                id: recLd
+                anchors.centerIn: parent
+                active: recW.live
+                sourceComponent: Grid {
+                    Component.onCompleted: Time.ssWatchers++
+                    Component.onDestruction: Time.ssWatchers--
+                    columns: view.vertical ? 1 : 3
+                    columnSpacing: 6
+                    rowSpacing: 2
+                    horizontalItemAlignment: Grid.AlignHCenter
+                    verticalItemAlignment: Grid.AlignVCenter
+                    Text {
+                        text: Icons.record
+                        color: Theme.red
+                        font.family: Theme.fontFamily
+                        font.pixelSize: view.wIcon - 3
+                    }
+                    Text {
+                        // "Saving…" while wf-recorder finishes the file
+                        text: Recorder.stopping ? I18n.t("Saving…") : Recorder.elapsed(Time.now.getTime())
+                        color: Theme.text
+                        font.family: Theme.fontFamily
+                        font.pixelSize: view.vertical ? view.wFont - 3 : view.wFont - 1
+                        font.bold: true
+                    }
+                    Text {
+                        visible: !Recorder.stopping
+                        text: Icons.stop
+                        color: Theme.red
+                        font.family: Theme.fontFamily
+                        font.pixelSize: view.wIcon - 2
+                    }
+                }
+            }
         }
     }
 

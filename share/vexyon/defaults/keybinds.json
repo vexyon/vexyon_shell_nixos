@@ -89,6 +89,18 @@
     "category": "Vexyon"
   },
   {
+    "id": "recorder",
+    "mods": [
+      "SUPER",
+      "SHIFT"
+    ],
+    "key": "R",
+    "action": "global",
+    "arg": "recorder",
+    "desc": "Screen recording: open the recorder / stop recording",
+    "category": "Vexyon"
+  },
+  {
     "id": "togglefloat",
     "mods": [
       "SUPER"

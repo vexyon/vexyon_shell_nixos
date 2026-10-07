@@ -103,9 +103,11 @@ PanelWindow {
     //  Virtualización encendido: apagado, esta lista sale vacía y no hay
     //  entrada de lanzador que valga. ⚠️ Se lee Config y no `Vm.enabled` a
     //  propósito: preguntar al singleton Vm lo instanciaría.
+    //  La grabadora, igual: solo con Ajustes → Grabación de pantalla
+    //  encendido, y leyendo Config, no `Recorder.enabled`.
     function shellEntries() {
-        if (Config.get("virtualization", "enabled", false) !== true) return [];
-        return [ {
+        var out = [];
+        if (Config.get("virtualization", "enabled", false) === true) out.push({
             shellPanel: "vmManager",
             id: "vexyon-vm-manager",
             name: I18n.t("Virtual machines"),
@@ -114,7 +116,21 @@ PanelWindow {
             keywords: ["vm", "virtual", "libvirt", "qemu", "kvm", "virtualization", "virtualizacion"],
             icon: "virt-viewer",
             noDisplay: false
-        } ];
+        });
+        if (Config.get("recording", "enabled", false) === true) out.push({
+            shellPanel: "recorder",
+            id: "vexyon-screen-recorder",
+            name: I18n.t("Screen recorder"),
+            genericName: I18n.t("Screen recording"),
+            comment: I18n.t("Record a monitor or a region, with sound"),
+            keywords: ["record", "recorder", "recording", "screencast", "video", "capture",
+                       "grabar", "grabadora", "grabacion", "pantalla"],
+            // Papirus: pantalla con región punteada y punto de grabar (el
+            // icono genérico media-record solo existe a 22/24 px)
+            icon: "com.github.mohelm97.screenrecorder",
+            noDisplay: false
+        });
+        return out;
     }
 
     function rebuild() {
@@ -133,7 +149,10 @@ PanelWindow {
             var comment = (a.comment || "").toLowerCase();
             var kw = "";
             try { kw = (a.keywords || []).join(" ").toLowerCase(); } catch (e) { kw = ""; }
-            var exe = (a.command || a.execString || "").toLowerCase();
+            // `command` es una LISTA en Quickshell 0.3 (QVector<QString>): sin
+            // String() el .toLowerCase() lanzaba y CUALQUIER búsqueda escrita
+            // abortaba rebuild() con la lista sin filtrar.
+            var exe = String(a.command || a.execString || "").toLowerCase();
 
             var score = -1;
             if (name === q) score = 0;

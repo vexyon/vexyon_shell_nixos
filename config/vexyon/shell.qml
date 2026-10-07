@@ -80,6 +80,21 @@ ShellRoot {
         }
     }
 
+    // Super+Shift+R: grabación de pantalla. Grabando → para. Si no → abre el
+    // selector (qué grabar). Apagado en Ajustes → lleva a Ajustes → Grabación
+    // de pantalla, igual que Super+V con las VMs.
+    //  ⚠️ Config PRIMERO y return antes de tocar `Recorder`: con el
+    //  interruptor apagado el singleton no se crea nunca.
+    GlobalShortcut {
+        appid: "quickshell"; name: "recorder"
+        onPressed: {
+            if (Config.get("recording", "enabled", false) !== true) { Panels.openSettingsAt("recording"); return; }
+            if (Recorder.recording) Recorder.stop();
+            else if (Panels.recordRegion) Panels.close("recordRegion");
+            else Panels.toggle("recorder");
+        }
+    }
+
     // ---- Multimedia keys (XF86*) — bound by the bridge with bindl/bindel so
     // they work while locked and repeat when held. Volume/mic go through the
     // existing PipeWire services, brightness through brightnessctl, media
@@ -146,6 +161,12 @@ ShellRoot {
     LazyLoader {
         active: Panels.calculator
         Calculator {}
+    }
+    // Grabación: el selector solo existe mientras está abierto, y nunca con
+    // el interruptor apagado (Config leído directamente, no Recorder.enabled).
+    LazyLoader {
+        active: Panels.recorder && Config.get("recording", "enabled", false) === true
+        RecorderPanel {}
     }
     ScreenshotOverlay {}
     MonitorRevertDialog {}

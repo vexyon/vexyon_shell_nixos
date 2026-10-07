@@ -259,7 +259,7 @@ Variants {
         required property string sec
         required property string groupAlign
         // reactive: re-reads when Config.data changes
-        readonly property var items: WidgetRegistry.section(sec)
+        readonly property var items: WidgetRegistry.barSection(sec)
 
         // Un espaciador/separador dentro de la sección la parte en subgrupos
         // visuales: los paneles anclados vuelven al anclaje por-widget en vez

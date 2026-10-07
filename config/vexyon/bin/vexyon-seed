@@ -127,7 +127,7 @@ seed_late_keybinds() {
   python3 - "$CFG/shell.json" "$DATA/defaults/keybinds.json" <<'PYEOF' || true
 import json, os, sys
 sj, dk = sys.argv[1], sys.argv[2]
-LATE = {"vmmanager", "calculator"}
+LATE = {"vmmanager", "calculator", "recorder"}
 try:
     cfg = json.load(open(sj))
     defaults = json.load(open(dk))

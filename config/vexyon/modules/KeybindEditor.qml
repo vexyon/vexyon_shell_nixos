@@ -33,7 +33,8 @@ Item {
         { arg: "screenshot",    label: I18n.t("Screenshot") },
         { arg: "themeswitcher", label: I18n.t("Switch theme (quick)") },
         { arg: "vmmanager",     label: I18n.t("Open VM manager") },
-        { arg: "calculator",    label: I18n.t("Open calculator") }
+        { arg: "calculator",    label: I18n.t("Open calculator") },
+        { arg: "recorder",      label: I18n.t("Screen recording: open / stop") }
     ]
     function builtinLabel(arg) {
         for (var i = 0; i < builtins.length; i++) if (builtins[i].arg === arg) return builtins[i].label;

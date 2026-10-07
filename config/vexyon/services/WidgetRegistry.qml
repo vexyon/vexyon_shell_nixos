@@ -61,6 +61,10 @@ Singleton {
         // catálogo se evalúa siempre — justo lo contrario de "coste cero con
         // el interruptor apagado". Ver PROJECT_STATE.md.
         { type: "vm",            name: I18n.t("Virtual machines"), desc: I18n.t("Live control of running VMs"), icon: Icons.desktop, group: "Sistema" },
+        // Grabación de pantalla: el indicador (tiempo + parar) que SOLO existe
+        // mientras se graba. Mismo trato que "vm": solo en el catálogo con el
+        // interruptor de Ajustes → Grabación de pantalla encendido.
+        { type: "recorder",      name: I18n.t("Screen recording"), desc: I18n.t("Elapsed time and stop button, only while recording"), icon: Icons.record, group: "Sistema" },
         { type: "spacer",        name: I18n.t("Spacer"),             desc: I18n.t("Configurable empty space"),              icon: Icons.arrowsH,     group: I18n.t("Layout") },
         { type: "separator",     name: I18n.t("Separator"),              desc: I18n.t("Visual divider between widgets"),            icon: Icons.dragHandle,  group: I18n.t("Layout") }
     ]
@@ -70,7 +74,10 @@ Singleton {
     // pintar una pastilla ya colocada aunque su interruptor se apague después.
     readonly property var visibleCatalog: {
         var vmOn = Config.get("virtualization", "enabled", false) === true;
-        return root.catalog.filter(function(e) { return e.type !== "vm" || vmOn; });
+        var recOn = Config.get("recording", "enabled", false) === true;
+        return root.catalog.filter(function(e) {
+            return (e.type !== "vm" || vmOn) && (e.type !== "recorder" || recOn);
+        });
     }
 
     function meta(type) {
@@ -200,6 +207,17 @@ Singleton {
         return withIds(raw);
     }
 
+    // What the BAR draws for a section: section() minus the recording
+    // indicator while Screen recording is switched off, so with the switch off
+    // that pill is not even created (its slot in shell.json is kept, and it
+    // comes back in place when the switch goes on). Only the bar uses this;
+    // the widget manager edits the full section().
+    function barSection(name) {
+        var list = section(name);
+        if (Config.get("recording", "enabled", false) === true) return list;
+        return list.filter(function(e) { return e.type !== "recorder"; });
+    }
+
     // Persist the whole widgets object after mutating one section.
     function _writeSection(name, list) {
         var w = Config.get("bar", "widgets", null);
@@ -218,6 +236,27 @@ Singleton {
         var list = section(sectionName);
         list.push({ type: type, id: newId(type) });
         _writeSection(sectionName, list);
+    }
+
+    function addWidgetAt(sectionName, type, index) {
+        var list = section(sectionName);
+        list.splice(Math.max(0, Math.min(list.length, index)), 0, { type: type, id: newId(type) });
+        _writeSection(sectionName, list);
+    }
+
+    // ¿hay un widget de este tipo en alguna sección (suelto o dentro de un
+    // grupo)? Ajustes lo usa para no ofrecer "añadir a la barra" dos veces.
+    function hasWidget(type) {
+        var secs = ["left", "center", "right"];
+        for (var s = 0; s < secs.length; s++) {
+            var list = section(secs[s]);
+            for (var i = 0; i < list.length; i++) {
+                if (list[i].type === type) return true;
+                var ch = list[i].type === "group" ? (list[i].children || []) : [];
+                for (var c = 0; c < ch.length; c++) if (ch[c].type === type) return true;
+            }
+        }
+        return false;
     }
 
     function removeWidget(sectionName, id) {

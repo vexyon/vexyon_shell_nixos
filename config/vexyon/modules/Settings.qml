@@ -71,6 +71,9 @@ FloatingWindow {
         { "title": "Virtualization", "icon": Icons.desktop, "items": [
             { "id": "virtualization", "label": "Virtualization", "icon": Icons.desktop }
         ] },
+        { "title": "Recording", "icon": Icons.record, "items": [
+            { "id": "recording", "label": "Screen recording", "icon": Icons.record }
+        ] },
         { "title": "System", "icon": Icons.gear, "items": [
             { "id": "audio",    "label": "Audio",              "icon": Icons.volumeHigh },
             { "id": "network",  "label": "Network",            "icon": Icons.wifi },
@@ -127,6 +130,7 @@ FloatingWindow {
                     "network": "Network", "displays": "Displays",
                     "behavior": "Behavior",
                     "virtualization": "Virtualization",
+                    "recording": "Screen recording",
                     "about": "About Vexyon" };
         return I18n.t(map[id] || id);
     }
@@ -995,6 +999,7 @@ FloatingWindow {
                                        : win.current === "displays" ? cmpDisplays
                                        : win.current === "behavior" ? cmpBehavior
                                        : win.current === "virtualization" ? cmpVirt
+                                       : win.current === "recording" ? cmpRec
                                        : cmpAbout
                     }
                 }
@@ -3339,6 +3344,450 @@ FloatingWindow {
                             wrapMode: Text.Wrap
                             font.family: Theme.fontFamily
                             font.pixelSize: Theme.fontSize - 3
+                        }
+                    }
+
+                    Item { Layout.fillHeight: true }
+                }
+            }
+        }
+
+        // ==================== Grabación de pantalla ====================
+        //  Mismo esquema que Virtualización: interruptor + comprobación
+        //  granular + instrucciones PROPIAS DE LA PLATAFORMA. wf-recorder es un
+        //  requisito opcional del ANFITRIÓN (como libvirt/qemu): ni el módulo de
+        //  Nix ni install.sh lo instalan. Ver PROJECT_STATE.md para dónde se
+        //  comprobó cada nombre de paquete.
+        Component {
+            id: cmpRec
+            Flickable {
+                contentHeight: recCol.implicitHeight
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+
+                ColumnLayout {
+                    id: recCol
+                    width: parent.width
+                    spacing: 12
+
+                    // ---------- interruptor ----------
+                    Rectangle {
+                        Layout.fillWidth: true
+                        implicitHeight: recSwCol.implicitHeight + 26
+                        radius: Theme.radius
+                        color: Theme.surface0
+                        ColumnLayout {
+                            id: recSwCol
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.leftMargin: 14
+                            anchors.rightMargin: 12
+                            spacing: 4
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 10
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: I18n.t("Enable screen recording")
+                                    color: Theme.text
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: Theme.fontSize
+                                }
+                                Toggle {
+                                    checked: Config.get("recording", "enabled", false)
+                                    onToggled: function(v) {
+                                        Config.set("recording", "enabled", v);
+                                        // El indicador de barra va con la función: sin
+                                        // él no se vería que se está grabando. Solo
+                                        // existe mientras se graba, así que ponerlo no
+                                        // cambia nada en la barra el resto del tiempo.
+                                        if (v && !WidgetRegistry.hasWidget("recorder"))
+                                            WidgetRegistry.addWidgetAt("right", "recorder", 0);
+                                    }
+                                }
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: I18n.t("Off by default. While it is off, nothing related to recording is loaded: no process, no bar indicator, no launcher entry, no memory used.")
+                                color: Theme.subtext0
+                                wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 2
+                            }
+                        }
+                    }
+
+                    // Todo lo demás solo con el interruptor puesto. Un Loader y
+                    // no `visible`: un ítem invisible sigue evaluando sus
+                    // bindings, y estos leen Recorder — con el interruptor
+                    // apagado el singleton no debe existir.
+                    Loader {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: item ? item.implicitHeight : 0
+                        active: Config.get("recording", "enabled", false) === true
+                        visible: active
+                        sourceComponent: ColumnLayout {
+                            spacing: 12
+                            // La sonda corre al abrir la página (y al encender el
+                            // interruptor). prime() recuerda la petición si
+                            // Config aún no ha parseado shell.json.
+                            Component.onCompleted: Recorder.prime()
+
+                            // ---------- estado global ----------
+                            Rectangle {
+                                Layout.fillWidth: true
+                                implicitHeight: recStRow.implicitHeight + 24
+                                radius: Theme.radius
+                                color: Recorder.ready
+                                       ? Qt.rgba(Theme.green.r, Theme.green.g, Theme.green.b, 0.12)
+                                       : Qt.rgba(Theme.yellow.r, Theme.yellow.g, Theme.yellow.b, 0.12)
+                                border.width: 1
+                                border.color: Recorder.ready ? Theme.green : Theme.yellow
+                                RowLayout {
+                                    id: recStRow
+                                    anchors.left: parent.left
+                                    anchors.right: parent.right
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    anchors.leftMargin: 14
+                                    anchors.rightMargin: 12
+                                    spacing: 10
+                                    Text {
+                                        text: Recorder.ready ? Icons.check : Icons.info
+                                        color: Recorder.ready ? Theme.green : Theme.yellow
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize + 4
+                                    }
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: !Recorder.detected ? I18n.t("Checking…")
+                                            : Recorder.ready ? I18n.t("wf-recorder found — screen recording is ready.")
+                                                               + (Recorder.version !== "" ? "  (" + Recorder.version + ")" : "")
+                                            : I18n.t("Something is missing. The list below shows exactly what.")
+                                        color: Theme.text
+                                        wrapMode: Text.Wrap
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize - 1
+                                    }
+                                    IconButton { icon: Icons.refresh; onClicked: Recorder.detect() }
+                                }
+                            }
+
+                            // ---------- comprobación granular ----------
+                            SsHeader { text: I18n.t("COMPONENTS") }
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                spacing: 9
+                                ReqRow {
+                                    pending: !Recorder.detected
+                                    ok: Recorder.has.recorder
+                                    label: I18n.t("wf-recorder — captures the screen and encodes the video")
+                                    note: I18n.t("It records through the compositor's screencopy protocol, the same one screenshots use, and only runs while you are recording.")
+                                }
+                                ReqRow {
+                                    pending: !Recorder.detected
+                                    ok: Recorder.has.pulse
+                                    optional: true
+                                    label: I18n.t("pipewire-pulse — PipeWire's PulseAudio server, for sound")
+                                    note: Recorder.has.pulse ? "" : I18n.t("Without it recordings are silent. Video works the same.")
+                                }
+                                ReqRow {
+                                    visible: Recorder.detected && Recorder.has.recorder && !Recorder.has.audio
+                                    ok: false
+                                    optional: true
+                                    label: I18n.t("This wf-recorder was built without sound support")
+                                    note: I18n.t("Recordings will be silent. The packages listed below are built with it.")
+                                }
+                            }
+
+                            // ---------- instrucciones por plataforma ----------
+                            //  Solo si falta algo: con todo instalado no hay nada
+                            //  que copiar y la página se queda corta.
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                visible: Recorder.detected && (!Recorder.has.recorder || !Recorder.has.pulse)
+                                spacing: 6
+
+                                SsHeader { text: I18n.t("SETUP FOR YOUR SYSTEM") }
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: Recorder.osName !== "" ? (I18n.t("Detected system") + ": " + Recorder.osName) : ""
+                                    visible: text !== ""
+                                    color: Theme.subtext0
+                                    wrapMode: Text.Wrap
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: Theme.fontSize - 2
+                                }
+
+                                // ======== NixOS ========
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    visible: Recorder.platform === "nixos"
+                                    spacing: 6
+
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: I18n.t("This goes in your configuration.nix. As with virtualization it comes in two parts, but here the first one is empty: screen recording is ONE entry inside a list you already have.")
+                                        color: Theme.text
+                                        wrapMode: Text.Wrap
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize - 1
+                                    }
+                                    PartLabel {
+                                        tag: I18n.t("PART A")
+                                        tone: Theme.green
+                                        title: I18n.t("Nothing to paste as a new block")
+                                        body: I18n.t("Screen recording needs no service and no option of its own: wf-recorder is a plain program that only runs while you record.")
+                                    }
+                                    PartLabel {
+                                        visible: !Recorder.has.recorder
+                                        tag: I18n.t("PART B")
+                                        tone: Theme.yellow
+                                        title: I18n.t("ADD this to a list you ALREADY have")
+                                        body: I18n.t("Do NOT paste it as a new block. Nix does not merge two definitions of the same attribute in one file: a second environment.systemPackages makes the build fail with \"attribute already defined\". Open the list you already have and add the entry inside it.")
+                                    }
+                                    Text {
+                                        Layout.fillWidth: true
+                                        visible: !Recorder.has.recorder
+                                        text: I18n.t("Inside your existing environment.systemPackages, add:")
+                                        color: Theme.text
+                                        wrapMode: Text.Wrap
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize - 2
+                                    }
+                                    CodeBlock { visible: !Recorder.has.recorder; tone: "merge"; code: "wf-recorder" }
+                                    Text {
+                                        Layout.fillWidth: true
+                                        visible: !Recorder.has.recorder
+                                        text: I18n.t("If you install your packages with Home Manager instead, add it to your home.packages list the same way.")
+                                        color: Theme.subtext0
+                                        wrapMode: Text.Wrap
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize - 3
+                                    }
+                                    PartLabel {
+                                        visible: !Recorder.has.pulse
+                                        tag: I18n.t("SOUND")
+                                        tone: Theme.yellow
+                                        title: I18n.t("CHANGE the line you already have")
+                                        body: I18n.t("The Vexyon module already turns PipeWire's PulseAudio server on, so if it is off your configuration sets it to false somewhere. Change THAT line to true: adding a second line makes the build fail with conflicting values.")
+                                    }
+                                    CodeBlock { visible: !Recorder.has.pulse; tone: "merge"; code: "services.pipewire.pulse.enable = true;" }
+
+                                    PartLabel {
+                                        tag: I18n.t("THEN")
+                                        tone: Theme.blue
+                                        title: I18n.t("Rebuild")
+                                        body: I18n.t("No need to log out: when the rebuild finishes, press the refresh button above.")
+                                    }
+                                    CodeBlock { code: "sudo nixos-rebuild switch" }
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: I18n.t("If your configuration is a flake, use your usual flake command instead (for example: sudo nixos-rebuild switch --flake /etc/nixos#your-hostname).")
+                                        color: Theme.subtext0
+                                        wrapMode: Text.Wrap
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize - 3
+                                    }
+                                }
+
+                                // ======== Arch / CachyOS ========
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    visible: Recorder.platform === "arch"
+                                    spacing: 6
+
+                                    PartLabel {
+                                        visible: !Recorder.has.recorder
+                                        tag: "1"
+                                        tone: Theme.green
+                                        title: I18n.t("Install the package")
+                                        body: I18n.t("wf-recorder is in the official extra repository. It talks to the compositor directly, so there is nothing to enable afterwards.")
+                                    }
+                                    CodeBlock { visible: !Recorder.has.recorder; tone: "add"; code: "sudo pacman -S --needed wf-recorder" }
+                                    PartLabel {
+                                        visible: !Recorder.has.pulse
+                                        tag: Recorder.has.recorder ? "1" : "2"
+                                        tone: Theme.yellow
+                                        title: I18n.t("Only for sound: PipeWire's PulseAudio server")
+                                        body: I18n.t("Vexyon's installer already installs pipewire-pulse. If it was removed or is not running, put it back and start it for your user:")
+                                    }
+                                    CodeBlock { visible: !Recorder.has.pulse; tone: "add"; code: "sudo pacman -S --needed pipewire-pulse" }
+                                    CodeBlock { visible: !Recorder.has.pulse; tone: "add"; code: "systemctl --user enable --now pipewire-pulse.socket" }
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: I18n.t("No need to log out: press the refresh button above afterwards.")
+                                        color: Theme.subtext0
+                                        wrapMode: Text.Wrap
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize - 3
+                                    }
+                                }
+
+                                // ======== plataforma desconocida ========
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    visible: Recorder.platform === "unknown"
+                                    spacing: 6
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: I18n.t("This system was not recognised, so no package names are shown — guessing them would be worse than nothing. Install the following components the way your distribution does it:")
+                                        color: Theme.text
+                                        wrapMode: Text.Wrap
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize - 1
+                                    }
+                                    Repeater {
+                                        model: [
+                                            I18n.t("wf-recorder — the screen recorder for wlroots compositors such as Hyprland"),
+                                            I18n.t("PipeWire with its PulseAudio server (pipewire-pulse) — only for sound")
+                                        ]
+                                        delegate: RowLayout {
+                                            required property var modelData
+                                            Layout.fillWidth: true
+                                            spacing: 8
+                                            Text {
+                                                Layout.alignment: Qt.AlignTop
+                                                text: "•"
+                                                color: Theme.overlay2
+                                                font.family: Theme.fontFamily
+                                                font.pixelSize: Theme.fontSize - 1
+                                            }
+                                            Text {
+                                                Layout.fillWidth: true
+                                                text: modelData
+                                                color: Theme.subtext1
+                                                wrapMode: Text.Wrap
+                                                font.family: Theme.fontFamily
+                                                font.pixelSize: Theme.fontSize - 2
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // ---------- opciones ----------
+                            SsHeader { text: I18n.t("OPTIONS") }
+                            SsSeg {
+                                label: I18n.t("Sound")
+                                sect: "recording"; k: "audio"; def: "system"
+                                options: [
+                                    { v: "none",   l: I18n.t("No sound") },
+                                    { v: "system", l: I18n.t("System sound") },
+                                    { v: "mic",    l: I18n.t("Microphone") }
+                                ]
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: I18n.t("One source at a time: wf-recorder takes a single audio device. System sound is whatever plays on the current output, Microphone is the current input; both follow the volume panel.")
+                                color: Theme.subtext0
+                                wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 3
+                            }
+                            SsSeg {
+                                label: I18n.t("Format")
+                                sect: "recording"; k: "format"; def: "mp4"
+                                options: [
+                                    { v: "mp4", l: "MP4" },
+                                    { v: "mkv", l: "MKV" }
+                                ]
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: I18n.t("Both are H.264 video with AAC sound. MP4 plays everywhere; MKV is still playable if a recording is cut off abruptly (a crash or a power cut).")
+                                color: Theme.subtext0
+                                wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 3
+                            }
+                            SsText {
+                                label: I18n.t("Recordings folder")
+                                sect: "recording"; k: "dir"
+                                def: "~/Videos/Recordings"; placeholder: "~/Videos/Recordings"
+                            }
+
+                            // ---------- uso ----------
+                            SsHeader { text: I18n.t("OPEN") }
+                            Text {
+                                Layout.fillWidth: true
+                                text: (Recorder.shortcut !== ""
+                                       ? I18n.t("%1 opens the recorder, and stops the recording while one is running.").arg(Recorder.shortcut) + " "
+                                       : "")
+                                      + I18n.t("It is also in the app launcher, as \"Screen recorder\".")
+                                color: Theme.subtext0
+                                wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 2
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 8
+                                Rectangle {
+                                    implicitWidth: recOpenTxt.implicitWidth + 24
+                                    implicitHeight: 34
+                                    radius: Theme.radius
+                                    color: recOpenMa.containsMouse ? Theme.surface2 : Theme.surface1
+                                    Behavior on color { ColorAnimation { duration: Theme.dur(120) } }
+                                    Text {
+                                        id: recOpenTxt
+                                        anchors.centerIn: parent
+                                        text: I18n.t("Open the recorder")
+                                        color: Theme.text
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize - 1
+                                    }
+                                    MouseArea {
+                                        id: recOpenMa
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: Panels.open("recorder")
+                                    }
+                                }
+                                Rectangle {
+                                    visible: !WidgetRegistry.hasWidget("recorder")
+                                    implicitWidth: recAddTxt.implicitWidth + 24
+                                    implicitHeight: 34
+                                    radius: Theme.radius
+                                    color: recAddMa.containsMouse ? Theme.surface2 : Theme.surface1
+                                    Behavior on color { ColorAnimation { duration: Theme.dur(120) } }
+                                    Text {
+                                        id: recAddTxt
+                                        anchors.centerIn: parent
+                                        text: I18n.t("Add the recording indicator to the bar")
+                                        color: Theme.text
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize - 1
+                                    }
+                                    MouseArea {
+                                        id: recAddMa
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: WidgetRegistry.addWidgetAt("right", "recorder", 0)
+                                    }
+                                }
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: I18n.t("The bar indicator only shows up while a recording is running (elapsed time; click it to stop). The rest of the time it is not on the bar at all.")
+                                color: Theme.subtext0
+                                wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 3
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                visible: Recorder.lastFile !== "" || Recorder.lastError !== ""
+                                text: Recorder.lastError !== ""
+                                      ? I18n.t("Last recording failed:") + " " + Recorder.lastError
+                                      : I18n.t("Last recording:") + " " + Recorder.lastFile
+                                color: Recorder.lastError !== "" ? Theme.red : Theme.subtext0
+                                wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 3
+                            }
                         }
                     }
 

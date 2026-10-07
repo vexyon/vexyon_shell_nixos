@@ -36,6 +36,16 @@ Singleton {
     // Calculadora (Super+Shift+C): popup del conjunto excluyente, como el
     // lanzador. shell.qml la carga con un LazyLoader atado a esta propiedad.
     property bool calculator: false
+    // Grabación de pantalla. `recorder` es el selector (qué grabar), popup del
+    // conjunto excluyente como la calculadora; shell.qml lo carga con un
+    // LazyLoader atado a esta propiedad Y al interruptor de Ajustes.
+    // `recordRegion` abre el selector de región de las capturas
+    // (ScreenshotOverlay) en modo grabar: como `screenshot`, se gestiona solo
+    // y closeAll() no lo toca. Al confirmar emite regionPicked y Recorder
+    // arranca; si el interruptor está apagado no hay Recorder que escuche.
+    property bool recorder: false
+    property bool recordRegion: false
+    signal regionPicked(string geom)
 
     // pestaña inicial que el widget pide antes de abrir (ilyamiro: toggle
     // volume / toggle network wifi|bt)
@@ -280,6 +290,7 @@ Singleton {
         root.themeQuick = false;
         root.vmPanel = false;
         root.calculator = false;
+        root.recorder = false;
         // vmManager NO se cierra aquí: es una ventana toplevel como Ajustes,
         // no un popup. Que se abra una pastilla de barra no debe cerrarla.
         root.trayMenu = false;

@@ -101,4 +101,6 @@ Singleton {
     readonly property string language:    "\uf1ab"   // fa-language (keyboard layout)
     readonly property string crop:        "\uf125"   // fa-crop (region select)
     readonly property string copy:        "\uf0c5"   // fa-copy (clipboard entry)
+    readonly property string record:      "\uf111"   // fa-circle (screen recording)
+    readonly property string stop:        "\uf04d"   // fa-stop (stop recording)
 }

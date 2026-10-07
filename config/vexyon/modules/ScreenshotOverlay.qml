@@ -22,8 +22,12 @@ import qs.services
 PanelWindow {
     id: win
 
-    readonly property bool shown: Panels.screenshot === true
-    function cancel() { Panels.close("screenshot"); }
+    // Record mode (Panels.recordRegion): the same selector picks the region
+    // for a screen recording. Enter emits Panels.regionPicked instead of
+    // grabbing a still; Recorder (only alive with recording enabled) starts.
+    readonly property bool recMode: Panels.recordRegion === true
+    readonly property bool shown: Panels.screenshot === true || win.recMode
+    function cancel() { Panels.close("screenshot"); Panels.close("recordRegion"); }
 
     // focused Hyprland monitor drives which screen we cover + the global offset
     readonly property var mon: Hyprland.focusedMonitor
@@ -116,6 +120,11 @@ PanelWindow {
         var gw = Math.round(win.selW);
         var gh = Math.round(win.selH);
         var geom = gx + "," + gy + " " + gw + "x" + gh;
+        if (win.recMode) {                   // unmap first, then hand it over
+            Panels.close("recordRegion");
+            Panels.regionPicked(geom);
+            return;
+        }
         Panels.close("screenshot");          // unmap first so grim skips us
         // El PATH de qs puede no llevar ~/.local/bin (p.ej. lanzado por
         // Hyprland con PATH pelado): resolver el script con fallbacks en vez
@@ -285,13 +294,13 @@ PanelWindow {
             spacing: 16
             Text {
                 anchors.verticalCenter: parent.verticalCenter
-                text: Icons.crop + I18n.t("  Drag to select")
+                text: (win.recMode ? Icons.record : Icons.crop) + I18n.t("  Drag to select")
                 color: Theme.subtext0; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1
             }
             Rectangle { width: 1; height: hintRow.height * 0.6; color: Theme.overlay0; anchors.verticalCenter: parent.verticalCenter }
             Text {
                 anchors.verticalCenter: parent.verticalCenter
-                text: I18n.t("Space to capture")
+                text: win.recMode ? I18n.t("Enter to record") : I18n.t("Space to capture")
                 color: win.validSel ? Theme.accent : Theme.overlay2
                 font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1; font.bold: true
             }

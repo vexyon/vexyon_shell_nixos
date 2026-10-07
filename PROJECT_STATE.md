@@ -6,6 +6,346 @@
 > instead of replacing it. The same entries are in both trees (`vexyon_shell`
 > for Arch/CachyOS and `vexyon_shell_nixos` for NixOS).
 
+## Session: built-in screen recorder (wf-recorder, native Quickshell UI, Super+Shift+R)
+
+### Files changed
+
+Byte-identical in both trees unless noted.
+
+| file | what |
+|---|---|
+| `config/vexyon/services/Recorder.qml` | **new**, the only door to the recorder: switch, detection, start/stop, wrapper script |
+| `config/vexyon/modules/RecorderPanel.qml` | **new**, the picker: one tile per monitor + Region, sound choice, Stop while recording |
+| `config/vexyon/modules/ScreenshotOverlay.qml` | record mode: the existing region selector hands the box to the recorder |
+| `config/vexyon/modules/WidgetView.qml` | `recorder` bar indicator (elapsed time + stop), click = stop |
+| `config/vexyon/services/WidgetRegistry.qml` | catalog entry `recorder` (only offered with the switch on), `barSection()`, `addWidgetAt()`, `hasWidget()` |
+| `config/vexyon/modules/Bar.qml` | one line: sections come from `WidgetRegistry.barSection()` |
+| `config/vexyon/modules/Settings.qml` | new page **Recording → Screen recording** |
+| `config/vexyon/services/Panels.qml` | `recorder`, `recordRegion`, `signal regionPicked` |
+| `config/vexyon/shell.qml` | `GlobalShortcut "recorder"` + `LazyLoader` for the picker |
+| `config/vexyon/modules/Launcher.qml` | "Screen recorder" entry (switch on only) + **pre-existing search bug fixed** (below) |
+| `config/vexyon/modules/KeybindEditor.qml` | "Screen recording: open / stop" in the bindable shell actions |
+| `config/vexyon/services/Icons.qml` | `record`, `stop` glyphs |
+| `config/vexyon/services/I18n.qml` | ES strings (62) |
+| `config/vexyon/shell.json`, `share/vexyon/defaults/keybinds.json` | `recorder` keybind; seed gets `"recording": {"enabled": false}` |
+| NixOS `config/vexyon/bin/vexyon-seed` | `LATE` += `recorder` |
+| Arch `install.sh` | `LATE` += `recorder` (and the step label) |
+
+**Not touched, on purpose:** `nix/module.nix`, `nix/package.nix` and the
+`install.sh` package list. wf-recorder is an opt-in host prerequisite exactly
+like libvirt/QEMU, not a shell dependency. The Nix package and `install.sh`
+already copy `services/`, `modules/` and `config/vexyon/` wholesale, so the two
+new files ship with no packaging change.
+
+### Backend: wf-recorder, and what "PipeWire" really means here
+
+**Chosen: `wf-recorder` 0.6.0** (latest upstream tag; HEAD has only docs/packaging
+commits since). Small CLI, FFmpeg libraries for encoding, built for wlroots-style
+compositors, already packaged on both platforms. Alternatives looked at:
+- **gpu-screen-recorder:** monitor capture needs its KMS helper with
+  `cap_sys_admin` (a NixOS module / setcap), and its portal mode shows a picker
+  dialog on every start. Heavier, and not a plain opt-in package.
+- **wl-screenrec:** VA-API only, no software fallback.
+- **OBS:** a GUI app, the opposite of this feature.
+
+**Capture path, verified in the sources, not assumed:**
+- **Video does NOT go through the portal or PipeWire.** wf-recorder 0.6.0 speaks
+  only `wlr-screencopy-unstable-v1` (`proto/meson.build`). Hyprland main (0.56,
+  `CMakeLists.txt`) still serves it, next to `ext-image-copy-capture`. It is the
+  same protocol `grim` uses for Vexyon's screenshots, and the one
+  xdg-desktop-portal-hyprland itself uses to feed PipeWire for screen sharing.
+  Going direct skips the portal's share-picker dialog and one copy.
+- **Sound goes through PipeWire,** via its PulseAudio server (`pipewire-pulse`,
+  already a dependency on both platforms: `services.pipewire.pulse` in the
+  module, `pipewire-pulse` in `install.sh`). Arch builds wf-recorder against
+  libpulse only; nixpkgs builds both PulseAudio and PipeWire backends (checked
+  with `ldd`). The shell always passes `--audio-backend=pulse`, which works on
+  both and keeps `@DEFAULT_MONITOR@` meaningful.
+- **Hyprland permissions:** screencopy is only gated when
+  `ecosystem:enforce_permissions` is on (default **off**, `ConfigValues.cpp`).
+  Vexyon doesn't turn it on. A user who does needs a screencopy allow rule for
+  wf-recorder, as for grim.
+
+**Region selection needs no `slurp`.** The shell already has its own region
+selector (`ScreenshotOverlay`). It now has a record mode (`Panels.recordRegion`);
+Enter hands the `X,Y WxH` global geometry to `Recorder.startRegion` through
+`Panels.regionPicked`.
+
+**Package names:**
+
+| | package | verified how |
+|---|---|---|
+| NixOS | `wf-recorder` (nixos-26.05: 0.6.0) | built/fetched from `channels.nixos.org/nixos-26.05`; binary run; `ldd` shows libpulse + libpipewire |
+| Arch | `wf-recorder` (extra, 0.6.0-1; deps include libpulse; slurp optional) | the archlinux.org package page as indexed by web search. **The environment's network policy blocks archlinux.org and every Arch mirror, so the database itself could not be queried.** Docker images were tried as a source of `extra.db`: the official and CachyOS images ship empty `/var/lib/pacman/sync`. |
+| Arch, sound only | `pipewire-pulse` (extra) | same, archlinux.org page via search |
+
+### How a recording runs (and stops)
+
+`Recorder._launch()` runs ONE `bash -c` wrapper as a Quickshell `Process`:
+`bash -c <script> vexyon-record <dir> <Recording_date> <mp4|mkv> <wf-recorder args>`.
+- **Arguments:**
+  - monitor: `-o NAME`; region: `-g "X,Y WxH"`.
+  - sound: `--audio-backend=pulse --audio=@DEFAULT_MONITOR@` (system) or
+    `@DEFAULT_SOURCE@` (mic), only when detection says sound works.
+  - Always `-y` plus a name that never clashes (`Recording_<date>[-N].<ext>`),
+    so wf-recorder never stops to ask anything.
+- **`recording` IS `Process.running`.** The indicator binds to it: it appears
+  when the process starts and goes away when it exits. No timer, no polling.
+- **Stop = close the wrapper's stdin** (`Process.stdinEnabled = false`). A
+  watcher in the wrapper waits for EOF on that pipe and sends wf-recorder
+  SIGINT (its graceful path: it writes the trailer).
+- **Shell death or reload stops it too.** Quickshell's `Process` destructor
+  SIGKILLs the wrapper, and a crashed shell closes the pipe. Either way the
+  watcher gets EOF, so a recording never outlives the shell, and orphaned
+  watchers clean up the temp log themselves.
+- **Found live, handled:** after SIGINT wf-recorder writes and closes the file
+  from its encoder thread at once, but its main thread only returns on the
+  *next* screencopy frame. Captures are damage-driven, so on an idle monitor
+  that frame may never come. A bare `wf-recorder` stayed alive indefinitely on
+  a static screen, with the file already complete.
+  - libx264 prints its `kb/s:` summary when the encoder is freed, which happens
+    after the file is closed.
+  - The watcher waits for that line, then ends the process. A 10 s cap ends it
+    regardless.
+  - Hyprland source agrees: copy-with-damage frames wait for the monitor to
+    render (`ScreenshareFrame.cpp`).
+- **Defaults:** the codec is wf-recorder's (libx264 superfast/crf 20, yuv420p,
+  AAC 48 kHz). Odd region sizes are fine: 601×301 came out 600×300. Rotated
+  monitors come out upright (wf-recorder applies the output transform).
+
+### Detection and setup instructions (same pattern as the VM manager)
+
+**Probe:** `Recorder.detect()`, one bash.
+- `command -v wf-recorder`, plus its version.
+- Audio support compiled in: the `-a, --audio[=DEVICE]` help line. Note that
+  `--audio-backend` is listed even in builds without audio, so it can't be the
+  test.
+- PulseAudio socket: `$XDG_RUNTIME_DIR/pulse/native` or `$PULSE_SERVER`.
+- `/etc/os-release`.
+
+**When it runs:** only when the Settings page or the picker opens, or when the
+switch goes on. `prime()` survives the Config-not-parsed-yet race, as
+`Vm.prime()` does.
+
+**Instructions:** shown only when something is missing, chosen from
+`/etc/os-release` with the same short platform list as `Vm.platform`.
+- **NixOS:** "PART A: nothing to paste as a new block" (said explicitly, so the
+  VM page's two-part format still reads right). Then "PART B: ADD to a list you
+  ALREADY have": `wf-recorder` inside the existing
+  `environment.systemPackages`, in amber, repeating the
+  "attribute already defined" warning, plus a Home Manager `home.packages`
+  note. Then THEN: `sudo nixos-rebuild switch` (+ flake note); no logout needed.
+- **NixOS, sound missing:** "CHANGE the line you already have":
+  `services.pipewire.pulse.enable = true;`. The module already defaults it on,
+  so a missing server means the user set it false somewhere, and a second
+  definition would conflict.
+- **Arch/CachyOS:** `sudo pacman -S --needed wf-recorder`. If sound is missing,
+  also `sudo pacman -S --needed pipewire-pulse` and
+  `systemctl --user enable --now pipewire-pulse.socket`.
+- **Unknown system:** the generic component list, no package names.
+
+### Zero cost with the switch off
+
+`recording.enabled` defaults to **false** (in the seed, and the code default).
+With it off:
+- **Shell:** the picker's `LazyLoader` is inactive. The shortcut reads Config
+  first and goes to Settings → Screen recording without touching `Recorder`.
+- **Bar:** `WidgetRegistry.barSection()` drops `recorder` entries, so the bar
+  doesn't even create the pill's slot. Its position in shell.json is kept for
+  when the switch comes back on.
+- **Widget catalog and launcher:** they read Config, not `Recorder`.
+- **Settings:** the page's whole body is a `Loader` (not `visible`), so opening
+  the page with the switch off does not create `Recorder`. That is stricter
+  than the VM page, whose `Vm.prime()` creates `Vm`.
+
+With it on but idle there is no process and no timer. The bar has an empty
+`Item` per bar whose inner `Loader` is inactive until a recording starts.
+
+**Proven at runtime** with test-only `console.log` lines in a scratch copy (not
+in the repos):
+
+| state | what the log showed |
+|---|---|
+| fresh start, switch off | nothing: no singleton, no bar slot, no picker, no child process |
+| Settings page opened, switch off | still no `Recorder` |
+| switch on | singleton + one empty slot per bar; no content until recording |
+| recording | content created on all 3 bars; on stop, destroyed on all 3 |
+| switch turned off | slots destroyed on all bars; launcher search "record" → no results; shortcut → Settings page |
+| restart with switch off, `recorder` still in the bar layout | zero recorder objects, zero processes |
+
+Within one session, a `Recorder` that was created stays: QML singletons are
+never destroyed. It is a few properties and two idle `Process` objects with no
+process, the same as `Vm`.
+
+**Elapsed time:** from the shared `Time` clock. The indicator holds
+`Time.ssWatchers` only while it exists, so the clock ticks per second during a
+recording and drops back to per-minute afterwards.
+
+### Bar indicator
+
+- Catalog type `recorder`, offered only with the switch on.
+- Turning the switch on adds it once at the start of the right section (if it
+  is not on the bar already): without it there would be no sign a recording is
+  running. It is invisible except while recording, so this changes nothing on
+  the bar otherwise. If removed, Settings offers "Add the recording indicator
+  to the bar".
+- While recording it shows: red dot, `MM:SS` (or `H:MM:SS`), a stop square.
+  Clicking the pill stops. "Saving…" shows while the file is finished.
+- Vertical bars stack it.
+
+### Keybind: Super+Shift+R
+
+**Collision check:** Super+Shift+R is in no Vexyon default and not in the seed
+shell.json.
+- Super+Shift is used for C (calculator), F (fullscreen, seed only), S, the
+  arrows and the workspace numbers. Mouse binds are Super+mouse buttons.
+- Hyprland ships no built-in binds.
+- **No collision, so no question raised.**
+
+**Behaviour:** recording → stop. Region overlay open → cancel it. Otherwise
+toggle the picker. With the switch off it opens Settings → Screen recording
+(like Super+V).
+
+**Registration:** the defaults + seed carry
+`{"id":"recorder","mods":["SUPER","SHIFT"],"key":"R","action":"global","arg":"recorder"}`.
+- The real bridge `build_keybinds_lua` emits
+  `hl.bind("SUPER + SHIFT + R", hl.dsp.global("quickshell:recorder"))`.
+- It is listed in the keybind editor's actions, and shows in the keybind guide
+  (calendar panel), which lists `Config.keybinds`.
+- `LATE` seeding was run on copies: added once to an existing shell.json, and
+  skipped when the user already had Super+Shift+R.
+
+### Settings → Recording → Screen recording
+
+1. **Switch,** with its zero-cost text.
+2. **Status card** (green/amber, refresh button) and the granular component list.
+3. **Setup for your system** (only if something is missing).
+4. **Options:**
+   - Sound: No sound / System sound / Microphone. One source at a time:
+     wf-recorder takes a single audio device; mixing both would need a
+     combined PipeWire source.
+   - Format: MP4 / MKV, both H.264 + AAC.
+   - Folder: default `~/Videos/Recordings`, next to `~/Pictures/Screenshots`.
+5. **Open:** the current shortcut, read from shell.json; "Open the recorder";
+   the "add indicator" button when needed; the last file or last error.
+
+### Pre-existing bug fixed in passing: launcher search
+
+`Launcher.qml` did `(a.command || a.execString || "").toLowerCase()`.
+- In Quickshell 0.3.0 `DesktopEntry.command` is a `QVector<QString>` (a list),
+  so this threw for every desktop entry and **any typed query aborted
+  `rebuild()`**: the list never filtered. Seen in the log as
+  `TypeError: Property 'toLowerCase' of object libreoffice,--impress`.
+- It has been there since the first upload, and it hid the new
+  "Screen recorder" entry from search.
+- Now `String(...)`. Same matching, no throw. Verified: "record" → only
+  "Screen recorder".
+
+### Verified live (cloud container, NOT the user's machine)
+
+**Setup:**
+- Real wf-recorder 0.6.0 (nixos-26.05).
+- Real PipeWire 1.6.6 + WirePlumber + pipewire-pulse.
+- The real shell (quickshell 0.3.0, Mesa llvmpipe) on headless sway with
+  HEADLESS-1 1920×1080, **HEADLESS-2 1080×1920 portrait (transform 90)** and
+  HEADLESS-3.
+- A test-only fake Hyprland IPC for monitor offsets and focus.
+- Every click was a real pointer event (persistent `zwlr_virtual_pointer_v1`
+  helper). Every key was a real `wtype` key event.
+- Sound was identified by tone: 880 Hz played on the "speakers" sink, 440 Hz
+  fed into a test mic.
+
+**Detection** (by clicks in Settings):
+- wf-recorder missing → red ✗ and the setup section.
+- Ubuntu → generic list.
+- NixOS and CachyOS (`ID_LIKE=arch`), set through a test-only os-release
+  override, → their own texts, each also with sound missing.
+- Installed → green "ready (wf-recorder 0.6.0)", setup hidden.
+
+**Recordings** (all decode fully; packet DTS strictly increasing):
+
+| target | how chosen | sound | stop | result |
+|---|---|---|---|---|
+| HEADLESS-3 | Enter in the picker | system | click on the bar indicator | MP4 1920×1080, AAC; tone 880 Hz |
+| HEADLESS-2 (portrait) | click on its tile | mic | Stop button in the reopened picker | MKV 1080×1920, upright; 440 Hz |
+| region 601×301 on HEADLESS-2 | real drag in the overlay, Enter | | Super+Shift+R on a static screen | 600×300 with the right content; wf-recorder gone in 0.12 s |
+| HEADLESS-1 | → key in the picker, Enter (Spanish, Catppuccin Latte) | mic | | |
+| HEADLESS-2 | | No sound | | video-only file |
+
+**Indicator:**
+- Appeared on all three bars, portrait included, the moment recording started.
+- Showed the right elapsed time (00:08 at ~9 s, counted from the click).
+- Disappeared on stop.
+- Frame 0 of every file is clean: the picker/overlay is unmapped first.
+
+**Stops** (wf-recorder exit after the action):
+- bar click 0.15 s; picker Stop 0.15 s; shortcut 0.12 s;
+- **switch turned off mid-recording 0.25 s** (file finished);
+- **shell hot-reload mid-recording ~2 s** (MKV complete);
+- **`kill -9` of the shell mid-recording 0.24 s** (MP4 complete with its index).
+- After each: no wf-recorder, no wrapper, no temp file.
+- Standalone, on a static screen with no shell, the stdin-EOF stop took
+  0.32 s where plain SIGINT never returned.
+
+**Notifications and errors:**
+- "Recording saved" with path and icon reached the notification center (Vexyon
+  has no popups).
+- An unwritable folder (`/proc/vexyon-nope`, typed into the field) →
+  "Recording failed: Cannot create …" in Settings and as a notification;
+  nothing left running.
+
+**Launcher:** the entry exists only with the switch on, and Enter opens the
+picker on the focused monitor.
+
+**Keybind:** sway has no Hyprland global-shortcut protocol. A test sway bind on
+the real Super+Shift+R key ran the `onPressed` body, copied verbatim from
+shell.qml at test time. Result: picker on the focused monitor, stop while
+recording, Settings with the switch off.
+
+### Static only
+
+- **Arch (no pacman here):** the 15 shared files are `cmp`-identical to NixOS.
+  `bash -n` passes on `install.sh`, `vexyon-seed` and the wrapper script
+  extracted from `Recorder.qml`.
+- **qmllint** (Qt 6.11.2, `qs.*` tree), old vs new for every changed file: no
+  new warning type.
+  - The extra counts are the existing classes: unqualified access, `Loader.item`
+    typed as QObject, `GlobalShortcut` unresolved (no Hyprland plugin for lint),
+    Process `onExited` typing.
+  - `Recorder.qml` has only the last of those.
+
+### Not verified here
+
+- Real Hyprland (no GPU in the container): its screencopy path, its damage
+  timing, and the global shortcut through Hyprland itself.
+- The permission prompt with `enforce_permissions` on.
+- Your monitors, including the real DP-2 portrait, and fractional scales.
+- CPU load of software x264 at your resolutions.
+
+### Known limits (MVP, by design)
+
+- One audio source at a time.
+- One monitor (or one region inside one monitor) per recording; wf-recorder
+  can't span outputs.
+- No pause, no editing, no streaming, no webcam overlay.
+- Frame rate is variable, damage-driven: an idle screen records few frames.
+  That is normal for wf-recorder and keeps files small.
+
+### To check by hand on the tower
+
+1. Settings → Recording → Screen recording: turn it on. It should show the NixOS
+   / Arch lines until wf-recorder is installed, then green after the refresh
+   button.
+2. Super+Shift+R on each monitor, including DP-2. Pick "This screen", wait,
+   press Super+Shift+R again. Play the file (`mpv ~/Videos/Recordings/…`).
+3. Super+Shift+R → R → drag a box → Enter. Stop from the bar indicator.
+4. Try System sound and Microphone, and check that the file has sound.
+5. After stopping: `pgrep -x wf-recorder` prints nothing. For the shell, use the
+   `/proc/*/exe` recipe: there is still exactly one quickshell.
+6. Turn the switch off: the indicator and the launcher entry are gone.
+
+---
+
 ## Session: DNS selector, Vexyon fastfetch greeting, Super+Shift+C calculator
 
 ### Files changed
