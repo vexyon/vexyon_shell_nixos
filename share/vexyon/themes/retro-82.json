@@ -1,0 +1,30 @@
+{
+  "id": "retro-82",
+  "name": "Retro 82",
+  "dark": true,
+  "colors": {
+    "base": "#05182e",
+    "mantle": "#031222",
+    "crust": "#020c17",
+    "text": "#f6dcac",
+    "subtext0": "#a7c9c6",
+    "subtext1": "#a7c9c6",
+    "surface0": "#0a2540",
+    "surface1": "#134e5a",
+    "surface2": "#2a6b78",
+    "overlay0": "#3f8f8a",
+    "overlay1": "#3f8f8a",
+    "overlay2": "#3f8f8a",
+    "accent": "#faa968",
+    "accent2": "#faa968",
+    "onAccent": "#05182e",
+    "red": "#f85525",
+    "green": "#028391",
+    "yellow": "#e97b3c",
+    "blue": "#3f8f8a",
+    "peach": "#faa968",
+    "mauve": "#3f8f8a",
+    "teal": "#8cbfb8",
+    "pink": "#3f8f8a"
+  }
+}

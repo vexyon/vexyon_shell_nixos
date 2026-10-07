@@ -1,0 +1,30 @@
+{
+  "id": "lumon",
+  "name": "Lumon",
+  "dark": true,
+  "colors": {
+    "base": "#16242d",
+    "mantle": "#101b21",
+    "crust": "#0b1216",
+    "text": "#d6e2ee",
+    "subtext0": "#d6e2ee",
+    "subtext1": "#d6e2ee",
+    "surface0": "#1b2d40",
+    "surface1": "#243d56",
+    "surface2": "#304860",
+    "overlay0": "#4d86b0",
+    "overlay1": "#4d86b0",
+    "overlay2": "#4d86b0",
+    "accent": "#8bc9eb",
+    "accent2": "#f2fcff",
+    "onAccent": "#16242d",
+    "red": "#4d86b0",
+    "green": "#5e95bc",
+    "yellow": "#6fa4c9",
+    "blue": "#6fb8e3",
+    "peach": "#8bc9eb",
+    "mauve": "#b1d8ee",
+    "teal": "#b4e4f6",
+    "pink": "#8bc9eb"
+  }
+}

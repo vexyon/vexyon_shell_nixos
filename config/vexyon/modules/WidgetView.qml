@@ -220,6 +220,13 @@ Item {
         }
     }
 
+    // ---- color de los iconos de la barra (roles del tema, nunca fijos) -----
+    //  reposo → Theme.accentFg · abierto/activo/sin leer → Theme.accent2Fg ·
+    //  apagado/silenciado → Theme.overlay2 · estado real → red/green/yellow.
+    //  Los textos siguen en text/subtext*. Antes todo icono iba en `text` (y
+    //  los monitores en peach/mauve/teal, mismo tono en todos los temas): al
+    //  cambiar de tema la barra solo cambiaba de matiz.
+
     // ---- glifo pasivo (sin MouseArea ni hover propio) ----------------------
     //  Sustituye a IconButton en los widgets cuya ÚNICA interacción es la
     //  acción primaria: el click/hover lo pone el fondo de la pastilla (bg),
@@ -227,7 +234,7 @@ Item {
     //  Mismo footprint (28px) que el IconButton que reemplaza.
     component Glyph : Item {
         property string icon: ""
-        property color iconColor: Theme.text
+        property color iconColor: Theme.accentFg
         property bool selfHide: false
         implicitWidth: 28
         implicitHeight: 28
@@ -246,7 +253,7 @@ Item {
     component Pill : Grid {
         property string glyph: ""
         property string label: ""
-        property color glyphColor: Theme.text
+        property color glyphColor: Theme.accentFg
         property color labelColor: Theme.subtext0
         property int labelSize: view.wFont - 1
         columns: view.vertical ? 1 : 2
@@ -281,7 +288,7 @@ Item {
             // icono por instancia: cfg.icon (clave) → glifo/logo; def. "grid"
             iconKey: view.cfg && view.cfg.icon ? view.cfg.icon : "grid"
             pixel: view.wIcon
-            tint: Panels.launcher ? Theme.accent : Theme.text
+            tint: Panels.launcher ? Theme.accent2Fg : Theme.accentFg
         }
     }
 
@@ -299,6 +306,11 @@ Item {
             readonly property int focusedId: Hyprland.focusedWorkspace ? Hyprland.focusedWorkspace.id : 1
             readonly property bool followMon: wcget("followMonitor", false)
             readonly property int curMon: Hyprland.focusedMonitor ? Hyprland.focusedMonitor.id : -1
+            // bar.workspaceStyle "dot" (estilos de barra): punto por workspace y
+            // el enfocado alargado, sin número. Si el usuario pidió nombres o
+            // iconos de apps, eso manda y se queda la píldora.
+            readonly property bool dots: Config.get("bar", "workspaceStyle", "pill") === "dot"
+                                         && !wsw.wcget("showApps", false) && !wsw.wcget("showNames", false)
 
             readonly property var existing: {
                 var s = [];
@@ -369,8 +381,8 @@ Item {
                 // fila en barra horizontal (columns -1 = sin límite), columna
                 // única en barra vertical
                 columns: view.vertical ? 1 : -1
-                rowSpacing: 6
-                columnSpacing: 6
+                rowSpacing: wsw.dots ? 8 : 6
+                columnSpacing: wsw.dots ? 8 : 6
                 Repeater {
                     model: wsw.wsList
                     delegate: Rectangle {
@@ -389,13 +401,15 @@ Item {
 
                         // el pill enfocado crece a lo largo del eje de la barra;
                         // con iconos de apps crece lo que pida el contenido
-                        implicitHeight: view.vertical
+                        implicitHeight: wsw.dots ? (view.vertical && focused ? 22 : 8)
+                            : view.vertical
                             ? (hasApps ? Math.max(focused ? 30 : 22, wsContent.implicitHeight + 14) : (focused ? 30 : 22))
                             : 22
-                        implicitWidth: view.vertical ? 22
+                        implicitWidth: wsw.dots ? (!view.vertical && focused ? 22 : 8)
+                            : view.vertical ? 22
                             : (hasApps ? Math.max(focused ? 30 : 22, wsContent.implicitWidth + 14)
                                : (focused ? Math.max(30, wsLabel.implicitWidth + 16) : 22))
-                        radius: 11
+                        radius: wsw.dots ? 4 : 11
                         Layout.alignment: Qt.AlignHCenter | Qt.AlignVCenter
                         color: focused ? view.roleColor(wsw.wcget("focusedColor", "primary"), Theme.accent)
                                : urgent ? view.roleColor(wsw.wcget("urgentColor", "error"), Theme.red)
@@ -411,6 +425,7 @@ Item {
 
                         Grid {
                             id: wsContent
+                            visible: !wsw.dots
                             anchors.centerIn: parent
                             // iconos en fila en barra horizontal, en columna en vertical.
                             // OJO: si columns > nº de ítems visibles, Grid infla
@@ -444,6 +459,12 @@ Item {
                         }
                         MouseArea {
                             anchors.fill: parent
+                            // en modo punto el área clicable sigue siendo la de
+                            // la píldora: 22 de grosor y medio hueco a cada lado
+                            anchors.topMargin: wsw.dots ? (view.vertical ? -4 : -7) : 0
+                            anchors.bottomMargin: anchors.topMargin
+                            anchors.leftMargin: wsw.dots ? (view.vertical ? -7 : -4) : 0
+                            anchors.rightMargin: anchors.leftMargin
                             cursorShape: Qt.PointingHandCursor
                             // Forma Lua (la cadena hyprlang "workspace N" no parsea)
                             onClicked: Hyprland.dispatch("hl.dsp.focus({ workspace = " + ws.wsId + " })")
@@ -509,7 +530,7 @@ Item {
                     Text {
                         visible: clockMa.showDate
                         anchors.verticalCenter: parent.verticalCenter
-                        text: Time.date; color: Theme.accent
+                        text: Time.date; color: Theme.accentFg
                         font.family: Theme.fontFamily; font.pixelSize: view.wFont - 1
                     }
                 }
@@ -551,7 +572,7 @@ Item {
         Glyph {
             icon: Audio.muted || Audio.percent === 0 ? Icons.volumeMute
                   : Audio.percent < 50 ? Icons.volumeLow : Icons.volumeHigh
-            iconColor: Audio.muted ? Theme.overlay2 : Theme.text
+            iconColor: Audio.muted ? Theme.overlay2 : Theme.accentFg
         }
     }
 
@@ -566,7 +587,7 @@ Item {
         Pill {
             readonly property bool selfHide: !Battery.present
             glyph: Battery.charging ? Icons.charging : Battery.percent <= 15 ? Icons.batteryLow : Icons.battery
-            glyphColor: Battery.percent <= 15 && !Battery.charging ? Theme.red : Battery.charging ? Theme.green : Theme.text
+            glyphColor: Battery.percent <= 15 && !Battery.charging ? Theme.red : Battery.charging ? Theme.green : Theme.accentFg
             label: Battery.percent + "%"
             labelSize: view.wFont - 2
         }
@@ -575,7 +596,7 @@ Item {
     Component { id: cNetwork
         Glyph {
             icon: Network.kind === "wifi" ? Icons.wifi : Network.kind === "ethernet" ? Icons.ethernet : Icons.noNetwork
-            iconColor: Network.kind === "disconnected" ? Theme.overlay2 : Theme.text
+            iconColor: Network.kind === "disconnected" ? Theme.overlay2 : Theme.accentFg
         }
     }
 
@@ -583,7 +604,7 @@ Item {
         Glyph {
             selfHide: !Bluetooth.present
             icon: Icons.bluetooth
-            iconColor: !Bluetooth.enabled ? Theme.overlay2 : Bluetooth.connectedCount > 0 ? Theme.accent : Theme.text
+            iconColor: !Bluetooth.enabled ? Theme.overlay2 : Bluetooth.connectedCount > 0 ? Theme.accent2Fg : Theme.accentFg
         }
     }
 
@@ -591,28 +612,28 @@ Item {
         Glyph {
             selfHide: !Mic.present
             icon: Mic.muted ? Icons.micOff : Icons.microphone
-            iconColor: Mic.muted ? Theme.overlay2 : Theme.text
+            iconColor: Mic.muted ? Theme.overlay2 : Theme.accentFg
         }
     }
 
     Component { id: cPower
         Glyph {
             icon: Icons.power
-            iconColor: Panels.powermenu ? Theme.red : Theme.text
+            iconColor: Panels.powermenu ? Theme.red : Theme.accentFg
         }
     }
 
     Component { id: cControl
         Glyph {
             icon: Icons.sliders
-            iconColor: Panels.quickSettings ? Theme.accent : Theme.text
+            iconColor: Panels.quickSettings ? Theme.accent2Fg : Theme.accentFg
         }
     }
 
     Component { id: cWeather
         Pill {
             readonly property bool selfHide: !Weather.ok
-            glyph: Icons.cloud; glyphColor: Theme.blue
+            glyph: Icons.cloud; glyphColor: Theme.accentFg
             label: Weather.ok ? (Weather.temp + "°") : ""
         }
     }
@@ -620,14 +641,14 @@ Item {
     Component { id: cNotif
         Glyph {
             icon: Notifications.dnd ? Icons.bellOff : Icons.bell
-            iconColor: Notifications.dnd ? Theme.overlay2 : Notifications.unread > 0 ? Theme.accent : Theme.text
+            iconColor: Notifications.dnd ? Theme.overlay2 : Notifications.unread > 0 ? Theme.accent2Fg : Theme.accentFg
         }
     }
 
     Component { id: cIdle
         Glyph {
             icon: Icons.coffee
-            iconColor: IdleInhibitor.active ? Theme.accent : Theme.overlay2
+            iconColor: IdleInhibitor.active ? Theme.accent2Fg : Theme.overlay2
         }
     }
 
@@ -643,9 +664,9 @@ Item {
             rowSpacing: 4
             horizontalItemAlignment: Grid.AlignHCenter
             verticalItemAlignment: Grid.AlignVCenter
-            IconButton { icon: Icons.stepBack; iconSize: view.wFont - 1; implicitWidth: 22; implicitHeight: 22; onClicked: Media.previous() }
-            IconButton { icon: Media.playing ? Icons.pause : Icons.play; iconColor: Theme.accent; iconSize: view.wFont; implicitWidth: 22; implicitHeight: 22; onClicked: Media.toggle() }
-            IconButton { icon: Icons.stepForward; iconSize: view.wFont - 1; implicitWidth: 22; implicitHeight: 22; onClicked: Media.next() }
+            IconButton { icon: Icons.stepBack; iconColor: Theme.accentFg; iconSize: view.wFont - 1; implicitWidth: 22; implicitHeight: 22; onClicked: Media.previous() }
+            IconButton { icon: Media.playing ? Icons.pause : Icons.play; iconColor: Theme.accent2Fg; iconSize: view.wFont; implicitWidth: 22; implicitHeight: 22; onClicked: Media.toggle() }
+            IconButton { icon: Icons.stepForward; iconColor: Theme.accentFg; iconSize: view.wFont - 1; implicitWidth: 22; implicitHeight: 22; onClicked: Media.next() }
             Text {
                 // per-instància: cfg.showLabel (def. true); sense títol en vertical
                 visible: (view.cfg && view.cfg.showLabel !== undefined ? view.cfg.showLabel : true) && !view.vertical
@@ -701,22 +722,22 @@ Item {
     }
 
     Component { id: cCpu
-        MonPill { glyph: Icons.microchip; glyphColor: Theme.peach; label: SystemStats.cpuPercent + "%" }
+        MonPill { glyph: Icons.microchip; glyphColor: Theme.accentFg; label: SystemStats.cpuPercent + "%" }
     }
     Component { id: cMem
-        MonPill { glyph: Icons.server; glyphColor: Theme.mauve; label: SystemStats.memPercent + "%" }
+        MonPill { glyph: Icons.server; glyphColor: Theme.accent2Fg; label: SystemStats.memPercent + "%" }
     }
     Component { id: cDisk
-        MonPill { glyph: Icons.drive; glyphColor: Theme.teal; label: SystemStats.diskPercent + "%" }
+        MonPill { glyph: Icons.drive; glyphColor: Theme.accentFg; label: SystemStats.diskPercent + "%" }
     }
     Component { id: cCpuTemp
         MonPill { selfHide: SystemStats.cpuTemp <= 0; glyph: Icons.thermometer
-               glyphColor: SystemStats.cpuTemp >= 80 ? Theme.red : Theme.yellow
+               glyphColor: SystemStats.cpuTemp >= 80 ? Theme.red : Theme.accent2Fg
                label: SystemStats.cpuTemp + "°" }
     }
     Component { id: cGpuTemp
         MonPill { selfHide: SystemStats.gpuTemp <= 0; glyph: Icons.thermometer
-               glyphColor: SystemStats.gpuTemp >= 85 ? Theme.red : Theme.green
+               glyphColor: SystemStats.gpuTemp >= 85 ? Theme.red : Theme.accentFg
                label: SystemStats.gpuTemp + "°" }
     }
     Component {
@@ -732,12 +753,12 @@ Item {
             verticalItemAlignment: Grid.AlignVCenter
             Row {
                 spacing: 2
-                Text { anchors.verticalCenter: parent.verticalCenter; text: Icons.arrowDown; color: Theme.green; font.family: Theme.fontFamily; font.pixelSize: view.wFont - 2 }
+                Text { anchors.verticalCenter: parent.verticalCenter; text: Icons.arrowDown; color: Theme.accentFg; font.family: Theme.fontFamily; font.pixelSize: view.wFont - 2 }
                 Text { anchors.verticalCenter: parent.verticalCenter; text: SystemStats.fmtSpeed(SystemStats.netDownKbs); color: Theme.subtext0; font.family: Theme.fontFamily; font.pixelSize: view.wFont - 3 }
             }
             Row {
                 spacing: 2
-                Text { anchors.verticalCenter: parent.verticalCenter; text: Icons.arrowUp; color: Theme.peach; font.family: Theme.fontFamily; font.pixelSize: view.wFont - 2 }
+                Text { anchors.verticalCenter: parent.verticalCenter; text: Icons.arrowUp; color: Theme.accent2Fg; font.family: Theme.fontFamily; font.pixelSize: view.wFont - 2 }
                 Text { anchors.verticalCenter: parent.verticalCenter; text: SystemStats.fmtSpeed(SystemStats.netUpKbs); color: Theme.subtext0; font.family: Theme.fontFamily; font.pixelSize: view.wFont - 3 }
             }
         }
@@ -781,8 +802,8 @@ Item {
                         source: trayIcon
                         visible: parent.parent.tint !== "none"
                         colorization: 1.0
-                        colorizationColor: parent.parent.tint === "primary" ? Theme.accent
-                                         : parent.parent.tint === "secondary" ? Theme.accent2
+                        colorizationColor: parent.parent.tint === "primary" ? Theme.accentFg
+                                         : parent.parent.tint === "secondary" ? Theme.accent2Fg
                                          : Theme.text
                         brightness: 0.0
                     }

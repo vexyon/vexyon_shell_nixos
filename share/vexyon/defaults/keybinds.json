@@ -77,6 +77,18 @@
     "category": "Vexyon"
   },
   {
+    "id": "calculator",
+    "mods": [
+      "SUPER",
+      "SHIFT"
+    ],
+    "key": "C",
+    "action": "global",
+    "arg": "calculator",
+    "desc": "Open Calculator",
+    "category": "Vexyon"
+  },
+  {
     "id": "togglefloat",
     "mods": [
       "SUPER"

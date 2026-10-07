@@ -1,0 +1,30 @@
+{
+  "id": "miasma",
+  "name": "Miasma",
+  "dark": true,
+  "colors": {
+    "base": "#222222",
+    "mantle": "#191919",
+    "crust": "#121212",
+    "text": "#c2c2b0",
+    "subtext0": "#8a8a7e",
+    "subtext1": "#8a8a7e",
+    "surface0": "#2c2c2c",
+    "surface1": "#383838",
+    "surface2": "#666666",
+    "overlay0": "#555555",
+    "overlay1": "#555555",
+    "overlay2": "#555555",
+    "accent": "#78824b",
+    "accent2": "#78824b",
+    "onAccent": "#222222",
+    "red": "#685742",
+    "green": "#5f875f",
+    "yellow": "#b36d43",
+    "blue": "#78824b",
+    "peach": "#8d6242",
+    "mauve": "#bb7744",
+    "teal": "#c9a554",
+    "pink": "#bb7744"
+  }
+}

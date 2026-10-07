@@ -1,0 +1,30 @@
+{
+  "id": "osaka-jade",
+  "name": "Osaka Jade",
+  "dark": true,
+  "colors": {
+    "base": "#111c18",
+    "mantle": "#0c1512",
+    "crust": "#090f0d",
+    "text": "#c1c497",
+    "subtext0": "#d6d5bc",
+    "subtext1": "#d6d5bc",
+    "surface0": "#23372b",
+    "surface1": "#32473b",
+    "surface2": "#53685b",
+    "overlay0": "#81b8a8",
+    "overlay1": "#81b8a8",
+    "overlay2": "#81b8a8",
+    "accent": "#509475",
+    "accent2": "#acd4cf",
+    "onAccent": "#111c18",
+    "red": "#ff5345",
+    "green": "#549e6a",
+    "yellow": "#459451",
+    "blue": "#509475",
+    "peach": "#a2734b",
+    "mauve": "#75bbb3",
+    "teal": "#2dd5b7",
+    "pink": "#d2689c"
+  }
+}

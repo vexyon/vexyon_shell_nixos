@@ -56,6 +56,14 @@ Singleton {
     // Contrast color to place text on top of the accent.
     readonly property color onAccent: pc("onAccent", meta.dark === false ? "#ffffff" : "#0b0b0f")
 
+    // Accent as FOREGROUND (icons/text drawn on a surface, e.g. the bar's
+    // pills). `accent` is tuned as a FILL (focused workspace, panel blobs, OSD
+    // bar); in light themes the canonical accent is too pale to read on a
+    // surface (Rosé Pine Dawn 2.2:1), so a theme may ship a same-hue variant.
+    // Optional keys: themes whose accent already reads fine just omit them.
+    readonly property color accentFg:  pc("accentFg",  accent)
+    readonly property color accent2Fg: pc("accent2Fg", accent2)
+
     // =======================================================================
     //  GEOMETRY / TYPOGRAPHY / MOTION TOKENS  (shell.json, theme may override)
     // =======================================================================

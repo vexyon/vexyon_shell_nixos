@@ -52,11 +52,21 @@ AnchoredPanel {
             // ssid con la tarjeta de contraseña expandida ("" = ninguna)
             property string pwSsid: ""
 
+            // DNS: el dispositivo de la pestaña, solo si tiene conexión activa
+            // (Bluetooth no lleva DNS propio). Se relee al cambiar — sin sondeo.
+            readonly property string dnsDev: mode === "wifi" ? (Network.wifiSsid !== "" ? Network.wifiDevice : "")
+                                           : mode === "eth" ? (Network.ethUp ? Network.ethDevice : "") : ""
+            property bool dnsOpen: false
+            property bool dnsCustom: false
+            onDnsDevChanged: { Network.refreshDns(dnsDev); dnsCustom = false; }
+
             // refresco al abrir (y al cambiar de pestaña wifi)
             Component.onCompleted: {
                 Network.refreshSaved();
                 Network.refreshInfo();
                 if (body.wifiPresent) Network.refreshWifi();
+                Network.dnsState = "";
+                Network.refreshDns(body.dnsDev);
             }
             onModeChanged: {
                 body.pwSsid = "";
@@ -695,6 +705,248 @@ AnchoredPanel {
                                 }
                             }
                         }
+                    }
+                }
+
+                // ======================= DNS ================================
+                //  Por CONEXIÓN (ver Network.setDns): cambia el perfil activo
+                //  de esta pestaña y se aplica en caliente con `device reapply`.
+                Rectangle {
+                    id: dnsCard
+                    readonly property var d: Network.dns
+                    readonly property bool ready: body.dnsDev !== "" && d.dev === body.dnsDev && (d.uuid || "") !== ""
+                    readonly property bool busy: Network.dnsState === "applying" || Network.dnsState === "reconnecting"
+                    function presetLabel(id) {
+                        return id === "auto" ? I18n.t("Automatic") : id === "custom" ? I18n.t("Custom")
+                             : id === "cloudflare" ? "Cloudflare" : id === "google" ? "Google" : id === "quad9" ? "Quad9" : id;
+                    }
+                    Layout.fillWidth: true
+                    visible: ready
+                    implicitHeight: dnsCol.implicitHeight + 20
+                    radius: Theme.radius
+                    color: Theme.surface0
+                    border.width: 1
+                    border.color: Qt.rgba(Theme.overlay0.r, Theme.overlay0.g, Theme.overlay0.b, 0.5)
+                    opacity: body.introContent
+                    Behavior on implicitHeight { NumberAnimation { duration: Theme.dur(160); easing.type: Theme.easing } }
+                    clip: true
+
+                    ColumnLayout {
+                        id: dnsCol
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        anchors.margins: 10
+                        spacing: 8
+
+                        // cabecera: servidores EN USO + modo; clic = desplegar
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 10
+                            Text {
+                                text: Icons.server
+                                color: dnsCard.d.preset === "auto" ? Theme.overlay2 : body.panelAccent
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize + 1
+                            }
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                spacing: 1
+                                Text {
+                                    text: "DNS · " + dnsCard.presetLabel(dnsCard.d.preset || "auto")
+                                    color: Theme.text
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: Theme.fontSize - 1
+                                    font.bold: true
+                                }
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: {
+                                        var a = (dnsCard.d.active4 || []).concat(dnsCard.d.active6 || []);
+                                        return a.length ? I18n.t("In use") + ": " + a.join(", ") : I18n.t("No DNS servers");
+                                    }
+                                    color: Theme.subtext0
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: Theme.fontSize - 4
+                                    elide: Text.ElideRight
+                                }
+                            }
+                            Text {
+                                text: body.dnsOpen ? Icons.chevronDown : Icons.chevronRight
+                                color: Theme.subtext0
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 2
+                            }
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            visible: body.dnsOpen
+                            wrapMode: Text.WordWrap
+                            text: I18n.t("Only for this connection:") + " " + (dnsCard.d.name || "")
+                                  + (dnsCard.d.v6ok ? "" : " · " + I18n.t("IPv6 off, IPv4 only"))
+                            color: Theme.overlay2
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontSize - 4
+                        }
+
+                        // presets + personalizado (la elegida resaltada)
+                        Flow {
+                            Layout.fillWidth: true
+                            visible: body.dnsOpen
+                            spacing: 6
+                            Repeater {
+                                model: ["auto", "cloudflare", "google", "quad9", "custom"]
+                                delegate: Rectangle {
+                                    id: chip
+                                    required property string modelData
+                                    readonly property bool sel: body.dnsCustom ? modelData === "custom"
+                                                                               : dnsCard.d.preset === modelData
+                                    width: chipLbl.implicitWidth + 20
+                                    height: 26
+                                    radius: 13
+                                    color: sel ? body.panelAccent
+                                         : chipMa.containsMouse ? Theme.surface2 : Theme.surface1
+                                    opacity: dnsCard.busy && !sel ? 0.5 : 1
+                                    Behavior on color { ColorAnimation { duration: Theme.dur(120) } }
+                                    Text {
+                                        id: chipLbl
+                                        anchors.centerIn: parent
+                                        text: dnsCard.presetLabel(chip.modelData)
+                                        color: chip.sel ? Theme.onAccent : Theme.text
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize - 3
+                                        font.bold: chip.sel
+                                    }
+                                    MouseArea {
+                                        id: chipMa
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        enabled: !dnsCard.busy
+                                        onClicked: {
+                                            if (chip.modelData === "custom") {
+                                                body.dnsCustom = true;
+                                                Network.dnsState = "";
+                                                dnsField.text = (dnsCard.d.preset === "custom")
+                                                    ? (dnsCard.d.cfg4 || []).concat(dnsCard.d.cfg6 || []).join(", ") : "";
+                                                dnsField.forceActiveFocus();
+                                                return;
+                                            }
+                                            body.dnsCustom = false;
+                                            var ps = Network.dnsPresets;
+                                            for (var i = 0; i < ps.length; i++)
+                                                if (ps[i].id === chip.modelData) Network.setDns(ps[i].v4, ps[i].v6);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // servidores propios: IPv4 y/o IPv6, separados por espacio o coma
+                        RowLayout {
+                            id: dnsCustomRow
+                            Layout.fillWidth: true
+                            visible: body.dnsOpen && body.dnsCustom
+                            spacing: 8
+                            function submit() {
+                                var parts = dnsField.text.split(/[\s,;]+/).filter(function(x) { return x !== ""; });
+                                var v4 = [], v6 = [], bad = [];
+                                var re4 = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
+                                var re6 = /^[0-9a-fA-F:]+$/;
+                                for (var i = 0; i < parts.length; i++) {
+                                    if (re4.test(parts[i])) v4.push(parts[i]);
+                                    else if (parts[i].indexOf(":") !== -1 && re6.test(parts[i])
+                                             && (parts[i].match(/::/g) || []).length <= 1) v6.push(parts[i]);
+                                    else bad.push(parts[i]);
+                                }
+                                if (bad.length || (v4.length + v6.length) === 0) {
+                                    Network.dnsState = "error";
+                                    Network.dnsError = bad.length ? I18n.t("Not a valid address:") + " " + bad.join(", ")
+                                                                  : I18n.t("Enter at least one server");
+                                    return;
+                                }
+                                Network.setDns(v4, v6);
+                                body.dnsCustom = false;
+                            }
+                            Rectangle {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: 30
+                                radius: Theme.radius - 2
+                                color: Theme.mantle
+                                border.width: 1
+                                border.color: dnsField.activeFocus ? body.panelAccent : Theme.surface2
+                                TextInput {
+                                    id: dnsField
+                                    anchors.fill: parent
+                                    anchors.leftMargin: 10
+                                    anchors.rightMargin: 10
+                                    verticalAlignment: TextInput.AlignVCenter
+                                    color: Theme.text
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: Theme.fontSize - 2
+                                    clip: true
+                                    onAccepted: dnsCustomRow.submit()
+                                    Keys.onEscapePressed: body.dnsCustom = false
+                                    Text {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        visible: dnsField.text === ""
+                                        text: "1.1.1.1, 2606:4700:4700::1111"
+                                        color: Theme.overlay1
+                                        font: dnsField.font
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                Layout.preferredWidth: applyLbl.implicitWidth + 22
+                                Layout.preferredHeight: 30
+                                radius: 15
+                                color: applyMa.containsMouse ? Theme.accent2 : Theme.accent
+                                Text {
+                                    id: applyLbl
+                                    anchors.centerIn: parent
+                                    text: I18n.t("Apply")
+                                    color: Theme.onAccent
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: Theme.fontSize - 2
+                                    font.bold: true
+                                }
+                                MouseArea {
+                                    id: applyMa
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: dnsCustomRow.submit()
+                                }
+                            }
+                        }
+
+                        // qué está pasando (aplicar / reactivar / error)
+                        Text {
+                            Layout.fillWidth: true
+                            visible: body.dnsOpen && Network.dnsState !== ""
+                            wrapMode: Text.WordWrap
+                            text: Network.dnsState === "applying" ? I18n.t("Applying…")
+                                : Network.dnsState === "reconnecting" ? I18n.t("Reconnecting to apply DNS…")
+                                : Network.dnsState === "applied" ? I18n.t("DNS updated, without reconnecting")
+                                : Network.dnsState === "reconnected" ? I18n.t("DNS updated (reconnected)")
+                                : Network.dnsError !== "" ? Network.dnsError : I18n.t("Could not change DNS")
+                            color: Network.dnsState === "error" ? Theme.red
+                                 : Network.dnsState === "reconnecting" ? Theme.peach
+                                 : Network.dnsState === "applying" ? Theme.subtext0 : Theme.green
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontSize - 4
+                        }
+                    }
+
+                    // la cabecera entera despliega/pliega (encima, solo su franja)
+                    MouseArea {
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        height: 44
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: { body.dnsOpen = !body.dnsOpen; if (!body.dnsOpen) body.dnsCustom = false; }
                     }
                 }
             }

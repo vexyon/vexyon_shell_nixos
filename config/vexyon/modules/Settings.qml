@@ -2733,6 +2733,22 @@ FloatingWindow {
                         placeholder: I18n.t("auto (detects Brave→Chrome→Zen→Firefox)")
                     }
 
+                    // Saludo de fish al abrir un terminal: el bridge regenera
+                    // conf.d/vexyon-greeting.fish con lo elegido aquí.
+                    SsHeader { text: I18n.t("TERMINAL") }
+                    SsSeg {
+                        label: I18n.t("Greeting when a terminal opens")
+                        sect: "behavior"; k: "terminalGreeting"; def: "vexyon"
+                        options: [ { v: "vexyon", l: I18n.t("Vexyon fastfetch") },
+                                   { v: "own",    l: I18n.t("My fastfetch config") },
+                                   { v: "off",    l: I18n.t("Off") } ]
+                    }
+                    Text {
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap
+                        text: I18n.t("\"My fastfetch config\" runs plain fastfetch, which reads ~/.config/fastfetch/config.jsonc if you have one; Vexyon never writes there. A fish_greeting of your own in config.fish always takes precedence.")
+                        color: Theme.subtext0; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
+                    }
+
                     SsHeader { text: I18n.t("WINDOWS AND FOCUS") }
                     SsToggle { label: I18n.t("Focus follows mouse"); sect: "behavior"; k: "focusFollowsMouse"; def: true }
                     SsSlider { label: I18n.t("Inner spacing (gaps_in)"); sect: "layout"; k: "gapsIn";  min: 0; max: 40; def: 4;  step: 1; suffix: " px" }

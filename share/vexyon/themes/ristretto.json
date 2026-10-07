@@ -1,0 +1,30 @@
+{
+  "id": "ristretto",
+  "name": "Ristretto",
+  "dark": true,
+  "colors": {
+    "base": "#2c2525",
+    "mantle": "#211b1b",
+    "crust": "#181414",
+    "text": "#e6d9db",
+    "subtext0": "#c3b7b8",
+    "subtext1": "#c3b7b8",
+    "surface0": "#3d2f2a",
+    "surface1": "#403e41",
+    "surface2": "#72696a",
+    "overlay0": "#72696a",
+    "overlay1": "#72696a",
+    "overlay2": "#72696a",
+    "accent": "#f38d70",
+    "accent2": "#f8a788",
+    "onAccent": "#2c2525",
+    "red": "#fd6883",
+    "green": "#adda78",
+    "yellow": "#f9cc6c",
+    "blue": "#f38d70",
+    "peach": "#fb9a77",
+    "mauve": "#bebffd",
+    "teal": "#85dacc",
+    "pink": "#a8a9eb"
+  }
+}

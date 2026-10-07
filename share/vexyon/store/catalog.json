@@ -27,7 +27,7 @@
         "text": "#f8f8f2", "subtext0": "#a9b1d6", "subtext1": "#c9cbe0",
         "surface0": "#343746", "surface1": "#414458", "surface2": "#565973",
         "overlay0": "#626483", "overlay1": "#6272a4", "overlay2": "#7a83b0",
-        "accent": "#bd93f9", "accent2": "#ff79c6", "onAccent": "#1c1d26",
+        "accent": "#bd93f9", "accent2": "#ff79c6", "onAccent": "#1c1d26", "accentFg": "#c096fc",
         "red": "#ff5555", "green": "#50fa7b", "yellow": "#f1fa8c",
         "blue": "#8be9fd", "peach": "#ffb86c", "mauve": "#bd93f9",
         "teal": "#8be9fd", "pink": "#ff79c6"
@@ -75,7 +75,7 @@
         "text": "#eee8d5", "subtext0": "#93a1a1", "subtext1": "#b3bbad",
         "surface0": "#073642", "surface1": "#0d4150", "surface2": "#144d5e",
         "overlay0": "#586e75", "overlay1": "#657b83", "overlay2": "#839496",
-        "accent": "#268bd2", "accent2": "#2aa198", "onAccent": "#001f27",
+        "accent": "#268bd2", "accent2": "#2aa198", "onAccent": "#001f27", "accentFg": "#46a6ef",
         "red": "#dc322f", "green": "#859900", "yellow": "#b58900",
         "blue": "#268bd2", "peach": "#cb4b16", "mauve": "#6c71c4",
         "teal": "#2aa198", "pink": "#d33682"
@@ -107,7 +107,7 @@
         "text": "#2e3440", "subtext0": "#4c566a", "subtext1": "#3b4252",
         "surface0": "#e5e9f0", "surface1": "#d8dee9", "surface2": "#c8d0de",
         "overlay0": "#aeb8c9", "overlay1": "#9aa5b8", "overlay2": "#7b8aa3",
-        "accent": "#5e81ac", "accent2": "#81a1c1", "onAccent": "#ffffff",
+        "accent": "#5e81ac", "accent2": "#81a1c1", "onAccent": "#ffffff", "accentFg": "#456690", "accent2Fg": "#6483a1",
         "red": "#bf616a", "green": "#a3be8c", "yellow": "#d08770",
         "blue": "#5e81ac", "peach": "#d08770", "mauve": "#b48ead",
         "teal": "#8fbcbb", "pink": "#b48ead"

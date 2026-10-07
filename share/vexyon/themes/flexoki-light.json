@@ -1,0 +1,30 @@
+{
+  "id": "flexoki-light",
+  "name": "Flexoki Light",
+  "dark": false,
+  "colors": {
+    "base": "#fffcf0",
+    "mantle": "#f2efe4",
+    "crust": "#e5e2d8",
+    "text": "#100f0f",
+    "subtext0": "#403e3c",
+    "subtext1": "#403e3c",
+    "surface0": "#e6e4d9",
+    "surface1": "#cecdc3",
+    "surface2": "#b7b5ac",
+    "overlay0": "#878580",
+    "overlay1": "#878580",
+    "overlay2": "#878580",
+    "accent": "#205ea6",
+    "accent2": "#4385be",
+    "onAccent": "#fffcf0",
+    "red": "#d14d41",
+    "green": "#879a39",
+    "yellow": "#d0a215",
+    "blue": "#205ea6",
+    "peach": "#d0772b",
+    "mauve": "#ce5d97",
+    "teal": "#3aa99f",
+    "pink": "#ce5d97"
+  }
+}

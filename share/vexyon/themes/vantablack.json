@@ -1,0 +1,30 @@
+{
+  "id": "vantablack",
+  "name": "Vantablack",
+  "dark": true,
+  "colors": {
+    "base": "#000000",
+    "mantle": "#090909",
+    "crust": "#070707",
+    "text": "#ffffff",
+    "subtext0": "#ececec",
+    "subtext1": "#ececec",
+    "surface0": "#1a1a1a",
+    "surface1": "#1a1a1a",
+    "surface2": "#7a7a7a",
+    "overlay0": "#505050",
+    "overlay1": "#505050",
+    "overlay2": "#505050",
+    "accent": "#8d8d8d",
+    "accent2": "#8d8d8d",
+    "onAccent": "#000000",
+    "red": "#a4a4a4",
+    "green": "#b6b6b6",
+    "yellow": "#cecece",
+    "blue": "#8d8d8d",
+    "peach": "#b9b9b9",
+    "mauve": "#9b9b9b",
+    "teal": "#b0b0b0",
+    "pink": "#9b9b9b"
+  }
+}

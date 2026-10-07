@@ -1,0 +1,30 @@
+{
+  "id": "matte-black",
+  "name": "Matte Black",
+  "dark": true,
+  "colors": {
+    "base": "#121212",
+    "mantle": "#0d0d0d",
+    "crust": "#090909",
+    "text": "#bebebe",
+    "subtext0": "#8a8a8d",
+    "subtext1": "#8a8a8d",
+    "surface0": "#1e1e1e",
+    "surface1": "#2a2a2a",
+    "surface2": "#333333",
+    "overlay0": "#555555",
+    "overlay1": "#555555",
+    "overlay2": "#555555",
+    "accent": "#e68e0d",
+    "accent2": "#f59e0b",
+    "onAccent": "#121212",
+    "red": "#d35f5f",
+    "green": "#ffc107",
+    "yellow": "#b91c1c",
+    "blue": "#e68e0d",
+    "peach": "#c63d3d",
+    "mauve": "#b91c1c",
+    "teal": "#bebebe",
+    "pink": "#d35f5f"
+  }
+}

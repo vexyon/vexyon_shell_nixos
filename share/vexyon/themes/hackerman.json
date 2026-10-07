@@ -1,0 +1,30 @@
+{
+  "id": "hackerman",
+  "name": "Hackerman",
+  "dark": true,
+  "colors": {
+    "base": "#0b0c16",
+    "mantle": "#080910",
+    "crust": "#06060c",
+    "text": "#ddf7ff",
+    "subtext0": "#b5c5db",
+    "subtext1": "#b5c5db",
+    "surface0": "#151828",
+    "surface1": "#1f253a",
+    "surface2": "#2d3450",
+    "overlay0": "#6a6e95",
+    "overlay1": "#6a6e95",
+    "overlay2": "#6a6e95",
+    "accent": "#82fb9c",
+    "accent2": "#2ec27e",
+    "onAccent": "#0b0c16",
+    "red": "#50f872",
+    "green": "#4fe88f",
+    "yellow": "#50f7d4",
+    "blue": "#829dd4",
+    "peach": "#50f7a3",
+    "mauve": "#cddbf4",
+    "teal": "#7cf8f7",
+    "pink": "#86a7df"
+  }
+}

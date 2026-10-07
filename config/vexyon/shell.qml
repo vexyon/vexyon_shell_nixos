@@ -57,6 +57,7 @@ ShellRoot {
     GlobalShortcut { appid: "quickshell"; name: "lock";          onPressed: Lock.lock() }
     GlobalShortcut { appid: "quickshell"; name: "screenshot";    onPressed: Panels.open("screenshot") }
     GlobalShortcut { appid: "quickshell"; name: "themeswitcher"; onPressed: Panels.toggleFallback("themeQuick") }
+    GlobalShortcut { appid: "quickshell"; name: "calculator";    onPressed: Panels.toggle("calculator") }
     // Super+E: cada pulsación abre una instancia NUEVA e independiente del
     // gestor de archivos (se cierra con Super+Q; la instancia se autodestruye).
     Component { id: fmFactory; FileManager {} }
@@ -138,6 +139,13 @@ ShellRoot {
     LazyLoader {
         active: Config.ready && Config.get("virtualization", "enabled", false) === true
         VmPanel {}
+    }
+    // Calculadora: solo existe mientras está abierta. Panels.toggle fija
+    // openScreen (monitor enfocado) ANTES de activar el Loader, así la
+    // ventana nace ya en su pantalla.
+    LazyLoader {
+        active: Panels.calculator
+        Calculator {}
     }
     ScreenshotOverlay {}
     MonitorRevertDialog {}

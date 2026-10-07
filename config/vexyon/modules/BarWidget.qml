@@ -24,11 +24,18 @@ Rectangle {
     property Item sectionItem: null
     property string sectionAlign: "center"
     property bool sectionSplit: false
+    // separador automático antes de este widget (bar.separators, ver
+    // BarSection.prevShown) y el hueco con el anterior, para centrarlo
+    property bool sepBefore: false
+    property int sepGap: 4
 
     readonly property real widgetAlpha: Config.get("bar", "widgetTransparency", 1.0)
     readonly property bool isGroup: type === "group"
     readonly property bool structural: type === "spacer" || type === "separator"
-    readonly property bool outline: Config.get("bar", "widgetOutline", false) && !structural && !isGroup
+    // bar.widgetShape "flat" (estilos de barra): sin pastilla en reposo, solo
+    // un velo al hover con la misma forma; misma área clicable que la pastilla
+    readonly property bool flat: Config.get("bar", "widgetShape", "pill") === "flat"
+    readonly property bool outline: Config.get("bar", "widgetOutline", false) && !structural && !isGroup && !flat
 
     // Each non-structural entry (incl. groups) is its own rounded rect —
     // DMS BasePill anatomy: moderate corner radius (NOT a full capsule),
@@ -42,7 +49,7 @@ Rectangle {
     // el radio la cierra en círculo). Solo el applauncher SUELTO; dentro de un
     // grupo la pastilla del grupo manda.
     readonly property bool roundPill: isPill && type === "applauncher"
-    readonly property int  pad: isPill ? 12 : 0
+    readonly property int  pad: isPill ? (flat ? 8 : 12) : 0
     readonly property int  pillThick: Theme.barHeight - 10
     readonly property bool hovered: hover.hovered
 
@@ -50,7 +57,10 @@ Rectangle {
     // WidgetView's `selfHide` (own property) — NOT `visible`, whose READ value
     // is the effective visibility (includes ancestors): with the pill hidden
     // on the first frame, parent and child would lock each other invisible.
-    visible: !(content.item && content.item.selfHide === true)
+    // `shown` = lo mismo que `visible` pero como valor PROPIO (la lectura de
+    // `visible` es la efectiva); la lee BarSection para los separadores.
+    readonly property bool shown: !(content.item && content.item.selfHide === true)
+    visible: shown
 
     implicitWidth: roundPill ? pillThick
         : vertical
@@ -64,6 +74,7 @@ Rectangle {
         : isPill ? Math.min(Theme.radius, Math.min(implicitWidth, implicitHeight) / 2) : 0
     color: {
         if (!isPill) return "transparent";
+        if (flat) return Qt.rgba(Theme.surface1.r, Theme.surface1.g, Theme.surface1.b, hovered ? 0.65 : 0.0);
         var c = hovered ? Theme.surface2 : Theme.surface1;
         return Qt.rgba(c.r, c.g, c.b, (hovered ? Math.max(0.5, 0.72 * widgetAlpha) : 0.72 * widgetAlpha));
     }
@@ -79,6 +90,15 @@ Rectangle {
     Behavior on scale { NumberAnimation { duration: Theme.dur(90); easing.type: Theme.easing } }
 
     HoverHandler { id: hover; enabled: host.isPill }
+
+    Loader {
+        active: host.sepBefore
+        width: host.vertical ? Math.round(host.width * 0.5) : 1
+        height: host.vertical ? 1 : Math.round(host.height * 0.5)
+        x: host.vertical ? Math.round((host.width - width) / 2) : -Math.round((host.sepGap + 1) / 2)
+        y: host.vertical ? -Math.round((host.sepGap + 1) / 2) : Math.round((host.height - height) / 2)
+        sourceComponent: Rectangle { color: Theme.overlay0 }
+    }
 
     Loader {
         id: content

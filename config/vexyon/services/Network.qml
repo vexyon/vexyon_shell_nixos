@@ -100,7 +100,7 @@ Singleton {
             "[ -z \"$DEV\" ] && exit 0; " +
             "nmcli -t -f GENERAL.HWADDR,IP4.ADDRESS device show \"$DEV\" 2>/dev/null | sed 's/^GENERAL.HWADDR:/mac=/; s/^IP4.ADDRESS\\[1\\]:/ip=/' | grep '='; " +
             "SPD=$(cat /sys/class/net/$DEV/speed 2>/dev/null); [ -n \"$SPD\" ] && [ \"$SPD\" != \"-1\" ] && echo \"speed=${SPD} Mb/s\"; " +
-            "FREQ=$(nmcli -t -f IN-USE,FREQ device wifi 2>/dev/null | awk -F: '$1==\"*\"{print $2; exit}'); [ -n \"$FREQ\" ] && echo \"freq=$FREQ\""]
+            "FREQ=$(nmcli -t -f IN-USE,FREQ device wifi list --rescan no 2>/dev/null | awk -F: '$1==\"*\"{print $2; exit}'); [ -n \"$FREQ\" ] && echo \"freq=$FREQ\""]
         stdout: StdioCollector {
             onStreamFinished: {
                 var out = {};
@@ -114,6 +114,116 @@ Singleton {
         }
     }
     function refreshInfo() { infoQuery.running = true; }
+
+    // ---- DNS de la conexión activa (selector del panel de red) -------------
+    //  POR CONEXIÓN, no global: se guarda en el perfil de NM de la conexión
+    //  activa del dispositivo (la Wi-Fi de casa puede ir por Cloudflare y la
+    //  del bar seguir en automático) y viaja con ese perfil. Nada global en
+    //  NetworkManager.conf, nada que pida root.
+    //  Leer: `device show` = los servidores que el dispositivo USA (vengan de
+    //  DHCP/RA o del perfil) + `connection show` = lo que pide el perfil.
+    //  Aplicar: `connection modify` + `device reapply`, que mete el cambio en
+    //  la conexión viva SIN desactivarla (medido: ~20 ms, sigue "connected").
+    //  Solo si NM rechaza el reapply se reactiva con `connection up` (corte de
+    //  unos segundos) y el panel lo dice. Sin sondeo: se lee al abrir el
+    //  panel, al cambiar de pestaña/conexión y tras aplicar.
+    readonly property var dnsPresets: [
+        { id: "auto",       v4: [], v6: [] },
+        { id: "cloudflare", v4: ["1.1.1.1", "1.0.0.1"],         v6: ["2606:4700:4700::1111", "2606:4700:4700::1001"] },
+        { id: "google",     v4: ["8.8.8.8", "8.8.4.4"],         v6: ["2001:4860:4860::8888", "2001:4860:4860::8844"] },
+        { id: "quad9",      v4: ["9.9.9.9", "149.112.112.112"], v6: ["2620:fe::fe", "2620:fe::9"] }
+    ]
+    // { dev, uuid, name, active4, active6, cfg4, cfg6, ignore, v6ok, preset }
+    property var dns: ({})
+    property string dnsState: ""            // "" | applying | reconnecting | applied | reconnected | error
+    property string dnsError: ""
+
+    Process {
+        id: dnsQuery
+        property string dev: ""
+        command: ["bash", "-c",
+            "nmcli -t -f GENERAL.CONNECTION,GENERAL.CON-UUID,IP4.DNS,IP6.DNS device show \"$1\" 2>/dev/null; " +
+            "u=$(nmcli -g GENERAL.CON-UUID device show \"$1\" 2>/dev/null); " +
+            "[ -n \"$u\" ] && nmcli -t -f ipv4.dns,ipv4.ignore-auto-dns,ipv6.dns,ipv6.method connection show \"$u\" 2>/dev/null",
+            "vxdns", dnsQuery.dev]
+        stdout: StdioCollector { onStreamFinished: root.parseDns(dnsQuery.dev, this.text) }
+    }
+    function refreshDns(dev) {
+        if (!dev) { root.dns = ({}); return; }
+        dnsQuery.dev = dev;
+        dnsQuery.running = true;
+    }
+    function parseDns(dev, txt) {
+        // multiline terse: "CAMPO:valor" — el valor puede llevar ':' (IPv6,
+        // nombres), así que se corta solo en el primero
+        var d = { dev: dev, uuid: "", name: "", active4: [], active6: [], cfg4: [], cfg6: [],
+                  ignore: false, v6ok: true, preset: "auto" };
+        var lines = txt.split("\n");
+        for (var i = 0; i < lines.length; i++) {
+            var c = lines[i].indexOf(":");
+            if (c <= 0) continue;
+            var k = lines[i].substring(0, c), v = lines[i].substring(c + 1).trim();
+            if (k === "GENERAL.CONNECTION") d.name = v;
+            else if (k === "GENERAL.CON-UUID") d.uuid = v;
+            else if (k.indexOf("IP4.DNS") === 0 && v !== "") d.active4.push(v);
+            else if (k.indexOf("IP6.DNS") === 0 && v !== "") d.active6.push(v);
+            else if (k === "ipv4.dns" && v !== "") d.cfg4 = v.split(",");
+            else if (k === "ipv6.dns" && v !== "") d.cfg6 = v.split(",");
+            else if (k === "ipv4.ignore-auto-dns") d.ignore = (v === "yes");
+            // NM rechaza ipv6.dns con method ignore/disabled (probado): sin
+            // IPv6 en el perfil, solo se toca IPv4
+            else if (k === "ipv6.method") d.v6ok = (v !== "ignore" && v !== "disabled");
+        }
+        if (d.ignore || d.cfg4.length > 0 || d.cfg6.length > 0) {
+            d.preset = "custom";
+            for (var p = 1; p < root.dnsPresets.length; p++)
+                if (root.dnsPresets[p].v4.join(",") === d.cfg4.join(",")) d.preset = root.dnsPresets[p].id;
+        }
+        root.dns = d;
+    }
+
+    Process {
+        id: dnsApply
+        // Salida: 2 = el perfil no se pudo modificar (dirección no válida,
+        // permisos) -> nada cambió; 3 = el perfil cambió pero ni reapply ni
+        // reactivar lo aplicaron. Por stdout, en orden: "reconnect" justo
+        // antes de reactivar (corte breve; el panel lo enseña mientras dura)
+        // y "err:<mensaje de nmcli>" si algo falla.
+        property bool reconnected: false
+        command: ["true"]
+        stdout: SplitParser {
+            onRead: function(line) {
+                if (line === "reconnect") { dnsApply.reconnected = true; root.dnsState = "reconnecting"; }
+                else if (line.indexOf("err:") === 0) root.dnsError = line.substring(4).replace(/^Error:\s*/, "");
+            }
+        }
+        onExited: function(code) {
+            if (code === 0) { root.dnsError = ""; root.dnsState = dnsApply.reconnected ? "reconnected" : "applied"; }
+            else root.dnsState = "error";
+            root.refreshDns(root.dns.dev);
+        }
+    }
+    // v4/v6: listas de servidores; ambas vacías = automático (DHCP/RA).
+    // Con servidores propios se ignoran los automáticos de LAS DOS familias:
+    // si no, los que anuncia el router por IPv6 seguirían colándose y la
+    // elección no mandaría. Sin servidores IPv6 en la lista, IPv6 no lleva
+    // DNS propio (los de IPv4 resuelven también AAAA).
+    function setDns(v4, v6) {
+        var d = root.dns;
+        if (!d.uuid || !d.dev || dnsApply.running) return;
+        var auto = v4.length === 0 && v6.length === 0;
+        root.dnsState = "applying"; root.dnsError = ""; dnsApply.reconnected = false;
+        dnsApply.command = ["bash", "-c",
+            "u=$1 d=$2 v4=$3 v6=$4 ig=$5 six=$6; " +
+            "set -- connection modify \"$u\" ipv4.dns \"$v4\" ipv4.ignore-auto-dns \"$ig\"; " +
+            "[ \"$six\" = 1 ] && set -- \"$@\" ipv6.dns \"$v6\" ipv6.ignore-auto-dns \"$ig\"; " +
+            "o=$(nmcli \"$@\" 2>&1) || { echo \"err:${o##*$'\\n'}\"; exit 2; }; " +
+            "nmcli device reapply \"$d\" >/dev/null 2>&1 && exit 0; " +
+            "echo reconnect; o=$(nmcli connection up \"$u\" 2>&1 >/dev/null) && exit 0; echo \"err:${o##*$'\\n'}\"; exit 3",
+            "vxdns", d.uuid, d.dev, v4.join(","), (d.v6ok ? v6 : []).join(","),
+            auto ? "no" : "yes", d.v6ok ? "1" : "0"];
+        dnsApply.running = true;
+    }
 
     // ---- conexión con resultado (para el hold-to-connect del radar) --------
     property string connectingId: ""        // ssid/dispositivo en proceso
@@ -168,13 +278,22 @@ Singleton {
     // del primer dispositivo conectado que `parse` siempre recibió — los dos
     // parsers quedan intactos y el resultado es byte-idéntico al de los dos
     // procesos anteriores. Antes: 2 bash + 3 nmcli cada 5s; ahora 1 bash + 2.
+    //
+    // ⚠️ `--rescan no` es obligatorio desde la fusión. `nmcli device wifi` a
+    // secas usa --rescan auto: si el último escaneo tiene >30 s PIDE uno y
+    // espera hasta 15 s (nmcli devices.c, timeout_msec = 15000). Antes la tabla
+    // de dispositivos salía de su propio proceso (~ms); al fusionarla quedó
+    // detrás de ese escaneo, y hasta que acaba wifiDevice/ethDevice siguen ""
+    // y el panel solo enseña Bluetooth. La señal de la red activa sale de la
+    // caché de NM; el escaneo de verdad lo pide el panel (refreshWifi). Va con
+    // `list` explícito: `device wifi --rescan no` lo rechaza nmcli (rc 2).
     Process {
         id: query
         command: ["bash", "-c",
             "nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status 2>/dev/null; " +
             "echo '###'; " +
             // SIGNAL:SSID for the active wifi
-            "nmcli -t -f IN-USE,SIGNAL,SSID device wifi 2>/dev/null | awk -F: '$1==\"*\"{print $2\":\"$3; exit}'"]
+            "nmcli -t -f IN-USE,SIGNAL,SSID device wifi list --rescan no 2>/dev/null | awk -F: '$1==\"*\"{print $2\":\"$3; exit}'"]
         running: true
         stdout: StdioCollector { onStreamFinished: root.parseAll(this.text) }
     }

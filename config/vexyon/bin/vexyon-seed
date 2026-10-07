@@ -62,6 +62,23 @@ seed_tree      "$SHARE/seed/themes"         "$DATA/themes"
 seed_tree      "$SHARE/seed/store"          "$DATA/store"
 seed_tree      "$SHARE/seed/defaults"       "$DATA/defaults"
 
+# Temas INCLUIDOS y catálogo de la tienda = datos del PAQUETE, no del usuario.
+# En Arch install.sh los sobrescribe en cada instalación; aquí copy_if_absent
+# no los actualizaría nunca y una corrección de paleta (p.ej. accentFg de los
+# temas claros) no llegaría a un $HOME ya sembrado. Se refrescan UNA vez por
+# build del paquete (VEXYON_SHARE cambia de ruta en cada build del store), no
+# en cada login. Los temas instalados desde la tienda no están en seed/: no se
+# tocan.
+stamp="$DATA/.seeded-from"
+if [ "$(cat "$stamp" 2>/dev/null)" != "$SHARE" ]; then
+  for f in "$SHARE"/seed/themes/*.json "$SHARE/seed/store/catalog.json"; do
+    [ -e "$f" ] || continue
+    dst="$DATA/${f#"$SHARE"/seed/}"
+    cp -f "$f" "$dst" && chmod u+w "$dst" || continue
+  done
+  printf '%s\n' "$SHARE" > "$stamp"
+fi
+
 # Distribución de teclado. Hyprland NO hereda la del sistema: sin esto la
 # sesión (y el greeter) se quedan en "us" y una contraseña con caracteres que
 # cambian de sitio entre distribuciones no se puede teclear. En Arch esto lo
@@ -110,7 +127,7 @@ seed_late_keybinds() {
   python3 - "$CFG/shell.json" "$DATA/defaults/keybinds.json" <<'PYEOF' || true
 import json, os, sys
 sj, dk = sys.argv[1], sys.argv[2]
-LATE = {"vmmanager"}
+LATE = {"vmmanager", "calculator"}
 try:
     cfg = json.load(open(sj))
     defaults = json.load(open(dk))

@@ -33,6 +33,9 @@ Singleton {
     // closeAll() no la toca. `vmPanel` sí es un panel anclado normal.
     property bool vmManager: false
     property bool vmPanel: false
+    // Calculadora (Super+Shift+C): popup del conjunto excluyente, como el
+    // lanzador. shell.qml la carga con un LazyLoader atado a esta propiedad.
+    property bool calculator: false
 
     // pestaña inicial que el widget pide antes de abrir (ilyamiro: toggle
     // volume / toggle network wifi|bt)
@@ -276,6 +279,7 @@ Singleton {
         root.clipboardPanel = false;
         root.themeQuick = false;
         root.vmPanel = false;
+        root.calculator = false;
         // vmManager NO se cierra aquí: es una ventana toplevel como Ajustes,
         // no un popup. Que se abra una pastilla de barra no debe cerrarla.
         root.trayMenu = false;

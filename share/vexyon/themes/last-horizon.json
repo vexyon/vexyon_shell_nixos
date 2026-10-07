@@ -1,0 +1,30 @@
+{
+  "id": "last-horizon",
+  "name": "Last Horizon",
+  "dark": true,
+  "colors": {
+    "base": "#0c0b0c",
+    "mantle": "#090809",
+    "crust": "#060606",
+    "text": "#fafcfb",
+    "subtext0": "#cfd3cd",
+    "subtext1": "#cfd3cd",
+    "surface0": "#0c0b0c",
+    "surface1": "#584e51",
+    "surface2": "#584e51",
+    "overlay0": "#584e51",
+    "overlay1": "#584e51",
+    "overlay2": "#584e51",
+    "accent": "#b59790",
+    "accent2": "#e2dddc",
+    "onAccent": "#0c0b0c",
+    "red": "#c38b7b",
+    "green": "#87a9b0",
+    "yellow": "#6b5e73",
+    "blue": "#b59790",
+    "peach": "#6b5e73",
+    "mauve": "#c4d8e2",
+    "teal": "#a5a0b6",
+    "pink": "#c4d8e2"
+  }
+}

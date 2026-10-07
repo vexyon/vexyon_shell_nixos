@@ -18,6 +18,8 @@
     "accent": "#268bd2",
     "accent2": "#2aa198",
     "onAccent": "#ffffff",
+    "accentFg": "#03629c",
+    "accent2Fg": "#028880",
     "red": "#dc322f",
     "green": "#859900",
     "yellow": "#b58900",

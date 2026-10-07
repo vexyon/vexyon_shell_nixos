@@ -1,0 +1,30 @@
+{
+  "id": "ethereal",
+  "name": "Ethereal",
+  "dark": true,
+  "colors": {
+    "base": "#060b1e",
+    "mantle": "#040816",
+    "crust": "#030610",
+    "text": "#ffcead",
+    "subtext0": "#c9b8a6",
+    "subtext1": "#c9b8a6",
+    "surface0": "#131a3a",
+    "surface1": "#252e56",
+    "surface2": "#6d7db6",
+    "overlay0": "#6d7db6",
+    "overlay1": "#6d7db6",
+    "overlay2": "#6d7db6",
+    "accent": "#7d82d9",
+    "accent2": "#c2c4f0",
+    "onAccent": "#060b1e",
+    "red": "#ed5b5a",
+    "green": "#92a593",
+    "yellow": "#e9bb4f",
+    "blue": "#7d82d9",
+    "peach": "#eb8b54",
+    "mauve": "#ead7e7",
+    "teal": "#a3bfd1",
+    "pink": "#c89dc1"
+  }
+}

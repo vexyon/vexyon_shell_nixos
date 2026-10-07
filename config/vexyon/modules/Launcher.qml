@@ -3,7 +3,6 @@ import QtQuick.Controls
 import Quickshell
 import Quickshell.Wayland
 import Quickshell.Hyprland
-import Quickshell.Widgets
 import qs.services
 import qs.components
 
@@ -389,7 +388,7 @@ PanelWindow {
                             anchors.rightMargin: 14
                             spacing: 14
 
-                            IconImage {
+                            AppIcon {
                                 anchors.verticalCenter: parent.verticalCenter
                                 implicitSize: 38
                                 source: Quickshell.iconPath(win.dispIcon(row.modelData), "application-x-executable")
@@ -465,7 +464,7 @@ PanelWindow {
                             Column {
                                 anchors.centerIn: parent
                                 spacing: 8
-                                IconImage {
+                                AppIcon {
                                     anchors.horizontalCenter: parent.horizontalCenter
                                     implicitSize: 46
                                     source: Quickshell.iconPath(win.dispIcon(cell.modelData), "application-x-executable")
@@ -614,7 +613,7 @@ PanelWindow {
 
                 Row {
                     spacing: 14
-                    IconImage {
+                    AppIcon {
                         anchors.verticalCenter: parent.verticalCenter
                         implicitSize: 44
                         source: Quickshell.iconPath(editIcon.text !== "" ? editIcon.text : (win.ctxEntry ? win.ctxEntry.icon : ""), "application-x-executable")
