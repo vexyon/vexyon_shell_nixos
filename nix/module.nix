@@ -117,9 +117,19 @@ let
     }"
   '';
 
+  # Lector WebP de Qt (el mismo qt6 de nixpkgs con el que está construido
+  # quickshell). quickshell solo trae los plugins de qtbase/qtsvg — PNG, JPEG,
+  # GIF, BMP — y el selector de foto de perfil ofrece *.webp: sin esto un
+  # avatar WebP no carga y Ajustes / Super+C / bloqueo enseñan solo la
+  # inicial. Es lo que en Arch aporta el paquete qt6-imageformats.
+  qtPluginExport = ''
+    export QT_PLUGIN_PATH="${pkgs.qt6.qtimageformats}/${pkgs.qt6.qtbase.qtPluginPrefix}''${QT_PLUGIN_PATH:+:$QT_PLUGIN_PATH}"
+  '';
+
   vexyonSession = pkgs.writeShellScript "vexyon-session" ''
     ${envExports}
     ${cursorPathExport}
+    ${qtPluginExport}
     exec ${vexyon}/bin/vexyon-start "$@"
   '';
 

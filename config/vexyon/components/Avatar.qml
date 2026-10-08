@@ -45,6 +45,7 @@ Item {
             source: Profile.url
             visible: showing
             fillMode: Image.PreserveAspectCrop
+            autoTransform: true   // orientación EXIF (fotos de móvil)
             asynchronous: true
             cache: false
             sourceSize.width: a.size * 2

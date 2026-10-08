@@ -6,6 +6,335 @@
 > instead of replacing it. The same entries are in both trees (`vexyon_shell`
 > for Arch/CachyOS and `vexyon_shell_nixos` for NixOS).
 
+## Session: audio silent below ~8% volume, profile photo shows only the initial
+
+### Files changed
+
+| file | what |
+|---|---|
+| `config/vexyon/services/Audio.qml` | the shell's volume scale: `toNode()` / `fromNode()` / `nodePercent()` / `setNodeVolume()`; `volume`, `percent`, `setVolume()` and `step()` go through them |
+| `config/vexyon/modules/VolumePanel.qml` | output and stream rows read and write through `Audio.nodePercent()` / `Audio.setNodeVolume()`; the Inputs tab is unchanged |
+| `config/vexyon/services/Profile.qml` | `toPath()` decodes the file dialog's URL; copy first, then delete the older `avatar-*` copies (the glob now expands); copy errors go to the log; `clearAvatar()` glob fixed |
+| `config/vexyon/components/Avatar.qml` | `autoTransform: true` (EXIF orientation) |
+| `install.sh` (Arch only) | adds `qt6-imageformats` |
+| `nix/module.nix` (NixOS only) | the session script exports `QT_PLUGIN_PATH` with `qt6.qtimageformats` |
+
+- **Byte-identical across trees:** the four QML files are `cmp`-identical in
+  `vexyon_shell` and `vexyon_shell_nixos`, and in the built NixOS package.
+- **The platform part is one line each:** the WebP image plugin is a package
+  on Arch and a session variable on NixOS.
+- No daemon, no Timer, no polling and no new subsystem. No new UI strings.
+
+### Issue 1: audio silent below ~8%: what was measured
+
+The "~8%" was treated as an observation, not a threshold. It was measured
+before changing anything.
+
+**Lab (cloud container, NOT the user's machine):**
+- PipeWire 1.6.6, WirePlumber 0.5.14, pipewire-pulse and Quickshell 0.3.0, all
+  from nixos-26.05.
+- Three `pipe-tunnel` sinks write exactly what PipeWire hands to the
+  "hardware", after the sink volume, into FIFOs:
+  - `S16LE`: the HDMI / Bluetooth encoder / USB DAC class;
+  - `S32LE`: onboard analog;
+  - `F32LE`: float, no quantisation.
+- A reader computed peak level and the share of non-zero samples per 100 ms.
+- The shell's **real `services/Audio.qml`** set every volume, through its own
+  `setVolume()` / `step()` / `setSink()`, from an offscreen Quickshell over
+  IPC. `pactl` and `wpctl` read back the same sink.
+- Signals:
+  - a −1 dBFS tone (the loudest possible content);
+  - pink noise peaking near −20 dBFS (a quiet passage or speech, roughly
+    10 dB under mastered music).
+
+**Path traced:** slider / keys / scroll → `Audio.setVolume()` →
+`sink.audio.volume`.
+- Quickshell 0.3.0 cubes the value: node gain = v³.
+  - Node-volume sinks: `SPA_PROP_channelVolumes` on the node.
+  - Hardware devices: the device route (`SPA_PARAM_Route`).
+- PipeWire then applies that gain:
+  - in software (audioconvert); or
+  - in the ALSA mixer plus a software remainder (ACP); or
+  - as the AVRCP volume of a Bluetooth headset.
+
+**Measured, old code** (shell % = pavucontrol % = wpctl, all equal):
+
+| shell % | gain | −1 dBFS tone, S16 out | pink noise, S16 out | pink noise, S32 out |
+|---|---|---|---|---|
+| 20 | −41.9 dB | −42.9 dBFS | | |
+| 10 | −60 dB | −61 dBFS | 46% non-zero samples, ±2 LSB | −82 dBFS |
+| 8 | −65.8 dB | −66.8 dBFS | 14% non-zero, ±1 LSB | −89 dBFS |
+| 7 | −69.3 dB | | 2% non-zero | −94 dBFS |
+| 6 / 5 | −73 / −78 dB | 5%: 88% non-zero, ±4 LSB | **all samples zero** | −95 / −101 dBFS |
+| 3 | −91 dB | 54% non-zero, ±1 LSB | all zero | −115 dBFS |
+| 2 / 1 | −102 / −120 dB | **all zero** | all zero | −124 / −144 dBFS |
+| 0 | silence | zero | zero | zero |
+
+**What this rules out:**
+- The shell sends exactly what it shows: no rounding to 0, no minimum clamp,
+  no threshold.
+- Mute was `false` at every level. The only mute writes are the explicit
+  toggles, plus "un-mute when you raise from 0".
+- PipeWire/WirePlumber add no threshold. audioconvert's `channelmix.min-volume`
+  defaults to 0.0, and dithering is off by default.
+- pipewire-pulse shows the same percent: it is the same cubic scale.
+- The bug is in the real system volume, not just the shell UI.
+
+### Root cause (confirmed)
+
+**The volume scale, not a threshold:**
+- The shell's 0–100% was PipeWire's cubic scale (the pavucontrol/wpctl %):
+  gain = (p/100)³.
+- That puts the bottom 8% of the slider at −66 dB…−∞. That is below what you
+  can hear at normal amplifier gain, on every output.
+- On 16-bit outputs, and with no dither, quiet content is also rounded to
+  **literal digital silence** at ≤6% (≤2% even for a full-scale tone).
+- The shell's own key/scroll step is 5%, so the only stop between 0 and 10% is
+  5% = −78 dB. "Silent below ~8%" is that stop.
+- Above ~10% (−60 dB) sound comes back. That matches the report.
+
+### Fix (exact)
+
+`Audio.qml` now has one volume scale. Every output volume the shell shows or
+sets uses it: bar widget, keys, scroll, OSD, control center, Settings, the
+battery panel slider, the volume panel hero, and its output and stream rows.
+
+- `u` = the shell's value (0..1).
+- `c` = PipeWire's node volume (the pavucontrol/wpctl number); gain = c³.
+- `knee` = e/10 = 0.2718.
+
+| range | mapping |
+|---|---|
+| `u ≥ knee` | `c = u` (the old scale, unchanged) |
+| `0.005 ≤ u < knee` | `c = 0.1 · e^(u/knee)`: linear in dB from −60 dB up to −33.9 dB at the knee, where its slope equals the cubic's (no kink) |
+| `u < 0.005` | `c = 0`: silence. This is what shows as 0%, and it absorbs float residue so 5% − 5% lands on 0, not on −60 dB |
+
+`fromNode()` is the inverse. Node volumes below −60 dB (set from outside) read
+as 0 on the slider. `percent` is 0 only when the node is exactly 0; anything
+else shows at least 1%.
+
+| shell % | 1 | 5 | 8 | 10 | 15 | 20 | ≥27.2 |
+|---|---|---|---|---|---|---|---|
+| node (wpctl) | 0.10 | 0.12 | 0.13 | 0.14 | 0.17 | 0.21 | = shell % |
+| gain now | −59 dB | −55 dB | −52 dB | −50 dB | −46 dB | −41 dB | unchanged |
+| gain before | −120 dB | −78 dB | −66 dB | −60 dB | −49 dB | −42 dB | |
+
+Why −60 dB:
+- In the report, ~10% (= −60 dB) was audible and ≤8% (≤ −66 dB) was not.
+- So the quietest non-zero step now sits where sound was last audible.
+- Android's default media volume curve also starts at about −58 dB.
+- `Mic` (inputs) keeps PipeWire's scale; this was an output bug.
+
+**Measured, new code** (same lab, pink noise):
+
+| shell % | S16 out | S32 out |
+|---|---|---|
+| 1 | 50% non-zero samples (was 0%) | −81 dBFS (was −144) |
+| 5 | 71% non-zero (was 0%) | −79 dBFS (was −101) |
+| 8 | 77% non-zero (was 14%) | −75 dBFS (was −89) |
+| 10 | 81% non-zero (was 46%) | −74 dBFS (was −82) |
+| 27, 30, 50, 100 | identical to before; wpctl 0.27 / 0.30 / 0.50 / 1.00 | identical |
+| 0 | zero | zero |
+
+**Also checked:**
+- `Audio.step(±5)`: 0 → 5 → 10 … 35 → 30 … 5 → **0**, each step audible.
+- External `wpctl set-volume`: 0.50 → 50%, 0.27 → 27%, 0.20 → 19%,
+  0.15 → 11%, 0.12 → 5%, 0.05 → 1%, 0 → 0%.
+- From an external 0.05: +5 → 5%, then −5 → 0.
+- Mute is independent of volume (0.40 → 0.40 [MUTED] → 0.40).
+- `Audio.setNodeVolume()` (what a volume panel row calls) on a non-default
+  sink and on an app stream: the same scale, and the default sink is untouched.
+- The real volume panel and control center (Arch layout, headless sway, Mesa
+  GL) with the default sink at 5% and other sinks at node 0.30 / 0.12:
+  - the hero shows 5%;
+  - the rows show 30% / 5%;
+  - the control center audio tile shows 5%.
+
+### Affected backends and devices
+
+The change is applied in the shell, before Quickshell. It works the same for
+every output PipeWire exposes:
+- ALSA cards (speakers, headphones, HDMI/DisplayPort, USB);
+- Bluetooth;
+- virtual sinks;
+- app streams.
+
+What each device class then does with the gain:
+- **ALSA (ACP):** hardware mixer plus a software remainder, so the dB value
+  reaches the output either way. ACP always reports a volume step
+  (1/65537 for dB mixers).
+- **Bluetooth with AVRCP absolute volume:**
+  - PipeWire sends round(c × 127) to the headset.
+  - The old 1/5/8% sent 1/6/10. The new 1/5/10% sends 13/15/18 out of 127.
+  - Quickshell skips changes smaller than one AVRCP step, measured from the
+    last value the device confirmed. Repeated presses add up, so the 5% key
+    step still gets through.
+- **HDMI, and BT without hardware volume:** software volume, as measured
+  above.
+- **pavucontrol / wpctl** keep their own scale. They read the same as the shell
+  from 27.2% up, and higher below it (shell 5% = wpctl 0.12).
+
+### Issue 2: profile photo shows only the initial: audit
+
+- **Where it's stored:** `shell.json` → `profile.avatar`. This is an absolute
+  path to a copy, `~/.config/vexyon/avatar-<epoch>`, which has no extension.
+  - `Profile.setAvatar()` writes it and mirrors it to `~/.face`. The shell
+    never reads `~/.face`.
+  - There is no second copy of this state anywhere.
+- **Who reads it:** only `components/Avatar.qml`, through `Profile.url`.
+  - It's used in exactly three places: the Settings profile card ("General
+    Settings"), the **Super+C control center** header (`QuickSettingsPanel`),
+    and the lock screen.
+  - It shows the photo when `Profile.hasAvatar && status === Image.Ready`;
+    otherwise the initial.
+  - The greeter only ever draws the initial: it runs before login and can't
+    read `$HOME`. Unchanged.
+- **Ruled out by test:**
+  - `Config.get` reactivity: a changed path updates all three live.
+  - Extension-less copies: PNG/JPEG are detected by content.
+  - Lost files: on NixOS `~/.config/vexyon` is a real, writable dir, and
+    install.sh's `cp -r` keeps the avatar files.
+
+### Root causes (confirmed by reproducing each one)
+
+1. **WebP never decodes, on both platforms.**
+   - Quickshell's Qt only has the PNG/JPEG/GIF/BMP/ICO (+SVG) readers, but the
+     picker offers `*.webp`.
+   - Measured: `Error decoding: …/avatar-…: Unsupported image format`, and the
+     initial in Settings and in Super+C.
+   - Arch: `install.sh` had no `qt6-imageformats`.
+   - NixOS: Quickshell's Qt wrapper doesn't include qtimageformats. The system
+     plugin dir only reaches `QT_PLUGIN_PATH` with `qt.enable`, which the
+     module deliberately doesn't set.
+2. **Paths with `#`, `%` or `?` were never saved.**
+   - `setAvatar()` stripped `file://` from `String(selectedFile)`. QML leaves
+     `%23`/`%25`/`%3F` encoded there (accents and spaces are decoded).
+   - So `cp` looked for `…/mi foto %231.png`, `set -e` stopped, and
+     `profile.avatar` was never written.
+   - The only trace was an empty `[Profile] copy failed:` in the log, and the
+     UI kept the initial.
+3. **Old copies were never deleted (found on the way).**
+   - The `rm` glob was inside single quotes, so it never matched. Every pick
+     left a file behind, and `clearAvatar()` left them all.
+   - Just un-quoting it would have deleted the source when you re-pick the
+     current copy, so the new order is: copy first, then delete the others.
+4. **Sideways phone photos (found on the way).**
+   - `Image` ignores EXIF orientation by default. Fixed with `autoTransform`.
+
+### Fix
+
+- `Profile.toPath()` decodes the URL. It's the same idiom as
+  `VmManager.urlToPath()`, plus a try/catch.
+- The copy runs before the cleanup, and copy errors now reach the log.
+- **Arch:** `install.sh` installs `qt6-imageformats`.
+- **NixOS:** the module's session script (next to `XCURSOR_PATH`) exports
+  `QT_PLUGIN_PATH=<qt6.qtimageformats>/lib/qt-6/plugins:$QT_PLUGIN_PATH`. It
+  comes from the same nixpkgs Qt (6.11.2) as Quickshell 0.3.0.
+- With no photo configured, or one that can't load, the initial is shown, as
+  before.
+
+**After updating:**
+- If an earlier pick failed (cause 2), nothing was saved: pick the photo once
+  more.
+- A WebP that was already saved shows up once the plugin is there:
+  - Arch: re-run install.sh, or `sudo pacman -S qt6-imageformats`, then
+    restart the shell.
+  - NixOS: `nixos-rebuild`, then log out and back in (it's a session
+    variable).
+
+### What was tested, NixOS vs Arch
+
+**NixOS:**
+- The flake package was built with nixpkgs pinned to the nixos-26.05 channel
+  tarball (`nixos-26.05.11576.7c8764b7c7b0`), because GitHub's API is blocked
+  in this container.
+- The **real `nix/module.nix`** was evaluated in a minimal NixOS system. Its
+  generated `vexyon-session` contains the export above.
+- The shell ran **from the package's read-only store QML**, with `$HOME`
+  seeded by the package's `vexyon-seed` and the environment of that exact
+  session script.
+- The four QML files in the store are `cmp`-identical to the repo.
+- Avatar results:
+  - WebP and PNG show the photo in Settings, Super+C and the lock screen.
+  - No photo shows "V".
+  - Control: the same package without the export logs `Unsupported image
+    format` and shows "V".
+
+**Arch:**
+- No pacman or Arch userland here.
+- The tree was deployed the way install.sh does it: `cp -r` into
+  `~/.config/vexyon`, keeping `shell.json`.
+- `qt6-imageformats` was stood in for by putting Qt 6.11.2's imageformats
+  plugins on `QT_PLUGIN_PATH`. Arch's package installs the same plugin into
+  Qt's default plugin dir.
+- Results:
+  - Before: PNG/JPEG shown; WebP → "V"; no photo → "V".
+  - After: WebP shown in Settings and Super+C.
+  - EXIF test JPEG: the yellow-pixel centroid sits at (0.49, 0.63), upright.
+    Without `autoTransform` it sits at (0.62, 0.51), sideways.
+- `setAvatar()` (real `Profile.qml`, dialog-style URLs) saves:
+  - plain path;
+  - `~/Imágenes/mi foto #1.png` (failed before);
+  - `50% off?.webp`;
+  - re-picking the current copy.
+  Exactly one `avatar-*` is left each time, and `~/.face` is identical.
+  `clearAvatar()` removes the path, the copies and `~/.face`.
+- `bash -n install.sh` passes.
+
+**Both:**
+- Audio was measured once, through the shared `Audio.qml`. It's the same
+  bytes in both trees and in the NixOS package.
+- qmllint (Qt 6.11.2), old vs new: no new warning type. VolumePanel has 5 more
+  "unqualified" notes, from the new `delegateRoot`/`body` references; the file
+  already uses that pattern everywhere.
+
+### Environment limits (honest)
+
+- **No audio hardware in the container:** no `/dev/snd`, no Bluetooth, no HDMI.
+  - The ALSA/ACP and Bluetooth paths were read in source (PipeWire 1.6.6
+    `acp.c`, `alsa-acp-device.c`, `bluez5-device.c`; Quickshell 0.3.0
+    `node.cpp`, `device.cpp`), not measured.
+  - The lab sinks stand in for the 16-bit (HDMI / BT encoder / USB) and
+    32-bit (analog) output classes.
+  - "Audible" in this entry means a measured level in dBFS, not a listening
+    test.
+- **No Hyprland** (headless sway, Mesa llvmpipe):
+  - The XF86 volume keys weren't pressed; their body is `Audio.step(±0.05)`,
+    which was tested.
+  - Real pointer clicks weren't available (the headless seat has no pointer),
+    so the volume panel row was tested by calling the function its drag
+    handler calls.
+- Versions are nixos-26.05's: Quickshell 0.3.0, Qt 6.11.2, PipeWire 1.6.6,
+  WirePlumber 0.5.14. CachyOS may ship newer ones.
+
+### Found, not fixed (not this bug)
+
+- **Quickshell 0.3.0 `PwNodeBoundAudio::setVolumes`** sends nothing for a
+  device-backed node whose route has no `volumeStep`.
+  - PipeWire's bluez5 only reports one with hardware volume.
+  - So on a Bluetooth headset **without** absolute volume, no volume change
+    from the shell (or any Quickshell UI) reaches the device, at any level.
+  - Read in source only. The report says Bluetooth works above 8%, so the
+    user's headset has absolute volume.
+
+### To check by hand on the tower (both systems)
+
+1. On speakers, headphones, a BT headset and HDMI, play music and go down with
+   the volume key: 15 → 10 → 5 → 0.
+   - Every step should be quieter but audible, and 0 silent.
+   - `wpctl get-volume @DEFAULT_AUDIO_SINK@` should read about 0.17 / 0.14 /
+     0.12 / 0.
+2. Drag the Super+C slider to 1%: very quiet, not silent.
+3. At 30–100%, loudness and the pavucontrol percentage should be exactly as
+   before.
+4. Settings → click the avatar → pick a `.webp` from `~/Imágenes`, then a
+   `.png` with `#` in its name. Both should show in the Settings card, in
+   Super+C and on the lock screen (Super+L).
+   - `ls ~/.config/vexyon/avatar-*` should show exactly one file.
+5. Right-click the avatar: the initial is back in all three places.
+
+---
+
 ## Session: VM networking audit and fixes (firewall, host-only addressing, running VMs, NIC network change, diagnostics)
 
 ### Files changed

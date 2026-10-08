@@ -27,17 +27,29 @@ Singleton {
 
     function shq(x) { return "'" + String(x).replace(/'/g, "'\\''") + "'"; }
 
+    // file URL (FileDialog.selectedFile) o ruta -> ruta local. String(url) deja
+    // %23 (#), %25 (%) y %3F (?) codificados: sin decodificar, cp no encuentra
+    // "mi foto #1.png" y el avatar nunca llega a guardarse.
+    function toPath(src) {
+        var s = String(src);
+        try { s = decodeURIComponent(s); } catch (e) {}
+        return s.indexOf("file://") === 0 ? s.slice(7) : s;
+    }
+
     // src: file URL o ruta; copia + persiste + espeja ~/.face
     function setAvatar(src) {
-        var s = String(src).replace(/^file:\/\//, "");
+        var s = root.toPath(src);
         if (s === "") return;
-        var dest = root.homeDir + "/.config/vexyon/avatar-" + Date.now();
+        var dir = root.homeDir + "/.config/vexyon";
+        var dest = dir + "/avatar-" + Date.now();
         copyProc.pendingDest = dest;
+        // copiar ANTES de borrar las anteriores (la elegida puede ser una de
+        // ellas); el glob va fuera de las comillas para que se expanda
         copyProc.command = ["bash", "-c",
-            "set -e; " +
-            "rm -f " + shq(root.homeDir + "/.config/vexyon/avatar-*") + " 2>/dev/null || true; " +
-            "cp -f " + shq(s) + " " + shq(dest) + "; " +
-            "cp -f " + shq(dest) + " " + shq(root.homeDir + "/.face") + " 2>/dev/null || true; " +
+            "set -e; exec 2>&1; " +
+            "cp -f -- " + shq(s) + " " + shq(dest) + "; " +
+            "for f in " + shq(dir) + "/avatar-*; do [ \"$f\" = " + shq(dest) + " ] || rm -f -- \"$f\"; done; " +
+            "cp -f -- " + shq(dest) + " " + shq(root.homeDir + "/.face") + " 2>/dev/null || true; " +
             "echo ok"];
         copyProc.running = true;
     }
@@ -45,7 +57,7 @@ Singleton {
     function clearAvatar() {
         Config.set("profile", "avatar", "");
         Quickshell.execDetached(["bash", "-c",
-            "rm -f " + shq(root.homeDir + "/.config/vexyon/avatar-*") + " " +
+            "rm -f -- " + shq(root.homeDir + "/.config/vexyon") + "/avatar-* " +
             shq(root.homeDir + "/.face") + " 2>/dev/null || true"]);
     }
 

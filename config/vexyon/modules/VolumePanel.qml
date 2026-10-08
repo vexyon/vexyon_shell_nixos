@@ -421,7 +421,10 @@ AnchoredPanel {
                         Behavior on opacity { NumberAnimation { duration: 500; easing.type: Easing.OutQuint } }
 
                         readonly property bool nodeReady: modelData && modelData.audio !== null
-                        readonly property int nodeVol: nodeReady ? Math.round(modelData.audio.volume * 100) : 0
+                        // salidas y streams: escala de volumen del shell (Audio); entradas: la de PipeWire
+                        readonly property bool outputSide: body.activeTab !== "inputs"
+                        readonly property int nodeVol: !nodeReady ? 0
+                            : outputSide ? Audio.nodePercent(modelData) : Math.round(modelData.audio.volume * 100)
                         readonly property bool nodeMute: nodeReady ? modelData.audio.muted : false
                         readonly property string nodeTitle: body.activeTab === "apps"
                             ? Audio.streamLabel(modelData) : Audio.nodeLabel(modelData)
@@ -551,7 +554,8 @@ AnchoredPanel {
                                             if (!delegateRoot.nodeReady) return;
                                             var pct = Math.max(0, Math.min(100, Math.round((mx / width) * 100)));
                                             if (pct > 0 && delegateRoot.nodeMute) delegateRoot.modelData.audio.muted = false;
-                                            delegateRoot.modelData.audio.volume = pct / 100;
+                                            if (delegateRoot.outputSide) Audio.setNodeVolume(delegateRoot.modelData, pct / 100);
+                                            else delegateRoot.modelData.audio.volume = pct / 100;
                                         }
                                     }
                                 }
