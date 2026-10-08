@@ -1,0 +1,906 @@
+#!/usr/bin/env python3
+"""
+vexyon-fm-helper — the Vexyon File Manager's on-demand helper.
+
+Every call does one job, prints one line of JSON and exits. Nothing stays
+resident except what the Wayland clipboard itself requires (see clip-set).
+
+    clip-set copy|cut PATH...    put files on the system clipboard
+    clip-get                     what the clipboard holds (files only)
+    clip-done                    a cut was pasted: take it off the clipboard
+
+    places                       XDG user folders + sidebar bookmarks
+    bm-add [--at N] PATH...      add sidebar bookmarks
+    bm-remove PATH               remove a bookmark (the folder is never touched)
+    bm-move PATH N               move a bookmark to position N
+    bm-moved FROM TO             Vexyon renamed or moved FROM to TO
+
+    icons                        custom folder icons
+    icon-set PATH ID GLYPH       a library icon (ID "md:<name>", GLYPH hex)
+    icon-image PATH IMAGE        a local SVG/PNG, stored as a sanitised copy
+    icon-reset PATH              back to the default icon
+    icon-moved FROM TO           Vexyon renamed or moved FROM to TO
+    icon-adopt PATH...           folders renamed outside Vexyon (same inode)
+
+CLIPBOARD
+---------
+The file manager used to keep copied files in a property of its own window,
+so a second window (or any other program) saw an empty clipboard. Files now go
+to the real Wayland clipboard as `text/uri-list` (RFC 2483, CRLF, percent-
+encoded file:// URIs), which every Linux file manager, browser and toolkit
+reads. wl-copy also offers the same text as text/plain, so pasting into a
+terminal or editor still gives the URIs as text.
+
+A Wayland clipboard has no data of its own: the program that copied serves it.
+That is wl-copy, started in the foreground in its own session so it outlives
+the file manager window (and a restart of the shell). It exits by itself as
+soon as anything else is copied. That is how every Wayland clipboard works,
+not a daemon: when the session ends the clipboard ends with it, unless a
+clipboard manager keeps it.
+
+`text/uri-list` cannot say "cut". GNOME-style file managers use
+x-special/gnome-copied-files and Dolphin application/x-kde-cutselection; both
+are read here. A cut made by Vexyon is recorded in
+$XDG_RUNTIME_DIR/vexyon/fm-clipboard.json with the PID of the wl-copy that
+serves it: it only counts as a cut while that same wl-copy is alive and the
+clipboard still holds exactly those URIs. Anything else is a copy, which never
+loses data.
+
+PLACES
+------
+User folders come from user-dirs.dirs (the configured, possibly translated
+paths such as ~/Documentos), never from English names. When the file does not
+exist yet, `xdg-user-dirs-update` creates it — the standard tool every desktop
+runs, which only fills in what is missing.
+
+Bookmarks live in $XDG_CONFIG_HOME/gtk-3.0/bookmarks, the file GTK file
+choosers, Nautilus, Thunar and Nemo already share. Lines Vexyon cannot show
+(sftp://, smb://…) are kept untouched.
+
+FOLDER ICONS
+------------
+$XDG_DATA_HOME/vexyon/folder-icons.json, keyed by path, with the folder's
+device and inode so a folder renamed or moved outside Vexyon (same file
+system) is found again. Nothing is written inside the folders themselves.
+Local images are copied, after sanitising, to
+$XDG_DATA_HOME/vexyon/folder-icons/<hash>.svg|.png; only that copy is ever
+loaded.
+"""
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.parse
+import xml.etree.ElementTree as ET
+
+HOME = os.path.expanduser("~")
+
+
+def xdg(var, default):
+    v = os.environ.get(var, "")
+    return v if v.startswith("/") else default
+
+
+CONFIG = xdg("XDG_CONFIG_HOME", os.path.join(HOME, ".config"))
+DATA = xdg("XDG_DATA_HOME", os.path.join(HOME, ".local", "share"))
+RUNTIME = xdg("XDG_RUNTIME_DIR", "/tmp/vexyon-%d" % os.getuid())
+
+RUN_DIR = os.path.join(RUNTIME, "vexyon")
+CLIP_MARK = os.path.join(RUN_DIR, "fm-clipboard.json")
+LOCK = os.path.join(RUN_DIR, "fm-helper.lock")
+USER_DIRS = os.path.join(CONFIG, "user-dirs.dirs")
+BOOKMARKS = os.path.join(CONFIG, "gtk-3.0", "bookmarks")
+ICON_DB = os.path.join(DATA, "vexyon", "folder-icons.json")
+ICON_DIR = os.path.join(DATA, "vexyon", "folder-icons")
+
+URI_LIST = "text/uri-list"
+GNOME = "x-special/gnome-copied-files"
+KDE_CUT = "application/x-kde-cutselection"
+
+
+def out(obj):
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def fail(msg, code=1):
+    out({"error": msg})
+    raise SystemExit(code)
+
+
+def ensure_run_dir():
+    os.makedirs(RUN_DIR, mode=0o700, exist_ok=True)
+
+
+class Locked(object):
+    """Serialises read-modify-write between helpers started by different
+    windows at the same moment."""
+
+    def __enter__(self):
+        ensure_run_dir()
+        self.fd = os.open(LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+
+
+def write_atomic(path, data, mode=0o644):
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    try:
+        mode = os.stat(path).st_mode & 0o777
+    except OSError:
+        pass
+    tmp = "%s.vexyon-tmp-%d" % (path, os.getpid())
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------
+# file:// URIs
+# ---------------------------------------------------------------------------
+def path_to_uri(p):
+    # Bytes, not str: a file name does not have to be valid UTF-8.
+    return "file://" + urllib.parse.quote_from_bytes(os.fsencode(p), safe="/")
+
+
+def uri_to_path(u):
+    """Local path of a file:// URI, or None for anything else."""
+    u = u.strip()
+    if not u.lower().startswith("file:"):
+        return None
+    rest = u[5:]
+    if rest.startswith("//"):
+        rest = rest[2:]
+        slash = rest.find("/")
+        if slash < 0:
+            return None
+        host = rest[:slash]
+        if host not in ("", "localhost") and host != os.uname().nodename:
+            return None
+        rest = rest[slash:]
+    if not rest.startswith("/"):
+        return None
+    rest = rest.split("#", 1)[0].split("?", 1)[0]
+    p = os.fsdecode(urllib.parse.unquote_to_bytes(rest))
+    p = os.path.normpath(p)
+    return p if p.startswith("/") else None
+
+
+def parse_uri_lines(text):
+    """RFC 2483: one URI per line, '#' lines are comments."""
+    uris = []
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = line.strip().rstrip("\x00")
+        if line and not line.startswith("#"):
+            uris.append(line)
+    return uris
+
+
+# ---------------------------------------------------------------------------
+# clipboard
+# ---------------------------------------------------------------------------
+def wl(args, timeout=3):
+    try:
+        r = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout
+
+
+def offered_types():
+    raw = wl(["wl-paste", "--list-types"])
+    if raw is None:
+        return []
+    return [t.strip() for t in raw.decode("utf-8", "replace").split("\n") if t.strip()]
+
+
+def read_type(t):
+    raw = wl(["wl-paste", "--no-newline", "--type", t])
+    return None if raw is None else raw.decode("utf-8", "surrogateescape")
+
+
+def pid_is_wlcopy(pid):
+    """Is PID still a wl-copy? NixOS wraps it (".wl-copy-wrapped", same PID
+    after the wrapper's exec), so the executable's name is compared without
+    those decorations."""
+    try:
+        exe = os.path.basename(os.readlink("/proc/%d/exe" % pid))
+    except (OSError, ValueError):
+        return False
+    if exe.endswith(" (deleted)"):
+        exe = exe[:-10]                  # upgraded underneath: still the same
+    return exe.lstrip(".").replace("-wrapped", "") == "wl-copy"
+
+
+def read_mark():
+    try:
+        with open(CLIP_MARK) as f:
+            m = json.load(f)
+        return m if isinstance(m, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def drop_mark():
+    try:
+        os.unlink(CLIP_MARK)
+    except OSError:
+        pass
+
+
+def clip_set(mode, paths):
+    if mode not in ("copy", "cut"):
+        fail("mode must be copy or cut")
+    clean = []
+    for p in paths:
+        if p.startswith("/"):
+            p = os.path.normpath(p)
+            if p not in clean:
+                clean.append(p)
+    if not clean:
+        fail("nothing to copy")
+    if shutil.which("wl-copy") is None:
+        fail("wl-copy is not installed")
+    uris = [path_to_uri(p) for p in clean]
+    data = ("\r\n".join(uris) + "\r\n").encode("ascii")
+    try:
+        proc = subprocess.Popen(["wl-copy", "--foreground", "--type", URI_LIST],
+                                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True,
+                                close_fds=True)
+        proc.stdin.write(data)
+        proc.stdin.close()
+    except OSError as e:
+        fail("wl-copy: %s" % (e.strerror or e))
+    # wl-copy reads everything, takes the selection and keeps serving it. If it
+    # is still alive a moment later it owns the clipboard; if it died, it
+    # could not (no Wayland display, no seat…).
+    deadline = time.monotonic() + 0.25
+    while time.monotonic() < deadline and proc.poll() is None:
+        time.sleep(0.01)
+    pid = proc.pid
+    if proc.poll() is not None:
+        # Gone already. Fine only if it exited cleanly because a clipboard
+        # keeper (wl-clip-persist and similar) took over our exact content.
+        if proc.returncode != 0 or parse_uri_lines(read_type(URI_LIST) or "") != uris:
+            fail("the clipboard is not available")
+        pid = None
+    with Locked():
+        write_atomic(CLIP_MARK, json.dumps({"mode": mode, "pid": pid,
+                                            "uris": uris}).encode(), 0o600)
+    out({"mode": mode, "paths": clean, "source": "vexyon", "foreign": 0})
+
+
+def clip_read():
+    types = offered_types()
+    if not types:
+        return {"mode": "", "paths": [], "source": "none", "foreign": 0}
+    mode, uris, source = "", [], "none"
+    if GNOME in types:
+        txt = read_type(GNOME) or ""
+        lines = parse_uri_lines(txt)
+        if lines and lines[0] in ("copy", "cut"):
+            mode, uris, source = lines[0], lines[1:], "gnome"
+    if not uris and URI_LIST in types:
+        uris = parse_uri_lines(read_type(URI_LIST) or "")
+        if uris:
+            mode, source = "copy", "uri"
+            if KDE_CUT in types and (read_type(KDE_CUT) or "").strip() == "1":
+                mode, source = "cut", "kde"
+    if not uris:
+        # A file list that arrived as plain text (e.g. picked again from the
+        # clipboard history): only when EVERY line is a file:// URI.
+        for t in ("text/plain;charset=utf-8", "text/plain"):
+            if t in types:
+                lines = parse_uri_lines(read_type(t) or "")
+                if lines and all(l.lower().startswith("file://") for l in lines):
+                    mode, uris, source = "copy", lines, "text"
+                break
+    if not uris:
+        return {"mode": "", "paths": [], "source": "none", "foreign": 0}
+
+    m = read_mark()
+    if source == "uri" and m and m.get("uris") == uris:
+        pid = m.get("pid")
+        # Ours while the wl-copy that serves it is alive; with no PID (a
+        # clipboard keeper took over) the exact same URI list has to do.
+        if pid is None or (isinstance(pid, int) and pid_is_wlcopy(pid)):
+            mode, source = m.get("mode", "copy"), "vexyon"
+
+    paths, foreign = [], 0
+    for u in uris:
+        p = uri_to_path(u)
+        if p is None:
+            foreign += 1
+        elif p not in paths:
+            paths.append(p)
+    return {"mode": mode if paths else "", "paths": paths,
+            "source": source, "foreign": foreign}
+
+
+def clip_get():
+    out(clip_read())
+
+
+def clip_done():
+    """After a cut was pasted the files are gone from where the clipboard
+    points; leave nothing behind that a second paste would trip over. Only
+    what is still exactly that cut is cleared — never something copied since."""
+    info = clip_read()
+    m = read_mark()
+    with Locked():
+        drop_mark()
+    if info["mode"] != "cut":
+        out({"cleared": False})
+        return
+    if (info["source"] == "vexyon" and m and isinstance(m.get("pid"), int)
+            and pid_is_wlcopy(m["pid"])):
+        try:
+            os.kill(m["pid"], signal.SIGTERM)
+        except OSError:
+            pass
+    else:
+        wl(["wl-copy", "--clear"])
+    out({"cleared": True})
+
+
+# ---------------------------------------------------------------------------
+# XDG user folders
+# ---------------------------------------------------------------------------
+USER_DIR_RE = re.compile(r'^\s*XDG_([A-Z]+)_DIR\s*=\s*"(.*)"\s*$')
+
+
+def unescape_shell(s):
+    return re.sub(r'\\(.)', r'\1', s)
+
+
+def read_user_dirs():
+    dirs = {}
+    try:
+        with open(USER_DIRS, encoding="utf-8", errors="surrogateescape") as f:
+            lines = f.read().split("\n")
+    except OSError:
+        return None
+    for line in lines:
+        m = USER_DIR_RE.match(line)
+        if not m:
+            continue
+        val = unescape_shell(m.group(2))
+        if val.startswith("$HOME"):
+            val = HOME + val[5:]
+        elif not val.startswith("/"):
+            continue                       # the spec allows nothing else
+        val = os.path.normpath(val)
+        if val == os.path.normpath(HOME):
+            continue                       # "disabled": points at $HOME
+        dirs[m.group(1)] = val
+    return dirs
+
+
+def user_dirs():
+    created = False
+    dirs = read_user_dirs()
+    if dirs is None and shutil.which("xdg-user-dirs-update"):
+        try:
+            subprocess.run(["xdg-user-dirs-update"], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=10)
+            created = True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        dirs = read_user_dirs()
+    res = {}
+    for k, p in (dirs or {}).items():
+        res[k] = {"path": p, "exists": os.path.isdir(p)}
+    return res, created
+
+
+# ---------------------------------------------------------------------------
+# bookmarks (GTK format: "URI[ label]" per line)
+# ---------------------------------------------------------------------------
+def read_bookmark_lines():
+    try:
+        with open(BOOKMARKS, encoding="utf-8", errors="surrogateescape") as f:
+            return [l for l in f.read().split("\n") if l.strip()]
+    except OSError:
+        return []
+
+
+def split_bm(line):
+    uri, _, label = line.strip().partition(" ")
+    return uri, label.strip()
+
+
+def bookmark_entries(lines):
+    """[(index in lines, path, label)] for the local folders."""
+    res = []
+    for i, line in enumerate(lines):
+        uri, label = split_bm(line)
+        p = uri_to_path(uri)
+        if p is not None:
+            res.append((i, p, label))
+    return res
+
+
+def write_bookmarks(lines):
+    data = "".join(l + "\n" for l in lines)
+    write_atomic(BOOKMARKS, data.encode("utf-8", "surrogateescape"))
+
+
+def builtin_paths(dirs):
+    s = {os.path.normpath(HOME)}
+    for v in dirs.values():
+        s.add(v["path"])
+    return s
+
+
+def places(extra=None):
+    dirs, created = user_dirs()
+    builtin = builtin_paths(dirs)
+    bms, seen = [], set()
+    for _, p, label in bookmark_entries(read_bookmark_lines()):
+        if p in seen or p in builtin:
+            continue                       # shown once, and built-ins once
+        seen.add(p)
+        bms.append({"path": p, "label": label or os.path.basename(p) or p,
+                    "custom": bool(label), "exists": os.path.isdir(p)})
+    res = {"home": os.path.normpath(HOME), "dirs": dirs, "bookmarks": bms,
+           "created": created}
+    if extra:
+        res.update(extra)
+    out(res)
+
+
+def visible_index_to_line(lines, entries, dirs, n):
+    """Position N among the bookmarks the sidebar shows -> index in `lines`."""
+    builtin = builtin_paths(dirs)
+    shown, seen = [], set()
+    for i, p, _ in entries:
+        if p in seen or p in builtin:
+            continue
+        seen.add(p)
+        shown.append(i)
+    if n < 0 or n >= len(shown):
+        return len(lines) if not shown else shown[-1] + 1
+    return shown[n]
+
+
+def bm_add(args):
+    at = -1
+    if len(args) >= 2 and args[0] == "--at":
+        try:
+            at = int(args[1])
+        except ValueError:
+            fail("bad position")
+        args = args[2:]
+    added, rejected = [], []
+    with Locked():
+        dirs, _ = user_dirs()
+        builtin = builtin_paths(dirs)
+        lines = read_bookmark_lines()
+        have = {p for _, p, _ in bookmark_entries(lines)}
+        new = []
+        for raw in args:
+            p = os.path.normpath(raw) if raw.startswith("/") else ""
+            if not p:
+                rejected.append({"path": raw, "why": "invalid"})
+            elif not os.path.isdir(p):
+                rejected.append({"path": p, "why": "notdir"})
+            elif p in builtin:
+                rejected.append({"path": p, "why": "builtin"})
+            elif p in have or p in new:
+                rejected.append({"path": p, "why": "duplicate"})
+            else:
+                new.append(p)
+        if new:
+            pos = visible_index_to_line(lines, bookmark_entries(lines), dirs, at)
+            lines[pos:pos] = [path_to_uri(p) for p in new]
+            write_bookmarks(lines)
+            added = new
+    places({"added": added, "rejected": rejected})
+
+
+def bm_remove(path):
+    path = os.path.normpath(path)
+    with Locked():
+        lines = read_bookmark_lines()
+        keep = [l for l in lines if uri_to_path(split_bm(l)[0]) != path]
+        if len(keep) != len(lines):
+            write_bookmarks(keep)
+    places({"removed": len(keep) != len(lines)})
+
+
+def bm_moved(src, dst):
+    """Vexyon renamed or moved SRC to DST: point its bookmarks (and those of
+    folders inside it) at the new place, same position, same label."""
+    src, dst = os.path.normpath(src), os.path.normpath(dst)
+    with Locked():
+        lines = read_bookmark_lines()
+        changed = False
+        if os.path.isdir(dst) and not os.path.exists(src):
+            for i, line in enumerate(lines):
+                uri, label = split_bm(line)
+                p = uri_to_path(uri)
+                if p is not None and (p == src or p.startswith(src + "/")):
+                    lines[i] = path_to_uri(dst + p[len(src):]) + (" " + label if label else "")
+                    changed = True
+        if changed:
+            write_bookmarks(lines)
+    places({"changed": changed})
+
+
+def bm_move(path, n):
+    path = os.path.normpath(path)
+    with Locked():
+        dirs, _ = user_dirs()
+        lines = read_bookmark_lines()
+        mine = [l for l in lines if uri_to_path(split_bm(l)[0]) == path]
+        if mine:
+            rest = [l for l in lines if uri_to_path(split_bm(l)[0]) != path]
+            pos = visible_index_to_line(rest, bookmark_entries(rest), dirs, n)
+            rest[pos:pos] = mine[:1]
+            if rest != lines:
+                write_bookmarks(rest)
+    places()
+
+
+# ---------------------------------------------------------------------------
+# folder icons
+# ---------------------------------------------------------------------------
+ICON_ID = re.compile(r"^(md:[a-z0-9-]{1,64}|img:[0-9a-f]{20}\.(svg|png))$")
+GLYPH = re.compile(r"^[0-9a-f]{4,5}$")
+
+
+def glyph_ok(g):
+    if not GLYPH.match(g):
+        return False
+    cp = int(g, 16)
+    # Nerd Font private-use ranges only (Font Awesome / Linux logos / MDI)
+    return 0xE000 <= cp <= 0xF8FF or 0xF0001 <= cp <= 0xF1AF0
+
+
+def load_icons():
+    try:
+        with open(ICON_DB, encoding="utf-8", errors="surrogateescape") as f:
+            db = json.load(f)
+        folders = db.get("folders") if isinstance(db, dict) else None
+        if isinstance(folders, dict):
+            return folders
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def save_icons(folders):
+    gc_images(folders)
+    data = json.dumps({"version": 1, "folders": folders}, ensure_ascii=False,
+                      indent=1, sort_keys=True)
+    write_atomic(ICON_DB, data.encode("utf-8", "surrogateescape"))
+
+
+def gc_images(folders):
+    used = {r.get("icon", "")[4:] for r in folders.values()
+            if r.get("icon", "").startswith("img:")}
+    try:
+        names = os.listdir(ICON_DIR)
+    except OSError:
+        return
+    for n in names:
+        if n not in used and re.match(r"^[0-9a-f]{20}\.(svg|png)$", n):
+            try:
+                os.unlink(os.path.join(ICON_DIR, n))
+            except OSError:
+                pass
+
+
+def identity(p):
+    st = os.stat(p)
+    return st.st_dev, st.st_ino
+
+
+def icons_out(folders, extra=None):
+    res = {"folders": folders, "imageDir": ICON_DIR}
+    if extra:
+        res.update(extra)
+    out(res)
+
+
+def set_record(path, icon, glyph):
+    path = os.path.normpath(path)
+    if not path.startswith("/") or not os.path.isdir(path):
+        fail("not a folder")
+    dev, ino = identity(path)
+    with Locked():
+        folders = load_icons()
+        folders[path] = {"icon": icon, "glyph": glyph, "dev": dev, "ino": ino}
+        save_icons(folders)
+    icons_out(folders)
+
+
+def icon_set(path, icon, glyph):
+    if not icon.startswith("md:") or not ICON_ID.match(icon) or not glyph_ok(glyph):
+        fail("unknown icon")
+    set_record(path, icon, glyph)
+
+
+def icon_reset(path):
+    path = os.path.normpath(path)
+    with Locked():
+        folders = load_icons()
+        if folders.pop(path, None) is not None:
+            save_icons(folders)
+    icons_out(folders)
+
+
+def icon_moved(src, dst):
+    src, dst = os.path.normpath(src), os.path.normpath(dst)
+    with Locked():
+        folders = load_icons()
+        changed = False
+        if os.path.isdir(dst) and not os.path.exists(src):
+            for k in list(folders):
+                if k == src or k.startswith(src + "/"):
+                    nk = dst + k[len(src):]
+                    rec = folders.pop(k)
+                    try:
+                        rec["dev"], rec["ino"] = identity(nk)
+                    except OSError:
+                        pass
+                    folders[nk] = rec
+                    changed = True
+        if changed:
+            save_icons(folders)
+    icons_out(folders, {"changed": changed})
+
+
+def icon_adopt(paths):
+    """A folder in a listing has the device+inode of a stored folder whose
+    path no longer leads to it: it was renamed or moved by another program.
+    Follow it (with whatever was customised underneath it)."""
+    with Locked():
+        folders = load_icons()
+        changed = False
+        for p in paths:
+            p = os.path.normpath(p)
+            if p in folders:
+                continue
+            try:
+                ident = identity(p)
+            except OSError:
+                continue
+            for old, rec in list(folders.items()):
+                if (rec.get("dev"), rec.get("ino")) != ident:
+                    continue
+                try:
+                    still = identity(old) == ident
+                except OSError:
+                    still = False
+                if still:
+                    continue              # a hard link / bind mount: not a move
+                for k in list(folders):
+                    if k == old or k.startswith(old + "/"):
+                        folders[p + k[len(old):]] = folders.pop(k)
+                changed = True
+                break
+        if changed:
+            save_icons(folders)
+    icons_out(folders, {"changed": changed})
+
+
+# ---- local images: untrusted input ----------------------------------------
+SVG_NS = "http://www.w3.org/2000/svg"
+XLINK_NS = "http://www.w3.org/1999/xlink"
+MAX_SVG = 1 << 20
+MAX_PNG = 4 << 20
+
+SVG_ELEMENTS = {
+    "svg", "g", "defs", "symbol", "use", "path", "rect", "circle", "ellipse",
+    "line", "polyline", "polygon", "linearGradient", "radialGradient", "stop",
+    "clipPath", "mask", "text", "tspan",
+}
+SVG_ATTRS = {
+    "id", "d", "x", "y", "x1", "y1", "x2", "y2", "cx", "cy", "r", "rx", "ry",
+    "fx", "fy", "width", "height", "viewBox", "preserveAspectRatio", "points",
+    "transform", "fill", "fill-opacity", "fill-rule", "stroke", "stroke-width",
+    "stroke-opacity", "stroke-linecap", "stroke-linejoin", "stroke-miterlimit",
+    "stroke-dasharray", "stroke-dashoffset", "opacity", "clip-path",
+    "clip-rule", "mask", "offset", "stop-color", "stop-opacity",
+    "gradientUnits", "gradientTransform", "spreadMethod", "clipPathUnits",
+    "maskUnits", "maskContentUnits", "font-family", "font-size",
+    "font-weight", "font-style", "text-anchor", "dominant-baseline",
+    "visibility", "display", "color", "version", "style",
+}
+URL_ATTRS = {"fill", "stroke", "clip-path", "mask"}
+LOCAL_URL = re.compile(r"^\s*url\(\s*['\"]?#[A-Za-z0-9_.:-]+['\"]?\s*\)\s*$")
+BAD_VALUE = re.compile(r"(javascript:|data:|expression\s*\(|@import|url\s*\()", re.I)
+
+
+def clean_value(name, value):
+    if name in URL_ATTRS and LOCAL_URL.match(value):
+        return value
+    if BAD_VALUE.search(value):
+        return None
+    return value
+
+
+def clean_style(style):
+    keep = []
+    for decl in style.split(";"):
+        k, _, v = decl.partition(":")
+        k, v = k.strip().lower(), v.strip()
+        if not k or k not in SVG_ATTRS or k == "style":
+            continue
+        v = clean_value(k, v)
+        if v is not None:
+            keep.append("%s:%s" % (k, v))
+    return ";".join(keep)
+
+
+def local_name(tag):
+    if not isinstance(tag, str):
+        return None
+    if tag.startswith("{"):
+        ns, _, name = tag[1:].partition("}")
+        return name if ns == SVG_NS else None
+    return None
+
+
+def clean_element(src):
+    """A new element with only allowed attributes and children (recursive)."""
+    name = local_name(src.tag)
+    dst = ET.Element("{%s}%s" % (SVG_NS, name))
+    for k, v in src.attrib.items():
+        if k in ("{%s}href" % XLINK_NS, "href"):
+            if re.match(r"^#[A-Za-z0-9_.:-]+$", v):   # same document only
+                dst.set("{%s}href" % XLINK_NS, v)
+            continue
+        if k not in SVG_ATTRS:
+            continue                                  # on*, xml:base, events…
+        if k == "style":
+            v = clean_style(v)
+            if v:
+                dst.set(k, v)
+            continue
+        v = clean_value(k, v)
+        if v is not None:
+            dst.set(k, v)
+    if name in ("text", "tspan") and src.text:
+        dst.text = src.text
+    for child in src:
+        cname = local_name(child.tag)
+        if cname in SVG_ELEMENTS:
+            dst.append(clean_element(child))
+            if name in ("text", "tspan") and child.tail:
+                dst[-1].tail = child.tail
+        # anything else is dropped with its whole subtree: script, style,
+        # foreignObject, image, a, animate, iframe, unknown namespaces…
+    return dst
+
+
+def sanitize_svg(raw):
+    if len(raw) > MAX_SVG:
+        raise ValueError("the SVG is larger than 1 MiB")
+    low = raw.lower()
+    # No DTD at all: no entities, no external references, no entity bombs.
+    if b"<!doctype" in low or b"<!entity" in low:
+        raise ValueError("the SVG declares a DTD or entities")
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        raise ValueError("not a valid SVG file")
+    if local_name(root.tag) != "svg":
+        raise ValueError("not an SVG image")
+    clean = clean_element(root)
+    if not clean.get("viewBox"):
+        w = re.match(r"^\s*([0-9.]+)", clean.get("width", ""))
+        h = re.match(r"^\s*([0-9.]+)", clean.get("height", ""))
+        if w and h:
+            clean.set("viewBox", "0 0 %s %s" % (w.group(1), h.group(1)))
+    ET.register_namespace("", SVG_NS)
+    ET.register_namespace("xlink", XLINK_NS)
+    return ET.tostring(clean, encoding="utf-8")
+
+
+def check_png(raw):
+    if len(raw) > MAX_PNG:
+        raise ValueError("the PNG is larger than 4 MiB")
+    if raw[:8] != b"\x89PNG\r\n\x1a\n" or raw[12:16] != b"IHDR":
+        raise ValueError("not a valid PNG file")
+    w = int.from_bytes(raw[16:20], "big")
+    h = int.from_bytes(raw[20:24], "big")
+    if not (0 < w <= 4096 and 0 < h <= 4096):
+        raise ValueError("the PNG is larger than 4096×4096")
+    return raw
+
+
+def icon_image(path, image):
+    try:
+        with open(image, "rb") as f:
+            raw = f.read(MAX_PNG + 1)
+    except OSError as e:
+        fail(e.strerror or str(e))
+    try:
+        if raw[:8] == b"\x89PNG\r\n\x1a\n":
+            data, ext = check_png(raw), "png"
+        elif raw.lstrip(b"\xef\xbb\xbf \t\r\n")[:1] == b"<":
+            data, ext = sanitize_svg(raw), "svg"
+        else:
+            raise ValueError("not an SVG or PNG image")
+    except ValueError as e:
+        fail(str(e))
+    name = "%s.%s" % (hashlib.sha256(data).hexdigest()[:20], ext)
+    target = os.path.join(ICON_DIR, name)
+    if not os.path.exists(target):
+        write_atomic(target, data)
+    set_record(path, "img:" + name, "")
+
+
+# ---------------------------------------------------------------------------
+def main():
+    a = sys.argv[1:]
+    if not a:
+        fail("usage: see the header of this file", 2)
+    cmd, rest = a[0], a[1:]
+    if cmd == "clip-set" and len(rest) >= 2:
+        clip_set(rest[0], rest[1:])
+    elif cmd == "clip-get":
+        clip_get()
+    elif cmd == "clip-done":
+        clip_done()
+    elif cmd == "places":
+        places()
+    elif cmd == "bm-add" and rest:
+        bm_add(rest)
+    elif cmd == "bm-remove" and len(rest) == 1:
+        bm_remove(rest[0])
+    elif cmd == "bm-moved" and len(rest) == 2:
+        bm_moved(rest[0], rest[1])
+    elif cmd == "bm-move" and len(rest) == 2:
+        try:
+            n = int(rest[1])
+        except ValueError:
+            fail("bad position")
+        bm_move(rest[0], n)
+    elif cmd == "icons":
+        icons_out(load_icons())
+    elif cmd == "icon-set" and len(rest) == 3:
+        icon_set(rest[0], rest[1], rest[2].lower())
+    elif cmd == "icon-image" and len(rest) == 2:
+        icon_image(rest[0], rest[1])
+    elif cmd == "icon-reset" and len(rest) == 1:
+        icon_reset(rest[0])
+    elif cmd == "icon-moved" and len(rest) == 2:
+        icon_moved(rest[0], rest[1])
+    elif cmd == "icon-adopt" and rest:
+        icon_adopt(rest)
+    else:
+        fail("usage: see the header of this file", 2)
+
+
+if __name__ == "__main__":
+    # A file name does not have to be valid UTF-8: never die printing one.
+    sys.stdout.reconfigure(errors="surrogateescape")
+    try:
+        main()
+    except OSError as e:
+        if e.errno == errno.EPIPE:
+            raise SystemExit(0)
+        fail(e.strerror or str(e))

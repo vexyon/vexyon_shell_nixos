@@ -6,6 +6,42 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
 (NixOS). Releases before 3.0 were not recorded here; their history is in
 `PROJECT_STATE.md` and the git log.
 
+## [Unreleased]
+
+### Fixed
+
+- **File Manager: copy/paste between two windows.** Copied or cut files were
+  kept in a property of the window they were copied in, so a second window
+  (or any other program) had nothing to paste. They now go to the system
+  clipboard as `text/uri-list` (served by `wl-copy`), and paste reads whatever
+  the clipboard holds: files from another Vexyon window or process, from
+  Nautilus, Thunar, Dolphin or a browser. Ctrl+C / Ctrl+X / Ctrl+V / Ctrl+A,
+  multi-selection, folders (recursive), cut = move (the source is removed only
+  after a complete move), cut items shown dimmed in every window.
+
+### Added
+
+- **File Manager: user folders at their real paths.** Desktop, Documents,
+  Downloads, Pictures, Music and Videos come from `user-dirs.dirs`, so
+  translated folders (`~/Documentos`, `~/Bilder`…) are found; never by English
+  names. A folder created later shows up on its own. `xdg-user-dirs` is
+  installed by both installers.
+- **File Manager: folder icons.** A symbol on top of the folder artwork for the
+  user folders, and *Customize Folder Icon* for any folder: 260 symbols in 19
+  categories (from the Nerd Font the shell already ships — no icon pack),
+  search in English and Spanish, live preview, reset; or a local SVG/PNG, of
+  which only a sanitised copy is ever loaded. Theme-aware contrast in dark and
+  light themes, grid and list. Icons follow renames and moves made in Vexyon
+  and renames made by other programs (same file system).
+- **File Manager: sidebar bookmarks.** *Add to Sidebar* (right-click, Ctrl+D)
+  or drag folders between the sidebar rows; reorder by dragging; *Remove from
+  Sidebar* never touches the folder. Stored in the GTK bookmarks file shared
+  with GTK file dialogs, Nautilus and Thunar; existing bookmarks are kept.
+- **File Manager: pasting never overwrites.** A name that already exists is
+  skipped and the card offers **Keep both**; pasting into the same folder
+  makes "name (copy)"; a folder is never copied into itself; errors (missing
+  source, read-only destination, permissions) are shown on the card.
+
 ## [3.0.0] — 2026-10-08
 
 ### Added

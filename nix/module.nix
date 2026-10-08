@@ -282,6 +282,10 @@ in
       hyprpicker # widget selector de color
       pulseaudio # SOLO por `pactl` (Ajustes → Audio, widget de privacidad); ningún demonio
       psmisc # `fuser`, la comprobación de cámara del widget de privacidad
+      # Gestor de ficheros: las carpetas de usuario (Escritorio, Documentos…)
+      # en las rutas de user-dirs.dirs; si aún no existe, el gestor ejecuta
+      # xdg-user-dirs-update una vez, como cualquier escritorio al entrar.
+      xdg-user-dirs
       # Qt6: lo trae quickshell como dependencia propia. NO se instala qt6ct
       # aunque vexyon-env.lua fije QT_QPA_PLATFORMTHEME=qt6ct.
       #

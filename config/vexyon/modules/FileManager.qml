@@ -10,7 +10,9 @@ import qs.components
 //  Vexyon File Manager — Super+E. Nautilus-like: places sidebar + list/grid
 //  view, breadcrumb nav, open (xdg-open), native trash (gio) con restaurar/
 //  vaciar, ZIP compress/extract, multi-selección (marquee + Ctrl/Shift),
-//  drag-and-drop para mover, cortar/copiar/pegar y renombrar.
+//  drag-and-drop para mover, cortar/copiar/pegar (portapapeles del SISTEMA,
+//  entre ventanas y programas: FileClipboard), renombrar, marcadores en la
+//  barra lateral (Places) e iconos de carpeta (FolderIcons).
 //  A real toplevel window (not an overlay).
 // ============================================================================
 FloatingWindow {
@@ -109,13 +111,24 @@ FloatingWindow {
     // Acciones del menú contextual. Vive en el ROOT (no en el delegate del
     // menú) para que la acción sobreviva a la destrucción del delegate que
     // la disparó — ver el comentario del onClicked del menú.
-    function ctxAction(act, e, sel) {
+    function ctxAction(act, e, sel, side) {
         switch (act) {
         case "open":       fm.open(e); break;
         case "rename":     fm.startRename(); break;
         case "cut":        fm.cutSelected(); break;
         case "copy":       fm.copySelected(); break;
-        case "paste":      fm.paste(); break;
+        case "paste":      fm.paste(fm.cwd); break;
+        case "pasteinto":  fm.paste(e.path); break;
+        case "bookmark":   fm.addToSidebar(sel.length ? sel : [e.path]); break;
+        case "bookmarkcwd": fm.addToSidebar([fm.cwd]); break;
+        case "unbookmark": Places.remove(e ? e.path : fm.cwd); break;
+        case "foldericon": fm.openIconPicker(e ? e.path : fm.cwd); break;
+        // barra lateral (quitar un marcador NUNCA toca la carpeta)
+        case "sideopen":   fm.navigate(side.path); break;
+        case "sideicon":   fm.openIconPicker(side.path); break;
+        case "bmup":       Places.move(side.path, side.index - 1); break;
+        case "bmdown":     Places.move(side.path, side.index + 1); break;
+        case "bmremove":   Places.remove(side.path); break;
         case "extract":    fm.extract(e.path); break;
         case "compress":   fm.compress(e.path); break;
         case "trash":      fm.trashPaths(sel.length ? sel : [e.path]); break;
@@ -136,7 +149,13 @@ FloatingWindow {
     // (sin carreras de Timer — el refresh llega cuando la operación acabó).
     Process {
         id: opProc
-        onExited: fm.refresh()
+        property var after: null          // callback opcional de runOp, al terminar
+        onExited: {
+            var f = opProc.after;
+            opProc.after = null;
+            fm.refresh();
+            if (f) f();
+        }
         stdout: StdioCollector {}
         stderr: StdioCollector {
             onStreamFinished: if (this.text.trim() !== "") console.warn("[FileManager] op:", this.text.trim())
@@ -149,9 +168,17 @@ FloatingWindow {
         return (i === 0 || v >= 10 ? Math.round(v) : v.toFixed(1)) + " " + u[i];
     }
 
-    function runOp(script) {
+    function runOp(script, after) {
+        opProc.after = after || null;
         opProc.command = ["bash", "-c", script];
         opProc.running = true;
+    }
+
+    //  Algo que Vexyon ha renombrado o movido conserva su icono de carpeta y
+    //  su marcador. Solo se llama al ayudante si de verdad hay algo que mover.
+    function followMove(from, to) {
+        FolderIcons.moved(from, to);
+        Places.moved(from, to);
     }
 
     // ======================================================================
@@ -178,6 +205,7 @@ FloatingWindow {
     }
     property int _jobSeq: 0
     property var _jobCmd: ({})          // id -> argv (no reactivo: se lee una vez)
+    property var _jobInfo: ({})         // id -> { kind, dest, srcs, conflicts[] }
     function jobCmd(id) { return fm._jobCmd[id] || []; }
 
     ListModel { id: jobModel }
@@ -191,26 +219,54 @@ FloatingWindow {
         var r = fm._jobRow(id);
         if (r !== -1) jobModel.remove(r);
         delete fm._jobCmd[id];
+        delete fm._jobInfo[id];
+        delete fm._jobExited[id];
+    }
+
+    //  Un aviso suelto en la misma franja que las transferencias (portapapeles
+    //  vacío, marcador repetido…). Sin proceso detrás: kind "note".
+    function notice(text, isError) {
+        if (!text) return;
+        var id = ++fm._jobSeq;
+        jobModel.append({ jobId: id, kind: "note", destName: "", phase: isError ? "err" : "note",
+                          total: 0, done: 0, files: 0, idx: 0, file: "", copied: 0,
+                          skipped: 0, errors: 0, conflicts: 0, errMsg: text });
     }
 
     //  kind = "copy" | "move".  Devuelve false si no había nada que hacer.
-    function startXfer(kind, paths, destDir) {
-        var use = [];
+    //  keepBoth: lo que ya exista en el destino se copia/mueve con un nombre
+    //  nuevo ("foto (copia).jpg") en vez de saltarse. Pegar en la MISMA carpeta
+    //  de origen siempre duplica así (lo decide el ayudante).
+    function startXfer(kind, paths, destDir, keepBoth) {
+        var use = [], self = 0;
         for (var i = 0; i < paths.length; i++) {
             var p = paths[i];
-            if (p === destDir || destDir.indexOf(p + "/") === 0) continue;   // dentro de sí mismo
+            if (p === destDir || destDir.indexOf(p + "/") === 0) { self++; continue; }   // dentro de sí mismo
             if (kind === "move" && p.substring(0, p.lastIndexOf("/")) === destDir) continue;
             use.push(p);
         }
+        if (self > 0) fm.notice(I18n.t("A folder can't be copied or moved into itself."), true);
         if (!use.length) return false;
         var id = ++fm._jobSeq;
-        var cmd = [fm.xferBin, kind, destDir];
+        var cmd = [fm.xferBin, kind, "--copy-word", I18n.t("copy")];
+        if (keepBoth) cmd.push("--keep-both");
+        cmd.push(destDir);
         for (var k = 0; k < use.length; k++) cmd.push(use[k]);
         fm._jobCmd[id] = cmd;
+        fm._jobInfo[id] = { kind: kind, dest: destDir, srcs: use, conflicts: [] };
         jobModel.append({ jobId: id, kind: kind, destName: fm.basename(destDir) || "/",
                           phase: "scan", total: 0, done: 0, files: 0, idx: 0,
-                          file: "", copied: 0, skipped: 0, errors: 0, errMsg: "" });
+                          file: "", copied: 0, skipped: 0, errors: 0, conflicts: 0, errMsg: "" });
         return true;
+    }
+    //  "Conservar ambos" de una tarjeta: lo que se saltó por existir ya, otra
+    //  vez, con nombre nuevo.
+    function keepBoth(id) {
+        var j = fm._jobInfo[id];
+        if (!j || !j.conflicts.length) return;
+        var kind = j.kind, dest = j.dest, srcs = j.conflicts.slice();
+        fm.dismissJob(id);
+        fm.startXfer(kind, srcs, dest, true);
     }
 
     //  Una línea del ayudante. Se leen SEGÚN LLEGAN (SplitParser), no al final:
@@ -237,17 +293,24 @@ FloatingWindow {
         case "@@SKIP":
             jobModel.setProperty(r, "skipped", jobModel.get(r).skipped + 1);
             break;
+        case "@@CONFLICT":
+            if (fm._jobInfo[id]) fm._jobInfo[id].conflicts.push(f[1] || "");
+            jobModel.setProperty(r, "conflicts", jobModel.get(r).conflicts + 1);
+            break;
         case "@@ERR":
             jobModel.setProperty(r, "errors", jobModel.get(r).errors + 1);
             if (jobModel.get(r).errMsg === "")
-                jobModel.setProperty(r, "errMsg", (f[1] || "") + ": " + (f[2] || ""));
+                jobModel.setProperty(r, "errMsg", (f[1] || "") + ": "
+                    + (f[2] === "@self" ? I18n.t("A folder can't be copied or moved into itself.") : (f[2] || "")));
             break;
         case "@@DONE":
             jobModel.setProperty(r, "copied", parseInt(f[1], 10) || 0);
             break;
         }
     }
+    property var _jobExited: ({})
     function _jobExit(id, code) {
+        fm._jobExited[id] = true;
         var r = fm._jobRow(id);
         if (r === -1) return;
         var j = jobModel.get(r);
@@ -258,6 +321,12 @@ FloatingWindow {
         else                              jobModel.setProperty(r, "phase", "ok");
         if (code > 1 && j.errMsg === "")
             jobModel.setProperty(r, "errMsg", I18n.t("The transfer could not be started."));
+        // Lo movido se lleva su icono de carpeta y su marcador (el ayudante
+        // comprueba que el origen ya no está y el destino sí).
+        var info = fm._jobInfo[id];
+        if (info && info.kind === "move")
+            for (var i = 0; i < info.srcs.length; i++)
+                fm.followMove(info.srcs[i], info.dest + "/" + fm.basename(info.srcs[i]));
         fm.refresh();
     }
 
@@ -268,7 +337,7 @@ FloatingWindow {
         delegate: Process {
             required property int jobId
             command: fm.jobCmd(jobId)
-            running: true
+            running: command.length > 0          // los avisos ("note") no tienen proceso
             stdout: SplitParser { onRead: function(line) { fm._jobLine(jobId, line); } }
             stderr: StdioCollector {
                 onStreamFinished: {
@@ -280,11 +349,28 @@ FloatingWindow {
                 }
             }
             onExited: function(code) { fm._jobExit(jobId, code); }
+            // Si el ayudante ni arranca (no está, sin permiso de ejecución) no
+            // hay `exited`: la tarjeta lo dice en vez de quedarse "calculando".
+            onRunningChanged: if (!running) {
+                var id = jobId;
+                Qt.callLater(function() { fm._jobNoStart(id); });
+            }
         }
+    }
+    function _jobNoStart(id) {
+        var r = fm._jobRow(id);
+        if (r === -1 || jobModel.get(r).phase !== "scan" || fm._jobExited[id]) return;
+        jobModel.setProperty(r, "phase", "err");
+        jobModel.setProperty(r, "errMsg", I18n.t("The transfer could not be started."));
     }
 
     function open(entry) {
         if (entry.isDir) navigate(entry.path);
+        else if (fm.pickImageFor !== "") {
+            // eligiendo la imagen de un icono de carpeta: abrir = usarla
+            if (/\.(svg|png)$/i.test(entry.name)) fm.useImage(entry.path);
+            else fm.notice(I18n.t("Choose an SVG or PNG image."), false);
+        }
         else Quickshell.execDetached(["xdg-open", entry.path]);
     }
 
@@ -362,16 +448,31 @@ FloatingWindow {
         fm.startXfer("copy", paths, destDir);
     }
 
-    // ---- cortar / copiar / pegar (portapapeles interno) --------------------
-    property var clipPaths: []
-    property string clipMode: ""   // "copy" | "cut"
-    function cutSelected() { var l = selectedList(); if (l.length) { fm.clipPaths = l; fm.clipMode = "cut"; } }
-    function copySelected() { var l = selectedList(); if (l.length) { fm.clipPaths = l; fm.clipMode = "copy"; } }
-    function paste() {
-        if (!fm.clipPaths.length) return;
-        var kind = fm.clipMode === "cut" ? "move" : "copy";
-        fm.startXfer(kind, fm.clipPaths, fm.cwd);
-        if (fm.clipMode === "cut") { fm.clipPaths = []; fm.clipMode = ""; }
+    // ---- cortar / copiar / pegar: portapapeles DEL SISTEMA -----------------
+    //  Antes vivía en dos propiedades de ESTA ventana (clipPaths/clipMode): otra
+    //  ventana del gestor —u otro programa— veía un portapapeles vacío. Ahora
+    //  Ctrl+C/X dejan los ficheros en el portapapeles de Wayland
+    //  (FileClipboard → text/uri-list servido por wl-copy) y Ctrl+V lee lo que
+    //  haya EN ESE MOMENTO, venga de donde venga. El motor de copia es el mismo
+    //  de siempre (vexyon-fm-xfer: progreso, nunca machaca).
+    function cutSelected() { var l = selectedList(); if (l.length) FileClipboard.cut(l, fm._clipDone); }
+    function copySelected() { var l = selectedList(); if (l.length) FileClipboard.copy(l, fm._clipDone); }
+    function _clipDone(ok) { if (!ok) fm.notice(FileClipboard.error, true); }
+    function paste(destDir) {
+        if (fm.inTrash) return;
+        FileClipboard.fetch(function(r) {
+            if (!r.paths.length) {
+                fm.notice(r.foreign > 0 ? I18n.t("Only local files can be pasted here.")
+                                        : I18n.t("There are no files on the clipboard."), false);
+                return;
+            }
+            var cut = r.mode === "cut";
+            fm.startXfer(cut ? "move" : "copy", r.paths, destDir);
+            // Un "cortar" se pega UNA vez: fuera del portapapeles, que sus
+            // ficheros ya no están donde él dice.
+            if (cut) FileClipboard.consumed();
+            if (r.foreign > 0) fm.notice(I18n.t("Items that are not local files were left out: ") + r.foreign, false);
+        });
     }
 
     // ---- renombrar ---------------------------------------------------------
@@ -389,7 +490,8 @@ FloatingWindow {
         var t = fm.renameText.trim();
         if (t === "" || t.indexOf("/") !== -1 || t === basename(fm.renamePath)) { fm.renameOpen = false; return; }
         var dir = fm.renamePath.substring(0, fm.renamePath.lastIndexOf("/"));
-        runOp("mv -n -- " + shq(fm.renamePath) + " " + shq(dir + "/" + t));
+        var from = fm.renamePath, to = dir + "/" + t;
+        runOp("mv -n -- " + shq(from) + " " + shq(to), function() { fm.followMove(from, to); });
         fm.renameOpen = false;
         fm.clearSelection();
     }
@@ -458,31 +560,44 @@ FloatingWindow {
               'while [ -e "$t" ]; do t="$d/$n $i"; i=$((i+1)); done; mkdir -p "$t"');
     }
 
+    //  %D:%i (dispositivo:inodo) de cada carpeta: si alguien la renombró o
+    //  movió FUERA de Vexyon, su icono personalizado la reconoce igual
+    //  (FolderIcons.adopt). Sale del mismo `find`, sin coste extra.
     Process {
         id: lister
         command: ["bash", "-c",
-            "find " + fm.shq(fm.cwd) + " -maxdepth 1 -mindepth 1 -printf '%y\\t%f\\n' 2>/dev/null | sort -t$'\\t' -k1,1 -k2,2f"]
+            "find " + fm.shq(fm.cwd) + " -maxdepth 1 -mindepth 1 -printf '%y\\t%D:%i\\t%f\\n' 2>/dev/null | sort -t$'\\t' -k1,1 -k3,3f"]
         stdout: StdioCollector {
             onStreamFinished: {
                 var out = [];
                 var lines = this.text.split("\n");
+                var base = fm.cwd === "/" ? "" : fm.cwd;
                 for (var i = 0; i < lines.length; i++) {
                     var l = lines[i];
                     if (l.trim() === "") continue;
                     var tab = l.indexOf("\t");
-                    if (tab < 0) continue;
+                    var tab2 = tab < 0 ? -1 : l.indexOf("\t", tab + 1);
+                    if (tab2 < 0) continue;
                     var type = l.substring(0, tab);
-                    var name = l.substring(tab + 1);
+                    var name = l.substring(tab2 + 1);
                     if (name.charAt(0) === "." && !fm.showHidden) continue; // hide dotfiles
                     var isDir = (type === "d");
-                    out.push({ name: name, isDir: isDir, path: fm.cwd + "/" + name });
+                    out.push({ name: name, isDir: isDir, path: base + "/" + name,
+                               id: isDir ? l.substring(tab + 1, tab2) : "" });
                 }
                 fm.entries = out;
+                FolderIcons.adopt(out);
             }
         }
     }
 
-    Component.onCompleted: { refresh(); refreshVolumes(); Drives.ref(); fmKeys.forceActiveFocus(); }
+    //  Lugares, iconos y portapapeles se leen al abrir cada ventana (y tras
+    //  cada cambio hecho desde Vexyon): lo que otro programa cambie aparece en
+    //  la siguiente ventana. Ni vigilantes ni sondeos.
+    Component.onCompleted: {
+        refresh(); refreshVolumes(); Drives.ref(); fmKeys.forceActiveFocus();
+        Places.refresh(); FolderIcons.refresh(); FileClipboard.probe();
+    }
     // El monitor de udisks2 vive mientras haya gestores abiertos (refcount).
     Component.onDestruction: Drives.unref()
 
@@ -504,15 +619,6 @@ FloatingWindow {
         // difiere el borrado real, así que es seguro desde este handler.
         else fm.destroy();
     }
-
-    readonly property var places: [
-        { icon: Icons.home,      label: I18n.t("Home"),      path: home },
-        { icon: Icons.documents, label: I18n.t("Documents"), path: home + "/Documents" },
-        { icon: Icons.download,  label: I18n.t("Downloads"), path: home + "/Downloads" },
-        { icon: Icons.image,     label: I18n.t("Pictures"),  path: home + "/Pictures" },
-        { icon: Icons.video,     label: I18n.t("Videos"),    path: home + "/Videos" },
-        { icon: Icons.music,     label: I18n.t("Music"),     path: home + "/Music" }
-    ]
 
     // Theme-driven, per-type Nerd Font glyphs. Monochrome glyphs tinted from the
     // active palette so the whole file manager reads as one themed surface and
@@ -693,7 +799,108 @@ FloatingWindow {
     property real ctxX: 0
     property real ctxY: 0
     property var ctxEntry: null   // null => menú de fondo (área vacía)
-    function showCtx(x, y, entry) { fm.ctxEntry = entry; fm.ctxX = x; fm.ctxY = y; fm.ctxOpen = true; }
+    property var ctxSide: null    // fila de la barra lateral: { path, bookmark, index, missing }
+    function showCtx(x, y, entry) {
+        fm.ctxSide = null; fm.ctxEntry = entry; fm.ctxX = x; fm.ctxY = y; fm.ctxOpen = true;
+        FileClipboard.probe();    // ¿hay algo que pegar? (puede venir de otro programa)
+    }
+    function showSideCtx(x, y, path, isBookmark, index, missing) {
+        fm.ctxEntry = null;
+        fm.ctxSide = { path: path, bookmark: isBookmark, index: index, missing: missing };
+        fm.ctxX = x; fm.ctxY = y; fm.ctxOpen = true;
+    }
+
+    // ---- marcadores de la barra lateral ------------------------------------
+    property int bmDragFrom: -1      // marcador que se está reordenando
+    property int bmInsert: -1        // hueco de inserción bajo el cursor (-1: ninguno)
+    //  Hay un arrastre de carpetas en curso (de esta ventana o de fuera): la
+    //  sección de marcadores se enseña aunque esté vacía, para poder soltar.
+    readonly property bool folderDragActive: (selArea.dragging && fm.selectionAllDirs()) || sideDrop.containsDrag
+
+    function entryOf(path) {
+        for (var i = 0; i < fm.entries.length; i++)
+            if (fm.entries[i].path === path) return fm.entries[i];
+        return null;
+    }
+    function selectionAllDirs() {
+        var l = fm.selectedList();
+        if (!l.length) return false;
+        for (var i = 0; i < l.length; i++) {
+            var e = fm.entryOf(l[i]);
+            if (!e || !e.isDir) return false;
+        }
+        return true;
+    }
+    //  y (coordenadas de bmCol) -> { slot: hueco de inserción, into: carpeta }.
+    //  La franja central de una fila es "dentro de esa carpeta"; los bordes,
+    //  "entre filas".
+    function bookmarkHit(y, allowInto) {
+        var n = bmRep.count;
+        for (var i = 0; i < n; i++) {
+            var it = bmRep.itemAt(i);
+            if (!it || y >= it.y + it.height) continue;
+            var rel = (y - it.y) / it.height;
+            if (allowInto && rel >= 0.25 && rel <= 0.75 && !it.missing) return { slot: -1, into: it.path };
+            return { slot: rel < 0.5 ? i : i + 1, into: "" };
+        }
+        return { slot: n, into: "" };
+    }
+    function finishBookmarkReorder() {
+        var from = fm.bmDragFrom, to = fm.bmInsert;
+        fm.bmDragFrom = -1; fm.bmInsert = -1;
+        if (from < 0 || to < 0 || to === from || to === from + 1) return;
+        var b = Places.bookmarks[from];
+        if (b) Places.move(b.path, to > from ? to - 1 : to);
+    }
+    //  "Añadir a la barra lateral": solo carpetas, sin duplicados (lo
+    //  comprueba el ayudante contra el fichero real). Nunca crea enlaces ni
+    //  toca la carpeta.
+    function addToSidebar(paths, at) {
+        var dirs = [], files = 0;
+        for (var i = 0; i < paths.length; i++) {
+            var e = fm.entryOf(paths[i]);
+            if (e && !e.isDir) files++;
+            else dirs.push(paths[i]);
+        }
+        if (!dirs.length) { fm.notice(I18n.t("Only folders can be added to the sidebar."), false); return; }
+        Places.add(dirs, at, function(added, rejected) {
+            if (!rejected.length && !files) return;
+            var why = rejected.length ? rejected[0].why : "notdir";
+            fm.notice(why === "duplicate" || why === "builtin" ? I18n.t("Already in the sidebar.")
+                    : why === "notdir" ? I18n.t("Only folders can be added to the sidebar.")
+                    : I18n.t("That folder can't be added to the sidebar."), false);
+        });
+    }
+
+    // ---- icono de carpeta ----------------------------------------------------
+    property bool iconPickOpen: false
+    property string iconPickPath: ""
+    //  Elegir una imagen propia: el selector se cierra y el PROPIO gestor sirve
+    //  para buscarla (doble clic en un .svg/.png). Esc o "Cancelar" vuelven.
+    property string pickImageFor: ""
+    property string pickReturnDir: ""
+    function openIconPicker(path) { fm.iconPickPath = path; fm.iconPickOpen = true; }
+    function startImagePick(path) {
+        fm.iconPickOpen = false;
+        fm.pickImageFor = path;
+        fm.pickReturnDir = fm.cwd;
+        var pics = Places.dirs.PICTURES;
+        if (pics && pics.exists) fm.navigate(pics.path);
+    }
+    function endImagePick(reopen) {
+        var p = fm.pickImageFor, back = fm.pickReturnDir;
+        fm.pickImageFor = ""; fm.pickReturnDir = "";
+        if (back !== "" && back !== fm.cwd) fm.navigate(back);
+        if (reopen && p !== "") fm.openIconPicker(p);
+    }
+    function useImage(file) {
+        var target = fm.pickImageFor;
+        FolderIcons.setImage(target, file, function(ok, err) {
+            if (ok) fm.endImagePick(false);
+            else fm.notice(I18n.t("That image can't be used: ") + err, true);
+        });
+    }
+    onIconPickOpenChanged: if (!iconPickOpen) fmKeys.forceActiveFocus()
 
     // ---- drag-and-drop state ----
     property string dropTarget: ""   // path de la carpeta bajo el cursor durante el drag
@@ -705,322 +912,472 @@ FloatingWindow {
         return decodeURIComponent(s.slice(7).split("?")[0].split("#")[0]);
     }
 
+    // ---- fila de la barra lateral (lugares y marcadores) ---------------------
+    //  Clic: abrir. Botón derecho: menú (abrir, icono, mover, quitar). Arrastrar
+    //  un MARCADOR arriba/abajo lo reordena (la línea de inserción lo enseña).
+    //  `dropPath` la convierte en destino de arrastres de ficheros (mover dentro).
+    Component {
+        id: sideRowCmp
+        Rectangle {
+            id: row
+            required property var modelData
+            required property int index
+            readonly property bool isBookmark: modelData.key === undefined
+            readonly property string path: modelData.path
+            readonly property bool missing: modelData.exists === false
+            readonly property string dropPath: missing ? "" : path
+            readonly property bool current: fm.cwd === path
+            readonly property string glyph: {
+                if (row.missing) return Icons.folder;
+                // Home conserva su casa de siempre salvo que se le elija otra cosa
+                if (modelData.key === "HOME" && FolderIcons.customId(row.path) === "") return Icons.home;
+                return FolderIcons.sidebarGlyph(row.path) || Icons.folder;
+            }
+            property bool wasDrag: false
+
+            Layout.fillWidth: true
+            Layout.preferredHeight: 34
+            radius: Theme.radius
+            color: fm.dropTarget === path ? Theme.surface2
+                   : current ? Theme.accent
+                   : (rowMa.containsMouse ? Theme.surface1 : "transparent")
+            border.width: fm.dropTarget === path ? 2 : 0
+            border.color: Theme.accent
+            opacity: row.isBookmark && fm.bmDragFrom === row.index ? 0.45 : (row.missing ? 0.7 : 1)
+            Behavior on color { ColorAnimation { duration: Theme.dur(100) } }
+
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: 10
+                anchors.rightMargin: 8
+                spacing: 10
+                Text {
+                    text: row.glyph
+                    color: row.current ? Theme.onAccent : Theme.subtext0
+                    font.family: FolderIcons.symbolFont
+                    font.pixelSize: Theme.fontSize + 1
+                    horizontalAlignment: Text.AlignHCenter
+                    Layout.preferredWidth: 18
+                }
+                Text {
+                    Layout.fillWidth: true
+                    text: row.modelData.label
+                    color: row.current ? Theme.onAccent : (row.missing ? Theme.overlay2 : Theme.text)
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fontSize - 1
+                    font.italic: row.missing
+                    elide: Text.ElideRight
+                }
+            }
+            MouseArea {
+                id: rowMa
+                anchors.fill: parent
+                hoverEnabled: true
+                acceptedButtons: Qt.LeftButton | Qt.RightButton
+                // el desplazable no se queda el gesto de reordenar
+                preventStealing: row.isBookmark
+                cursorShape: fm.bmDragFrom >= 0 ? Qt.ClosedHandCursor : Qt.PointingHandCursor
+                property real py: 0
+                onPressed: function(mouse) {
+                    fmKeys.forceActiveFocus();
+                    fm.ctxOpen = false;
+                    row.wasDrag = false;
+                    if (mouse.button === Qt.RightButton) {
+                        var pt = rowMa.mapToItem(null, mouse.x, mouse.y);
+                        fm.showSideCtx(pt.x, pt.y, row.path, row.isBookmark, row.index, row.missing);
+                        return;
+                    }
+                    py = mouse.y;
+                }
+                onPositionChanged: function(mouse) {
+                    if (!pressed || !row.isBookmark || !(mouse.buttons & Qt.LeftButton)) return;
+                    if (fm.bmDragFrom < 0 && Math.abs(mouse.y - py) < 6) return;
+                    row.wasDrag = true;
+                    fm.bmDragFrom = row.index;
+                    var p = rowMa.mapToItem(bmCol, mouse.x, mouse.y);
+                    fm.bmInsert = fm.bookmarkHit(p.y, false).slot;
+                }
+                onReleased: if (fm.bmDragFrom >= 0) fm.finishBookmarkReorder()
+                onCanceled: { fm.bmDragFrom = -1; fm.bmInsert = -1; }
+                onClicked: function(mouse) {
+                    if (mouse.button !== Qt.LeftButton || row.wasDrag) return;
+                    if (row.missing) { fm.notice(I18n.t("This folder no longer exists."), false); return; }
+                    fm.navigate(row.path);
+                }
+            }
+        }
+    }
+
     RowLayout {
         anchors.fill: parent
         spacing: 0
 
         // ================= SIDEBAR =================
+        //  Lugares (Home + carpetas XDG reales), marcadores, volúmenes,
+        //  dispositivos y remotos van en un desplazable: con muchos marcadores
+        //  la columna crece sin empujar la papelera fuera de la ventana.
         Rectangle {
+            id: sidebar
             Layout.preferredWidth: 190
             Layout.fillHeight: true
             color: Theme.mantle
 
             ColumnLayout {
-                id: sideCol
                 anchors.fill: parent
                 anchors.margins: 10
                 spacing: 4
 
-                Text {
-                    text: I18n.t("Places")
-                    color: Theme.overlay2
-                    font.family: Theme.fontFamily
-                    font.pixelSize: Theme.fontSize - 3
-                    Layout.bottomMargin: 4
-                }
+                Flickable {
+                    id: sideFlick
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    contentWidth: width
+                    contentHeight: sideCol.implicitHeight
+                    clip: true
+                    boundsBehavior: Flickable.StopAtBounds
+                    interactive: contentHeight > height
 
-                Repeater {
-                    model: fm.places
-                    delegate: Rectangle {
-                        required property var modelData
-                        readonly property string dropPath: modelData.path
-                        Layout.fillWidth: true
-                        Layout.preferredHeight: 34
-                        radius: Theme.radius
-                        color: fm.dropTarget === modelData.path ? Theme.surface2
-                               : fm.cwd === modelData.path ? Theme.accent
-                               : (pm.containsMouse ? Theme.surface1 : "transparent")
-                        border.width: fm.dropTarget === modelData.path ? 2 : 0
-                        border.color: Theme.accent
-                        Behavior on color { ColorAnimation { duration: Theme.dur(100) } }
-                        RowLayout {
-                            anchors.fill: parent
-                            anchors.leftMargin: 10
-                            spacing: 10
-                            Text {
-                                text: modelData.icon
-                                color: fm.cwd === modelData.path ? Theme.onAccent : Theme.subtext0
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize + 1
-                                Layout.preferredWidth: 18
-                            }
-                            Text {
-                                Layout.fillWidth: true
-                                text: modelData.label
-                                color: fm.cwd === modelData.path ? Theme.onAccent : Theme.text
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize - 1
-                            }
-                        }
-                        MouseArea {
-                            id: pm
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: fm.navigate(modelData.path)
-                        }
-                    }
-                }
+                    ColumnLayout {
+                        id: sideCol
+                        width: sideFlick.width
+                        spacing: 4
 
-                // ---- Volumes (mounted drives) ----
-                Text {
-                    visible: fm.volumes.length > 0
-                    text: I18n.t("Volumes")
-                    color: Theme.overlay2
-                    font.family: Theme.fontFamily
-                    font.pixelSize: Theme.fontSize - 3
-                    Layout.topMargin: 10
-                    Layout.bottomMargin: 4
-                }
-                Repeater {
-                    model: fm.volumes
-                    delegate: Rectangle {
-                        required property var modelData
-                        readonly property string dropPath: modelData.path
-                        Layout.fillWidth: true
-                        Layout.preferredHeight: 40
-                        radius: Theme.radius
-                        color: fm.dropTarget === modelData.path ? Theme.surface2
-                               : fm.cwd === modelData.path ? Theme.accent
-                               : (vm.containsMouse ? Theme.surface1 : "transparent")
-                        border.width: fm.dropTarget === modelData.path ? 2 : 0
-                        border.color: Theme.accent
-                        Behavior on color { ColorAnimation { duration: Theme.dur(100) } }
-                        RowLayout {
-                            anchors.fill: parent
-                            anchors.leftMargin: 10
-                            anchors.rightMargin: 8
-                            spacing: 10
-                            Text {
-                                text: Icons.drive
-                                color: fm.cwd === modelData.path ? Theme.onAccent : Theme.subtext0
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize + 1
-                                Layout.preferredWidth: 18
-                            }
+                        Text {
+                            text: I18n.t("Places")
+                            color: Theme.overlay2
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontSize - 3
+                            Layout.bottomMargin: 4
+                        }
+
+                        // Home + las carpetas de usuario en sus rutas CONFIGURADAS
+                        // (user-dirs.dirs: ~/Documentos, ~/Bilder…), nunca adivinadas
+                        // por su nombre en inglés.
+                        Repeater {
+                            model: Places.builtin
+                            delegate: sideRowCmp
+                        }
+
+                        // ---- Marcadores (los del usuario; fichero de marcadores GTK) ----
+                        //  SOLTAR una carpeta entre dos filas (o en el hueco vacío) la
+                        //  añade aquí; encima de una fila, la mueve dentro, como en
+                        //  cualquier otro lugar. Arrastrar un marcador lo reordena.
+                        Item {
+                            id: bmBox
+                            Layout.fillWidth: true
+                            Layout.topMargin: visible ? 6 : 0
+                            visible: Places.bookmarks.length > 0 || fm.folderDragActive
+                            implicitHeight: bmCol.implicitHeight
+
                             ColumnLayout {
-                                Layout.fillWidth: true
-                                spacing: 0
+                                id: bmCol
+                                width: parent.width
+                                spacing: 4
                                 Text {
-                                    Layout.fillWidth: true
-                                    text: modelData.label
-                                    color: fm.cwd === modelData.path ? Theme.onAccent : Theme.text
+                                    text: I18n.t("Bookmarks")
+                                    color: Theme.overlay2
                                     font.family: Theme.fontFamily
-                                    font.pixelSize: Theme.fontSize - 1
-                                    elide: Text.ElideRight
+                                    font.pixelSize: Theme.fontSize - 3
+                                    Layout.bottomMargin: 4
                                 }
-                                Text {
+                                Repeater {
+                                    id: bmRep
+                                    model: Places.bookmarks
+                                    delegate: sideRowCmp
+                                }
+                                // hueco donde soltar cuando aún no hay marcadores
+                                Rectangle {
+                                    visible: Places.bookmarks.length === 0
                                     Layout.fillWidth: true
-                                    text: modelData.size
-                                    color: fm.cwd === modelData.path ? Theme.onAccent : Theme.overlay2
-                                    font.family: Theme.fontFamily
-                                    font.pixelSize: Theme.fontSize - 4
-                                    elide: Text.ElideRight
+                                    Layout.preferredHeight: 34
+                                    radius: Theme.radius
+                                    color: fm.dropTarget === "::bookmark" ? Qt.alpha(Theme.accent, 0.18) : "transparent"
+                                    border.width: 1
+                                    border.color: Qt.alpha(Theme.accent, fm.dropTarget === "::bookmark" ? 0.9 : 0.45)
+                                    Text {
+                                        anchors.fill: parent
+                                        anchors.leftMargin: 10
+                                        anchors.rightMargin: 6
+                                        verticalAlignment: Text.AlignVCenter
+                                        text: I18n.t("Drop a folder here")
+                                        color: Theme.subtext0
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize - 3
+                                        elide: Text.ElideRight
+                                    }
                                 }
                             }
-                        }
-                        MouseArea {
-                            id: vm
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: fm.navigate(modelData.path)
-                        }
-                    }
-                }
 
-                // ---- Devices (unidades extraíbles, udisks2 en vivo) ----
-                // Mismo delegado visual que Volumes; añade botón de expulsar y,
-                // si no está montado, el click monta y entra.
-                Text {
-                    visible: Drives.devices.length > 0
-                    text: I18n.t("Devices")
-                    color: Theme.overlay2
-                    font.family: Theme.fontFamily
-                    font.pixelSize: Theme.fontSize - 3
-                    Layout.topMargin: 10
-                    Layout.bottomMargin: 4
-                }
-                Repeater {
-                    model: Drives.devices
-                    delegate: Rectangle {
-                        id: devRow
-                        required property var modelData
-                        readonly property bool mounted: modelData.mount !== ""
-                        readonly property string dropPath: modelData.mount
-                        Layout.fillWidth: true
-                        Layout.preferredHeight: 40
-                        radius: Theme.radius
-                        color: (mounted && fm.dropTarget === modelData.mount) ? Theme.surface2
-                               : (mounted && fm.cwd === modelData.mount) ? Theme.accent
-                               : (dvm.containsMouse ? Theme.surface1 : "transparent")
-                        border.width: (mounted && fm.dropTarget === modelData.mount) ? 2 : 0
-                        border.color: Theme.accent
-                        Behavior on color { ColorAnimation { duration: Theme.dur(100) } }
-                        RowLayout {
-                            anchors.fill: parent
-                            anchors.leftMargin: 10
-                            anchors.rightMargin: 8
-                            spacing: 10
-                            Text {
-                                text: Icons.drive
-                                color: fm.cwd === modelData.mount ? Theme.onAccent
-                                       : devRow.mounted ? Theme.green : Theme.subtext0
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize + 1
-                                Layout.preferredWidth: 18
-                            }
-                            ColumnLayout {
-                                Layout.fillWidth: true
-                                spacing: 0
-                                Text {
-                                    Layout.fillWidth: true
-                                    text: modelData.label
-                                    color: fm.cwd === modelData.mount ? Theme.onAccent : Theme.text
-                                    font.family: Theme.fontFamily
-                                    font.pixelSize: Theme.fontSize - 1
-                                    elide: Text.ElideRight
-                                }
-                                Text {
-                                    Layout.fillWidth: true
-                                    text: modelData.size
-                                    color: fm.cwd === modelData.mount ? Theme.onAccent : Theme.overlay2
-                                    font.family: Theme.fontFamily
-                                    font.pixelSize: Theme.fontSize - 4
-                                    elide: Text.ElideRight
-                                }
-                            }
-                            // Expulsar: solo con el dispositivo montado
+                            // línea de inserción (soltar o reordenar)
                             Rectangle {
-                                Layout.preferredWidth: 20; Layout.preferredHeight: 20
-                                radius: 10
-                                visible: devRow.mounted
-                                color: ejMa.containsMouse ? Theme.red : "transparent"
-                                Text {
-                                    anchors.centerIn: parent
-                                    text: Icons.close
-                                    color: ejMa.containsMouse ? Theme.onAccent : Theme.subtext0
-                                    font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
+                                visible: fm.bmInsert >= 0 && Places.bookmarks.length > 0
+                                x: 4
+                                width: parent.width - 8
+                                height: 3
+                                radius: 1.5
+                                color: Theme.accent
+                                z: 5
+                                y: {
+                                    var n = bmRep.count, k = fm.bmInsert;
+                                    if (n === 0 || k < 0) return 0;
+                                    var it = bmRep.itemAt(Math.min(k, n - 1));
+                                    if (!it) return 0;
+                                    return (k < n ? it.y - 2 : it.y + it.height + 1) - height / 2 + 1;
+                                }
+                            }
+                        }
+                        // ---- Volumes (mounted drives) ----
+                        Text {
+                            visible: fm.volumes.length > 0
+                            text: I18n.t("Volumes")
+                            color: Theme.overlay2
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontSize - 3
+                            Layout.topMargin: 10
+                            Layout.bottomMargin: 4
+                        }
+                        Repeater {
+                            model: fm.volumes
+                            delegate: Rectangle {
+                                required property var modelData
+                                readonly property string dropPath: modelData.path
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: 40
+                                radius: Theme.radius
+                                color: fm.dropTarget === modelData.path ? Theme.surface2
+                                : fm.cwd === modelData.path ? Theme.accent
+                                : (vm.containsMouse ? Theme.surface1 : "transparent")
+                                border.width: fm.dropTarget === modelData.path ? 2 : 0
+                                border.color: Theme.accent
+                                Behavior on color { ColorAnimation { duration: Theme.dur(100) } }
+                                RowLayout {
+                                    anchors.fill: parent
+                                    anchors.leftMargin: 10
+                                    anchors.rightMargin: 8
+                                    spacing: 10
+                                    Text {
+                                        text: Icons.drive
+                                        color: fm.cwd === modelData.path ? Theme.onAccent : Theme.subtext0
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize + 1
+                                        Layout.preferredWidth: 18
+                                    }
+                                    ColumnLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 0
+                                        Text {
+                                            Layout.fillWidth: true
+                                            text: modelData.label
+                                            color: fm.cwd === modelData.path ? Theme.onAccent : Theme.text
+                                            font.family: Theme.fontFamily
+                                            font.pixelSize: Theme.fontSize - 1
+                                            elide: Text.ElideRight
+                                        }
+                                        Text {
+                                            Layout.fillWidth: true
+                                            text: modelData.size
+                                            color: fm.cwd === modelData.path ? Theme.onAccent : Theme.overlay2
+                                            font.family: Theme.fontFamily
+                                            font.pixelSize: Theme.fontSize - 4
+                                            elide: Text.ElideRight
+                                        }
+                                    }
                                 }
                                 MouseArea {
-                                    id: ejMa
-                                    anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                                    id: vm
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: fm.navigate(modelData.path)
+                                }
+                            }
+                        }
+
+                        // ---- Devices (unidades extraíbles, udisks2 en vivo) ----
+                        // Mismo delegado visual que Volumes; añade botón de expulsar y,
+                        // si no está montado, el click monta y entra.
+                        Text {
+                            visible: Drives.devices.length > 0
+                            text: I18n.t("Devices")
+                            color: Theme.overlay2
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontSize - 3
+                            Layout.topMargin: 10
+                            Layout.bottomMargin: 4
+                        }
+                        Repeater {
+                            model: Drives.devices
+                            delegate: Rectangle {
+                                id: devRow
+                                required property var modelData
+                                readonly property bool mounted: modelData.mount !== ""
+                                readonly property string dropPath: modelData.mount
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: 40
+                                radius: Theme.radius
+                                color: (mounted && fm.dropTarget === modelData.mount) ? Theme.surface2
+                                : (mounted && fm.cwd === modelData.mount) ? Theme.accent
+                                : (dvm.containsMouse ? Theme.surface1 : "transparent")
+                                border.width: (mounted && fm.dropTarget === modelData.mount) ? 2 : 0
+                                border.color: Theme.accent
+                                Behavior on color { ColorAnimation { duration: Theme.dur(100) } }
+                                RowLayout {
+                                    anchors.fill: parent
+                                    anchors.leftMargin: 10
+                                    anchors.rightMargin: 8
+                                    spacing: 10
+                                    Text {
+                                        text: Icons.drive
+                                        color: fm.cwd === modelData.mount ? Theme.onAccent
+                                        : devRow.mounted ? Theme.green : Theme.subtext0
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize + 1
+                                        Layout.preferredWidth: 18
+                                    }
+                                    ColumnLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 0
+                                        Text {
+                                            Layout.fillWidth: true
+                                            text: modelData.label
+                                            color: fm.cwd === modelData.mount ? Theme.onAccent : Theme.text
+                                            font.family: Theme.fontFamily
+                                            font.pixelSize: Theme.fontSize - 1
+                                            elide: Text.ElideRight
+                                        }
+                                        Text {
+                                            Layout.fillWidth: true
+                                            text: modelData.size
+                                            color: fm.cwd === modelData.mount ? Theme.onAccent : Theme.overlay2
+                                            font.family: Theme.fontFamily
+                                            font.pixelSize: Theme.fontSize - 4
+                                            elide: Text.ElideRight
+                                        }
+                                    }
+                                    // Expulsar: solo con el dispositivo montado
+                                    Rectangle {
+                                        Layout.preferredWidth: 20; Layout.preferredHeight: 20
+                                        radius: 10
+                                        visible: devRow.mounted
+                                        color: ejMa.containsMouse ? Theme.red : "transparent"
+                                        Text {
+                                            anchors.centerIn: parent
+                                            text: Icons.close
+                                            color: ejMa.containsMouse ? Theme.onAccent : Theme.subtext0
+                                            font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
+                                        }
+                                        MouseArea {
+                                            id: ejMa
+                                            anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                                            onClicked: {
+                                                // salir del dispositivo antes de desmontar
+                                                if (Drives.contains(fm.cwd)) fm.navigate(fm.home);
+                                                Drives.unmount(modelData.dev);
+                                            }
+                                        }
+                                    }
+                                }
+                                MouseArea {
+                                    id: dvm
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    z: -1
                                     onClicked: {
-                                        // salir del dispositivo antes de desmontar
-                                        if (Drives.contains(fm.cwd)) fm.navigate(fm.home);
-                                        Drives.unmount(modelData.dev);
+                                        if (devRow.mounted) fm.navigate(modelData.mount);
+                                        else Drives.mount(modelData.dev, modelData.obj,
+                                        function(mp) { fm.navigate(mp); });
                                     }
                                 }
                             }
                         }
-                        MouseArea {
-                            id: dvm
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            z: -1
-                            onClicked: {
-                                if (devRow.mounted) fm.navigate(modelData.mount);
-                                else Drives.mount(modelData.dev, modelData.obj,
-                                                  function(mp) { fm.navigate(mp); });
-                            }
-                        }
-                    }
-                }
 
-                // ---- Remoto (SFTP connections) ----
-                RowLayout {
-                    Layout.fillWidth: true
-                    Layout.topMargin: 10
-                    Text {
-                        Layout.fillWidth: true
-                        text: I18n.t("Remote")
-                        color: Theme.overlay2
-                        font.family: Theme.fontFamily
-                        font.pixelSize: Theme.fontSize - 3
-                    }
-                    Rectangle {
-                        Layout.preferredWidth: 22; Layout.preferredHeight: 22
-                        radius: 6
-                        color: addRemoteMa.containsMouse ? Theme.accent : Theme.surface1
-                        Text { anchors.centerIn: parent; text: Icons.plus; color: addRemoteMa.containsMouse ? Theme.onAccent : Theme.subtext0; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2 }
-                        MouseArea { id: addRemoteMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: fm.openRemoteForm() }
-                    }
-                }
-                Repeater {
-                    model: fm.remotes
-                    delegate: Rectangle {
-                        required property var modelData
-                        readonly property bool conn: fm.isMounted(modelData.name)
-                        Layout.fillWidth: true
-                        Layout.preferredHeight: 34
-                        radius: Theme.radius
-                        color: fm.cwd === (fm.remoteDir + "/" + modelData.name) ? Theme.accent
-                               : (rmtMa.containsMouse ? Theme.surface1 : "transparent")
+                        // ---- Remoto (SFTP connections) ----
                         RowLayout {
-                            anchors.fill: parent; anchors.leftMargin: 10; anchors.rightMargin: 6; spacing: 8
-                            Text {
-                                text: Icons.ethernet
-                                color: fm.cwd === (fm.remoteDir + "/" + modelData.name) ? Theme.onAccent
-                                       : (conn ? Theme.green : Theme.subtext0)
-                                font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize; Layout.preferredWidth: 16
-                            }
+                            Layout.fillWidth: true
+                            Layout.topMargin: 10
                             Text {
                                 Layout.fillWidth: true
-                                text: modelData.name
-                                color: fm.cwd === (fm.remoteDir + "/" + modelData.name) ? Theme.onAccent : Theme.text
-                                font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1
-                                elide: Text.ElideRight
+                                text: I18n.t("Remote")
+                                color: Theme.overlay2
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 3
                             }
                             Rectangle {
-                                Layout.preferredWidth: 20; Layout.preferredHeight: 20
-                                radius: 10
-                                visible: rmtMa.containsMouse || conn
-                                color: actMa.containsMouse ? (conn ? Theme.red : Theme.surface2) : "transparent"
-                                Text {
-                                    anchors.centerIn: parent
-                                    text: conn ? Icons.close : Icons.trash
-                                    color: Theme.subtext0
-                                    font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
+                                Layout.preferredWidth: 22; Layout.preferredHeight: 22
+                                radius: 6
+                                color: addRemoteMa.containsMouse ? Theme.accent : Theme.surface1
+                                Text { anchors.centerIn: parent; text: Icons.plus; color: addRemoteMa.containsMouse ? Theme.onAccent : Theme.subtext0; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2 }
+                                MouseArea { id: addRemoteMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: fm.openRemoteForm() }
+                            }
+                        }
+                        Repeater {
+                            model: fm.remotes
+                            delegate: Rectangle {
+                                required property var modelData
+                                readonly property bool conn: fm.isMounted(modelData.name)
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: 34
+                                radius: Theme.radius
+                                color: fm.cwd === (fm.remoteDir + "/" + modelData.name) ? Theme.accent
+                                : (rmtMa.containsMouse ? Theme.surface1 : "transparent")
+                                RowLayout {
+                                    anchors.fill: parent; anchors.leftMargin: 10; anchors.rightMargin: 6; spacing: 8
+                                    Text {
+                                        text: Icons.ethernet
+                                        color: fm.cwd === (fm.remoteDir + "/" + modelData.name) ? Theme.onAccent
+                                        : (conn ? Theme.green : Theme.subtext0)
+                                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize; Layout.preferredWidth: 16
+                                    }
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: modelData.name
+                                        color: fm.cwd === (fm.remoteDir + "/" + modelData.name) ? Theme.onAccent : Theme.text
+                                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1
+                                        elide: Text.ElideRight
+                                    }
+                                    Rectangle {
+                                        Layout.preferredWidth: 20; Layout.preferredHeight: 20
+                                        radius: 10
+                                        visible: rmtMa.containsMouse || conn
+                                        color: actMa.containsMouse ? (conn ? Theme.red : Theme.surface2) : "transparent"
+                                        Text {
+                                            anchors.centerIn: parent
+                                            text: conn ? Icons.close : Icons.trash
+                                            color: Theme.subtext0
+                                            font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
+                                        }
+                                        MouseArea {
+                                            id: actMa
+                                            anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                                            onClicked: conn ? fm.disconnectRemote(modelData.name) : fm.forgetRemote(modelData.name)
+                                        }
+                                    }
                                 }
                                 MouseArea {
-                                    id: actMa
-                                    anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-                                    onClicked: conn ? fm.disconnectRemote(modelData.name) : fm.forgetRemote(modelData.name)
+                                    id: rmtMa
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    z: -1
+                                    onClicked: conn ? fm.navigate(fm.remoteDir + "/" + modelData.name) : fm.connectSaved(modelData)
                                 }
                             }
                         }
-                        MouseArea {
-                            id: rmtMa
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            z: -1
-                            onClicked: conn ? fm.navigate(fm.remoteDir + "/" + modelData.name) : fm.connectSaved(modelData)
-                        }
+
                     }
                 }
 
-                Item { Layout.fillHeight: true }
-
-                // Trash (soltar un drag encima = enviar a la papelera, como Nautilus)
+                // Trash (soltar un drag encima = enviar a la papelera, como Nautilus).
+                // Fija abajo, fuera del desplazable.
                 Rectangle {
+                    id: trashRow
                     readonly property string dropPath: "::trash"
                     Layout.fillWidth: true
                     Layout.preferredHeight: 34
                     radius: Theme.radius
                     color: fm.dropTarget === "::trash" ? Qt.alpha(Theme.red, 0.25)
-                           : fm.inTrash ? Theme.accent : (tm.containsMouse ? Theme.surface1 : "transparent")
+                    : fm.inTrash ? Theme.accent : (tm.containsMouse ? Theme.surface1 : "transparent")
                     border.width: fm.dropTarget === "::trash" ? 2 : 0
                     border.color: Theme.red
                     RowLayout {
@@ -1032,6 +1389,49 @@ FloatingWindow {
                         id: tm; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                         onClicked: fm.navigate(fm.trashDir)
                     }
+                }
+            }
+
+            // Drops ENTRANTES sobre la barra lateral (otra ventana del gestor,
+            // Nautilus, un navegador…): entre marcadores = añadir marcador
+            // (solo carpetas: lo comprueba el ayudante); encima de un lugar =
+            // copiar ahí, como en la vista.
+            DropArea {
+                id: sideDrop
+                anchors.fill: parent
+                keys: ["text/uri-list"]
+                function target(x, y) {
+                    var fp = sideDrop.mapToItem(sideFlick, x, y);
+                    if (fp.x < 0 || fp.y < 0 || fp.x >= sideFlick.width || fp.y >= sideFlick.height)
+                        return { into: "", slot: -1 };
+                    var bp = sideDrop.mapToItem(bmBox, x, y);
+                    if (bmBox.visible && bp.y >= -2 && bp.y <= bmBox.height + 2) {
+                        var hit = fm.bookmarkHit(bp.y, true);
+                        return hit.into !== "" ? { into: hit.into, slot: -1 } : { into: "", slot: hit.slot };
+                    }
+                    var sp = sideDrop.mapToItem(sideCol, x, y);
+                    var ch = sideCol.childAt(sp.x, sp.y);
+                    return { into: (ch && ch.dropPath !== undefined && ch.dropPath !== "") ? ch.dropPath : "", slot: -1 };
+                }
+                onPositionChanged: function(drag) {
+                    var t = sideDrop.target(drag.x, drag.y);
+                    fm.bmInsert = t.slot;
+                    fm.dropTarget = t.into !== "" ? t.into : (t.slot >= 0 ? "::bookmark" : "");
+                }
+                onExited: { fm.bmInsert = -1; fm.dropTarget = ""; }
+                onDropped: function(drop) {
+                    var t = sideDrop.target(drop.x, drop.y);
+                    fm.bmInsert = -1;
+                    fm.dropTarget = "";
+                    var paths = [];
+                    for (var i = 0; i < drop.urls.length; i++) {
+                        var p = fm.uriToPath(drop.urls[i]);
+                        if (p !== "") paths.push(p);
+                    }
+                    if (!paths.length) return;
+                    // la acción es COPIA para el origen: nunca borra nada suyo
+                    if (t.slot >= 0) { fm.addToSidebar(paths, t.slot); drop.accept(Qt.CopyAction); }
+                    else if (t.into !== "") { fm.copyPaths(paths, t.into); drop.accept(Qt.CopyAction); }
                 }
             }
         }
@@ -1116,6 +1516,38 @@ FloatingWindow {
                 }
             }
 
+            // ---- eligiendo la imagen de un icono de carpeta ----
+            Rectangle {
+                visible: fm.pickImageFor !== ""
+                Layout.fillWidth: true
+                Layout.preferredHeight: 40
+                color: Qt.alpha(Theme.accent, 0.14)
+                RowLayout {
+                    anchors.fill: parent
+                    anchors.leftMargin: 14
+                    anchors.rightMargin: 10
+                    spacing: 10
+                    Text { text: Icons.image; color: Theme.accent; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize + 1 }
+                    Text {
+                        Layout.fillWidth: true
+                        text: I18n.t("Double-click an SVG or PNG image to use it as the icon of ")
+                              + "\u201c" + fm.basename(fm.pickImageFor) + "\u201d"
+                        color: Theme.text
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSize - 2
+                        elide: Text.ElideMiddle
+                    }
+                    Rectangle {
+                        Layout.preferredHeight: 28
+                        Layout.preferredWidth: pickCancel.implicitWidth + 24
+                        radius: Theme.radius
+                        color: pickCancelMa.containsMouse ? Theme.surface2 : Theme.surface1
+                        Text { id: pickCancel; anchors.centerIn: parent; text: I18n.t("Cancel"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2 }
+                        MouseArea { id: pickCancelMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: fm.endImagePick(true) }
+                    }
+                }
+            }
+
             // ---- content ----
             Item {
                 id: contentArea
@@ -1141,17 +1573,17 @@ FloatingWindow {
                                       : (fm.isSelected(modelData.path) ? 1 : 0)
                         border.color: fm.dropTarget === modelData.path ? Theme.accent
                                       : Qt.alpha(Theme.accent, 0.6)
-                        opacity: fm.clipMode === "cut" && fm.clipPaths.indexOf(modelData.path) !== -1 ? 0.5 : 1
+                        opacity: FileClipboard.cutSet[modelData.path] === true ? 0.5 : 1
                         RowLayout {
                             anchors.fill: parent
                             anchors.leftMargin: 14
                             anchors.rightMargin: 14
                             spacing: 12
-                            Text {
-                                text: fm.mimeGlyph(modelData)
-                                color: fm.mimeColor(modelData)
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize + 4
+                            FolderGlyph {
+                                glyph: fm.mimeGlyph(modelData)
+                                glyphColor: fm.mimeColor(modelData)
+                                pixelSize: Theme.fontSize + 4
+                                emblem: modelData.isDir ? FolderIcons.emblemFor(modelData.path) : null
                                 Layout.preferredWidth: 24
                                 horizontalAlignment: Text.AlignHCenter
                             }
@@ -1192,17 +1624,17 @@ FloatingWindow {
                                           : (fm.isSelected(modelData.path) ? 1 : 0)
                             border.color: fm.dropTarget === modelData.path ? Theme.accent
                                           : Qt.alpha(Theme.accent, 0.6)
-                            opacity: fm.clipMode === "cut" && fm.clipPaths.indexOf(modelData.path) !== -1 ? 0.5 : 1
+                            opacity: FileClipboard.cutSet[modelData.path] === true ? 0.5 : 1
                             ColumnLayout {
                                 anchors.centerIn: parent
                                 width: parent.width - 12
                                 spacing: 6
-                                Text {
+                                FolderGlyph {
                                     Layout.alignment: Qt.AlignHCenter
-                                    text: fm.mimeGlyph(modelData)
-                                    color: fm.mimeColor(modelData)
-                                    font.family: Theme.fontFamily
-                                    font.pixelSize: Math.round(44 * fm.zoom)
+                                    glyph: fm.mimeGlyph(modelData)
+                                    glyphColor: fm.mimeColor(modelData)
+                                    pixelSize: Math.round(44 * fm.zoom)
+                                    emblem: modelData.isDir ? FolderIcons.emblemFor(modelData.path) : null
                                 }
                                 Text {
                                     Layout.fillWidth: true
@@ -1282,7 +1714,7 @@ FloatingWindow {
 
                     function cancelDrag() {
                         marquee = false; dragging = false; deferSingle = false;
-                        dragCopy = false; leftHeld = false; fm.dropTarget = "";
+                        dragCopy = false; leftHeld = false; fm.dropTarget = ""; fm.bmInsert = -1;
                     }
                     // ---- handoff a drag Wayland REAL (cruzar el borde de la ventana) ----
                     // El gesto interno solo mueve/copia DENTRO de la ventana; en cuanto
@@ -1422,17 +1854,39 @@ FloatingWindow {
                         fm.selCount = Object.keys(m).length;
                     }
                     // Durante un drag de items: carpeta bajo el cursor en la vista,
-                    // o un destino del sidebar (places/volúmenes/papelera).
+                    // o un destino del sidebar (places/marcadores/volúmenes/papelera).
+                    // Entre dos marcadores (o en el hueco vacío) el destino es
+                    // "::bookmark": soltar AÑADE un marcador, nunca mueve ni copia.
                     function updateDropTarget(mx, my) {
+                        fm.bmInsert = -1;
                         var i = viewAt(mx, my);
                         if (i >= 0) {
                             var e = fm.entries[i];
                             fm.dropTarget = (e.isDir && !fm.isSelected(e.path)) ? e.path : "";
                             return;
                         }
+                        var tp = selArea.mapToItem(trashRow, mx, my);
+                        if (tp.x >= 0 && tp.y >= 0 && tp.x < trashRow.width && tp.y < trashRow.height) {
+                            fm.dropTarget = "::trash";
+                            return;
+                        }
+                        // solo la parte VISIBLE del desplazable
+                        var fp = selArea.mapToItem(sideFlick, mx, my);
+                        if (fp.x < 0 || fp.y < 0 || fp.x >= sideFlick.width || fp.y >= sideFlick.height) {
+                            fm.dropTarget = "";
+                            return;
+                        }
+                        var bp = selArea.mapToItem(bmBox, mx, my);
+                        if (bmBox.visible && bp.y >= -2 && bp.y <= bmBox.height + 2) {
+                            var hit = fm.bookmarkHit(bp.y, true);
+                            if (hit.into !== "") { fm.dropTarget = hit.into !== fm.cwd ? hit.into : ""; return; }
+                            if (fm.selectionAllDirs()) { fm.dropTarget = "::bookmark"; fm.bmInsert = hit.slot; return; }
+                            fm.dropTarget = "";
+                            return;
+                        }
                         var sp = selArea.mapToItem(sideCol, mx, my);
                         var ch = sideCol.childAt(sp.x, sp.y);
-                        fm.dropTarget = (ch && ch.dropPath !== undefined && ch.dropPath !== fm.cwd) ? ch.dropPath : "";
+                        fm.dropTarget = (ch && ch.dropPath !== undefined && ch.dropPath !== "" && ch.dropPath !== fm.cwd) ? ch.dropPath : "";
                     }
 
                     onPressed: function(mouse) {
@@ -1498,6 +1952,7 @@ FloatingWindow {
                         if (dragging) {
                             var copy = (mouse.modifiers & Qt.ControlModifier) !== 0;
                             if (fm.dropTarget === "::trash") fm.trashPaths(fm.selectedList());
+                            else if (fm.dropTarget === "::bookmark") fm.addToSidebar(fm.selectedList(), fm.bmInsert);
                             else if (fm.dropTarget !== "") {
                                 if (copy) fm.copyPaths(fm.selectedList(), fm.dropTarget);
                                 else fm.movePaths(fm.selectedList(), fm.dropTarget);
@@ -1667,7 +2122,8 @@ FloatingWindow {
                         }
                         Text { text: Icons.file; color: selArea.dragCopy ? Theme.green : Theme.accent; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize + 1 }
                         Text {
-                            text: fm.selCount === 1 ? fm.basename(fm.selectedList()[0] || "") : fm.selCount + I18n.t(" items")
+                            text: fm.dropTarget === "::bookmark" ? I18n.t("Add to Sidebar")
+                                  : fm.selCount === 1 ? fm.basename(fm.selectedList()[0] || "") : fm.selCount + I18n.t(" items")
                             color: Theme.text
                             font.family: Theme.fontFamily
                             font.pixelSize: Theme.fontSize - 1
@@ -1698,6 +2154,7 @@ FloatingWindow {
                     required property int copied
                     required property int skipped
                     required property int errors
+                    required property int conflicts
                     required property string errMsg
 
                     readonly property bool live: phase === "scan" || phase === "run"
@@ -1706,7 +2163,8 @@ FloatingWindow {
                     readonly property real frac: total > 0 ? Math.max(0, Math.min(1, done / total)) : -1
                     readonly property color tint: phase === "err" ? Theme.red
                                                 : phase === "warn" ? Theme.yellow
-                                                : phase === "ok" ? Theme.green : Theme.accent
+                                                : phase === "ok" ? Theme.green
+                                                : phase === "note" ? Theme.blue : Theme.accent
 
                     Layout.fillWidth: true
                     Layout.preferredHeight: cardCol.implicitHeight + 14
@@ -1717,8 +2175,8 @@ FloatingWindow {
                     //  usuario lo cierre: eso no puede desaparecer sin que se
                     //  haya leído. Es un disparo único por tarjeta, no un sondeo.
                     Timer {
-                        interval: 4000
-                        running: card.phase === "ok"
+                        interval: card.phase === "note" ? 6000 : 4000
+                        running: card.phase === "ok" || card.phase === "note"
                         onTriggered: fm.dismissJob(card.jobId)
                     }
 
@@ -1739,6 +2197,7 @@ FloatingWindow {
                                 font.family: Theme.fontFamily
                                 font.pixelSize: Theme.fontSize - 3
                                 text: {
+                                    if (card.kind === "note") return card.errMsg;
                                     if (card.phase === "scan")
                                         return (card.kind === "move" ? I18n.t("Moving to ") : I18n.t("Copying to "))
                                                + card.destName + " — " + I18n.t("working out how much there is…");
@@ -1763,6 +2222,24 @@ FloatingWindow {
                                 font.pixelSize: Theme.fontSize - 3
                                 text: fm.fmtBytes(card.done) + " / " + fm.fmtBytes(card.total)
                                       + "   " + Math.round(card.frac * 100) + " %"
+                            }
+                            // "Conservar ambos": lo que se saltó por existir ya, otra
+                            // vez con nombre nuevo ("foto (copia).jpg"). Nunca machaca.
+                            Rectangle {
+                                visible: card.phase === "warn" && card.conflicts > 0
+                                Layout.preferredHeight: 24
+                                Layout.preferredWidth: keepBothText.implicitWidth + 20
+                                radius: Theme.radius - 2
+                                color: keepBothMa.containsMouse ? Theme.surface2 : Theme.surface1
+                                Text {
+                                    id: keepBothText
+                                    anchors.centerIn: parent
+                                    text: I18n.t("Keep both")
+                                    color: Theme.text
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: Theme.fontSize - 3
+                                }
+                                MouseArea { id: keepBothMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: fm.keepBoth(card.jobId) }
                             }
                             IconButton {
                                 visible: !card.live
@@ -1802,7 +2279,8 @@ FloatingWindow {
                         var s = fm.entries.length + I18n.t(" items");
                         if (fm.selCount === 1) s += "  •  " + fm.basename(fm.selectedList()[0] || "");
                         else if (fm.selCount > 1) s += "  •  " + fm.selCount + I18n.t(" selected");
-                        if (fm.clipPaths.length) s += "  •  " + fm.clipPaths.length + (fm.clipMode === "cut" ? I18n.t(" to move") : I18n.t(" to copy"));
+                        if (FileClipboard.paths.length)
+                            s += "  •  " + FileClipboard.paths.length + (FileClipboard.mode === "cut" ? I18n.t(" to move") : I18n.t(" to copy"));
                         return s;
                     }
                     color: Theme.subtext0
@@ -1818,7 +2296,7 @@ FloatingWindow {
         id: fmKeys
         focus: true
         Keys.onPressed: function(event) {
-            if (fm.remoteFormOpen || fm.renameOpen) return;
+            if (fm.remoteFormOpen || fm.renameOpen || fm.iconPickOpen) return;
             if (fm.propOpen) {
                 if (event.key === Qt.Key_Escape || event.key === Qt.Key_Return) { fm.propOpen = false; event.accepted = true; }
                 return;
@@ -1834,6 +2312,7 @@ FloatingWindow {
                     selArea.cancelDrag();
                 }
                 else if (fm.ctxOpen) fm.ctxOpen = false;
+                else if (fm.pickImageFor !== "") fm.endImagePick(true);
                 else if (fm.selCount > 0) fm.clearSelection();
                 else fm.goUp();
                 event.accepted = true;
@@ -1854,7 +2333,11 @@ FloatingWindow {
             } else if (ctrl && event.key === Qt.Key_X) {
                 fm.cutSelected(); event.accepted = true;
             } else if (ctrl && event.key === Qt.Key_V) {
-                if (!fm.inTrash) fm.paste(); event.accepted = true;
+                if (!fm.inTrash) fm.paste(fm.cwd); event.accepted = true;
+            } else if (ctrl && event.key === Qt.Key_D) {
+                // Ctrl+D (Nautilus): la carpeta seleccionada —o esta— a la barra lateral
+                if (!fm.inTrash) fm.addToSidebar(fm.selCount > 0 ? fm.selectedList() : [fm.cwd]);
+                event.accepted = true;
             } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
                 var s = fm.selectedList();
                 if (s.length === 1)
@@ -1874,9 +2357,10 @@ FloatingWindow {
     }
     Card {
         visible: fm.ctxOpen
-        x: Math.min(fm.ctxX, fm.width - width - 8)
-        y: Math.min(fm.ctxY, fm.height - height - 8)
-        width: 210
+        x: Math.max(8, Math.min(fm.ctxX, fm.width - width - 8))
+        y: Math.max(8, Math.min(fm.ctxY, fm.height - height - 8))
+        // tan ancho como la etiqueta más larga (en español las hay largas)
+        width: Math.max(210, menuCol.implicitWidth + 8)
         implicitHeight: menuCol.implicitHeight + 8
         color: Theme.surface1
         radius: Theme.radius
@@ -1891,6 +2375,22 @@ FloatingWindow {
                 model: {
                     var n = Math.max(1, fm.selCount);
                     var suf = n > 1 ? " (" + n + ")" : "";
+                    var clipN = FileClipboard.paths.length;
+                    var pasteLabel = clipN ? I18n.t("Paste (") + clipN + ")" : I18n.t("Paste");
+                    // fila de la barra lateral
+                    if (fm.ctxSide) {
+                        var sd = fm.ctxSide, side = [];
+                        if (!sd.missing) {
+                            side.push({ label: I18n.t("Open"), act: "sideopen" });
+                            side.push({ label: I18n.t("Customize Folder Icon…"), act: "sideicon" });
+                        }
+                        if (sd.bookmark) {
+                            if (sd.index > 0) side.push({ label: I18n.t("Move up"), act: "bmup" });
+                            if (sd.index < Places.bookmarks.length - 1) side.push({ label: I18n.t("Move down"), act: "bmdown" });
+                            side.push({ label: I18n.t("Remove from Sidebar"), act: "bmremove" });
+                        }
+                        return side;
+                    }
                     if (fm.inTrash) {
                         if (fm.ctxEntry) return [
                             { label: I18n.t("Restore") + suf, act: "restore" },
@@ -1900,12 +2400,15 @@ FloatingWindow {
                     }
                     if (!fm.ctxEntry) {
                         var bg = [{ label: I18n.t("New folder"), act: "newfolder" }];
-                        if (fm.clipPaths.length) bg.push({ label: I18n.t("Paste (") + fm.clipPaths.length + ")", act: "paste" });
+                        bg.push({ label: pasteLabel, act: "paste", disabled: clipN === 0 });
                         bg.push({ label: I18n.t("Select all"), act: "selectall" });
                         bg.push({ label: fm.showHidden ? I18n.t("Hide hidden files") : I18n.t("Show hidden files"), act: "togglehidden" });
+                        if (!Places.inSidebar(fm.cwd)) bg.push({ label: I18n.t("Add to Sidebar"), act: "bookmarkcwd" });
+                        bg.push({ label: I18n.t("Customize Folder Icon…"), act: "foldericon" });
                         bg.push({ label: I18n.t("Properties"), act: "props" });
                         return bg;
                     }
+                    var isDir = fm.ctxEntry.isDir;
                     var items = [];
                     if (n === 1) {
                         items.push({ label: I18n.t("Open"), act: "open" });
@@ -1913,9 +2416,20 @@ FloatingWindow {
                     }
                     items.push({ label: I18n.t("Cut") + suf, act: "cut" });
                     items.push({ label: I18n.t("Copy") + suf, act: "copy" });
+                    if (n === 1 && isDir)
+                        items.push({ label: I18n.t("Paste into Folder"), act: "pasteinto", disabled: clipN === 0 });
                     if (n === 1) {
                         if (/\.zip$/i.test(fm.ctxEntry.name)) items.push({ label: I18n.t("Extract here"), act: "extract" });
                         else items.push({ label: I18n.t("Compress to .zip"), act: "compress" });
+                    }
+                    // carpetas: barra lateral e icono (un marcador es solo una
+                    // línea en el fichero de marcadores: quitarlo no toca nada)
+                    if (n === 1 && isDir) {
+                        if (Places.isBookmarked(fm.ctxEntry.path)) items.push({ label: I18n.t("Remove from Sidebar"), act: "unbookmark" });
+                        else if (!Places.isBuiltin(fm.ctxEntry.path)) items.push({ label: I18n.t("Add to Sidebar"), act: "bookmark" });
+                        items.push({ label: I18n.t("Customize Folder Icon…"), act: "foldericon" });
+                    } else if (n > 1 && fm.selectionAllDirs()) {
+                        items.push({ label: I18n.t("Add to Sidebar") + suf, act: "bookmark" });
                     }
                     items.push({ label: I18n.t("Properties") + suf, act: "props" });
                     items.push({ label: I18n.t("Move to Trash") + suf, act: "trash", danger: true });
@@ -1925,14 +2439,16 @@ FloatingWindow {
                     required property var modelData
                     Layout.fillWidth: true
                     Layout.preferredHeight: 32
+                    implicitWidth: itemLabel.implicitWidth + 28
                     radius: Theme.radius - 2
-                    color: im.containsMouse ? Theme.surface2 : "transparent"
+                    color: im.containsMouse && !modelData.disabled ? Theme.surface2 : "transparent"
                     Text {
+                        id: itemLabel
                         anchors.fill: parent
                         anchors.leftMargin: 12
                         verticalAlignment: Text.AlignVCenter
                         text: modelData.label
-                        color: modelData.danger ? Theme.red : Theme.text
+                        color: modelData.disabled ? Theme.overlay1 : (modelData.danger ? Theme.red : Theme.text)
                         font.family: Theme.fontFamily
                         font.pixelSize: Theme.fontSize - 1
                     }
@@ -1940,6 +2456,7 @@ FloatingWindow {
                         id: im
                         anchors.fill: parent
                         hoverEnabled: true
+                        enabled: !modelData.disabled
                         cursorShape: Qt.PointingHandCursor
                         onClicked: {
                             // DIFERIR la acción: mutar aquí estado del que
@@ -1952,13 +2469,36 @@ FloatingWindow {
                             // ejecuta la acción fuera de la vida del delegate.
                             var act = modelData.act;
                             var e = fm.ctxEntry;
+                            var side = fm.ctxSide;
                             var sel = fm.selectedList();
                             fm.ctxOpen = false;
-                            Qt.callLater(function() { fm.ctxAction(act, e, sel); });
+                            Qt.callLater(function() { fm.ctxAction(act, e, sel, side); });
                         }
                     }
                 }
             }
+        }
+    }
+
+    // ---- diálogo "Personalizar icono de carpeta" ----
+    Rectangle {
+        anchors.fill: parent
+        visible: fm.iconPickOpen
+        color: "#000000"
+        opacity: fm.iconPickOpen ? 0.5 : 0
+        Behavior on opacity { NumberAnimation { duration: Theme.dur(120) } }
+        MouseArea { anchors.fill: parent; onClicked: fm.iconPickOpen = false }
+    }
+    Loader {
+        anchors.centerIn: parent
+        active: fm.iconPickOpen
+        z: 210
+        sourceComponent: FolderIconPicker {
+            path: fm.iconPickPath
+            maxWidth: fm.width - 40
+            maxHeight: fm.height - 40
+            onCloseRequested: fm.iconPickOpen = false
+            onChooseImage: fm.startImagePick(fm.iconPickPath)
         }
     }
 

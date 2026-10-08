@@ -2,8 +2,12 @@
 """
 vexyon-fm-xfer — copia y mueve ficheros DICIENDO POR DÓNDE VA.
 
-    copy <destino> <origen>…
-    move <destino> <origen>…
+    copy [--keep-both] [--copy-word PALABRA] <destino> <origen>…
+    move [--keep-both] [--copy-word PALABRA] <destino> <origen>…
+
+    --keep-both    si en el destino ya hay algo con ese nombre, se copia/mueve
+                   con un nombre nuevo ("foto (copia).jpg") en vez de saltarlo
+    --copy-word    la palabra del nombre nuevo, ya traducida ("copy", "copia")
 
 POR QUÉ EXISTE Y NO SE USA `cp`/`mv` A SECAS
 --------------------------------------------
@@ -35,6 +39,8 @@ PROTOCOLO (líneas sueltas por STDOUT, se leen según llegan)
     @@FILE  <n> <de> <nombre>        empieza el fichero n de <de>
     @@PROG  <hechos> <total>         bytes acumulados de TODA la operación
     @@SKIP  <nombre>                 el destino ya existía: NO se ha tocado
+    @@CONFLICT <ruta origen>         un elemento de primer nivel saltado por
+                                     eso (el gestor ofrece "Conservar ambos")
     @@ERR   <nombre> <motivo>        ese elemento ha fallado; se sigue con el resto
     @@DONE  <copiados> <saltados> <fallos>
 
@@ -43,6 +49,7 @@ de pasar por el buffer.
 """
 import errno
 import os
+import re
 import shutil
 import sys
 
@@ -72,10 +79,86 @@ def die(msg):
 
 
 # ---------------------------------------------------------------------------
+# nombres nuevos ("Conservar ambos" y pegar en la misma carpeta)
+# ---------------------------------------------------------------------------
+COPY_WORD = "copy"
+DOUBLE_EXT = (".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst")
+
+
+def split_name(name, is_dir):
+    """("foto", ".jpg"). Las carpetas y los ocultos sin más punto no tienen
+    extensión; los .tar.gz cuentan como una sola."""
+    if is_dir:
+        return name, ""
+    low = name.lower()
+    for ext in DOUBLE_EXT:
+        if low.endswith(ext) and len(name) > len(ext):
+            return name[:-len(ext)], name[-len(ext):]
+    stem, ext = os.path.splitext(name)
+    return (stem, ext) if stem else (name, "")
+
+
+def free_name(dest, name, is_dir):
+    """Primer nombre libre: "foto (copy).jpg", "foto (copy 2).jpg"…  Si el
+    nombre ya era una copia, se sigue contando en vez de anidar sufijos."""
+    stem, ext = split_name(name, is_dir)
+    w = re.escape(COPY_WORD)
+    m = re.match(r"^(.*) \(%s(?: (\d+))?\)$" % w, stem)
+    if m:
+        stem = m.group(1)
+    n = 1
+    while True:
+        tag = COPY_WORD if n == 1 else "%s %d" % (COPY_WORD, n)
+        cand = "%s (%s)%s" % (stem, tag, ext)
+        if not os.path.lexists(os.path.join(dest, cand)):
+            return cand
+        n += 1
+
+
+def inside(dest, src):
+    """¿`dest` es `src` o está dentro? Con rutas reales: un enlace no engaña."""
+    try:
+        d, s = os.path.realpath(dest), os.path.realpath(src)
+    except OSError:
+        return False
+    return d == s or d.startswith(s.rstrip("/") + "/")
+
+
+def plan(srcs, dest, keep_both):
+    """[(origen, nombre en destino)] de primer nivel, ya decidido.
+
+    - Una carpeta no se mete en sí misma ni en una de sus subcarpetas: eso se
+      dice (@@ERR) y no se intenta.
+    - Pegar en la MISMA carpeta de origen es duplicar: nombre nuevo siempre.
+    - Si el nombre ya existe: con --keep-both nombre nuevo; si no, un fichero
+      se salta (@@SKIP + @@CONFLICT) y una carpeta se fusiona sin machacar nada,
+      como hasta ahora.
+    """
+    out, failed = [], 0
+    for src in srcs:
+        src = src.rstrip("/")
+        name = os.path.basename(src)
+        if not name:
+            continue
+        is_dir = os.path.isdir(src) and not os.path.islink(src)
+        if is_dir and inside(dest, src):
+            failed += 1
+            # "@self": el gestor lo traduce (los demás motivos son strerror)
+            emit("@@ERR\t%s\t@self" % clean(name))
+            continue
+        same = os.path.realpath(os.path.dirname(src) or "/") == os.path.realpath(dest)
+        dst = os.path.join(dest, name)
+        if os.path.lexists(dst) and (same or keep_both):
+            name = free_name(dest, name, is_dir)
+        out.append((src, name))
+    return out, failed
+
+
+# ---------------------------------------------------------------------------
 # recuento previo
 # ---------------------------------------------------------------------------
 def scan(srcs, dest):
-    """Devuelve (trabajos, bytes_totales).
+    """Devuelve (trabajos, bytes_totales). `srcs` = [(origen, nombre)].
 
     Cada trabajo es (origen, destino, es_directorio). Los directorios van antes
     que su contenido para poder crearlos por orden.
@@ -84,11 +167,7 @@ def scan(srcs, dest):
     podría meter en la copia medio disco (o un bucle) sin que nadie lo pida.
     """
     jobs, total = [], 0
-    for src in srcs:
-        src = src.rstrip("/")
-        name = os.path.basename(src)
-        if not name:
-            continue
+    for src, name in srcs:
         dst = os.path.join(dest, name)
         if os.path.islink(src) or not os.path.isdir(src):
             jobs.append((src, dst, False))
@@ -185,44 +264,62 @@ def copy_file(src, dst, prog):
 # ---------------------------------------------------------------------------
 # la operación
 # ---------------------------------------------------------------------------
-def run(mode, dest, srcs):
+def run(mode, dest, srcs, keep_both=False):
     if not os.path.isdir(dest):
         die("el destino no es una carpeta: %s" % dest)
+
+    items, pfailed = plan(srcs, dest, keep_both)
 
     # Mover DENTRO del mismo sistema de ficheros es un renombrado: instantáneo,
     # no mueve un solo byte y no hay nada que medir. Se intenta primero, y solo
     # si el kernel dice EXDEV (destino en otro sistema de ficheros: disco
     # externo, sshfs, otra partición) se cae a copiar-y-borrar, que sí tarda.
-    quick, rest = [], []
+    quick, rest, qskip, qfailed = [], [], 0, 0
     if mode == "move":
-        for src in srcs:
-            s = src.rstrip("/")
-            name = os.path.basename(s)
-            if not name:
-                continue
+        for s, name in items:
+            if os.path.dirname(s) and os.path.realpath(os.path.dirname(s)) == os.path.realpath(dest):
+                continue                  # mover a donde ya está: nada que hacer
             dst = os.path.join(dest, name)
-            if os.path.exists(dst):
+            if os.path.lexists(dst):
+                qskip += 1
                 emit("@@SKIP\t%s" % clean(name))
+                emit("@@CONFLICT\t%s" % clean(s))
                 continue
             try:
                 os.rename(s, dst)
                 quick.append(name)
             except OSError as e:
                 if e.errno == errno.EXDEV:
-                    rest.append(s)
+                    rest.append((s, name))
                 else:
+                    qfailed += 1
                     emit("@@ERR\t%s\t%s" % (clean(name), clean(e.strerror or e)))
         if not rest:
             emit("@@TOTAL\t0\t%d" % len(quick))
-            emit("@@DONE\t%d\t0\t0" % len(quick))
-            return 0
-        srcs = rest
+            emit("@@DONE\t%d\t%d\t%d" % (len(quick), qskip, pfailed + qfailed))
+            return 1 if pfailed + qfailed else 0
+        items = rest
+    else:
+        # Copiar: un fichero de primer nivel que ya existe se salta entero y se
+        # avisa, para poder ofrecer "Conservar ambos" sobre él.
+        keep = []
+        for s, name in items:
+            dst = os.path.join(dest, name)
+            if os.path.lexists(dst) and not (os.path.isdir(dst) and os.path.isdir(s)
+                                             and not os.path.islink(s)):
+                qskip += 1
+                emit("@@SKIP\t%s" % clean(name))
+                emit("@@CONFLICT\t%s" % clean(s))
+                continue
+            keep.append((s, name))
+        items = keep
 
-    jobs, total = scan(srcs, dest)
+    jobs, total = scan(items, dest)
     files = [j for j in jobs if not j[2]]
     emit("@@TOTAL\t%d\t%d" % (total, len(files)))
     prog = Progress(total)
 
+    # Contadores de ESTA fase (la copia): de ellos depende borrar el origen.
     copied = skipped = failed = 0
     index = 0
     # Los directorios de los que sí se ha copiado todo, para poder borrarlos al
@@ -259,7 +356,7 @@ def run(mode, dest, srcs):
     # copiado ENTERO y bien. Si algo falló o se saltó, el origen se queda: es
     # preferible una copia duplicada a un borrado que no tocaba.
     if mode == "move" and failed == 0 and skipped == 0:
-        for src in srcs:
+        for src, _ in items:
             try:
                 if os.path.islink(src) or not os.path.isdir(src):
                     os.unlink(src)
@@ -270,15 +367,30 @@ def run(mode, dest, srcs):
                                         clean(e.strerror or e)))
 
     copied += len(quick)
-    emit("@@DONE\t%d\t%d\t%d" % (copied, skipped, failed))
+    failed += pfailed + qfailed
+    emit("@@DONE\t%d\t%d\t%d" % (copied, skipped + qskip, failed))
     return 1 if failed else 0
 
 
 def main():
-    if len(sys.argv) < 4 or sys.argv[1] not in ("copy", "move"):
-        die("uso: vexyon-fm-xfer <copy|move> <destino> <origen>…")
+    global COPY_WORD
+    args = sys.argv[1:]
+    if not args or args[0] not in ("copy", "move"):
+        die("uso: vexyon-fm-xfer <copy|move> [--keep-both] [--copy-word P] <destino> <origen>…")
+    mode, args = args[0], args[1:]
+    keep_both = False
+    while args and args[0].startswith("--"):
+        if args[0] == "--keep-both":
+            keep_both, args = True, args[1:]
+        elif args[0] == "--copy-word" and len(args) > 1:
+            w = clean(args[1]).strip().replace("/", "")
+            COPY_WORD, args = (w or COPY_WORD), args[2:]
+        else:
+            die("opción desconocida: %s" % args[0])
+    if len(args) < 2:
+        die("uso: vexyon-fm-xfer <copy|move> [--keep-both] [--copy-word P] <destino> <origen>…")
     try:
-        raise SystemExit(run(sys.argv[1], sys.argv[2].rstrip("/"), sys.argv[3:]))
+        raise SystemExit(run(mode, args[0].rstrip("/") or "/", args[1:], keep_both))
     except KeyboardInterrupt:
         raise SystemExit(130)
 

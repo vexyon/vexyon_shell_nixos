@@ -61,6 +61,7 @@ Vexyon is a complete desktop shell built from scratch in QML on [Quickshell](htt
 - **Multimedia keys + themed OSD** — volume, brightness, mic mute and media keys work out of the box, with a clean bottom-center OSD that follows your theme. Event-driven (MPRIS and PipeWire handled in-process — no `playerctl`/`wpctl` spawning).
 - **Dynamic iGPU pinning for hybrid laptops** — on iGPU + NVIDIA machines the session runs pinned to the iGPU; a udev hotplug handler re-decides on display hotplug, so plugging an external monitor wired to the dGPU works without reboot or re-login. No daemons, no polling.
 - **Built-in everything** — app launcher, file manager, clipboard history, screenshot tool with region crop, notification center, quick settings, media / volume / network / battery / system-monitor panels, power menu and a keybind editor.
+- **File manager (Super+E)** — copy, cut and paste go through the system clipboard, so they work between file manager windows and with other apps and file managers; your Desktop, Documents, Downloads, Pictures, Music and Videos folders at their real (also translated) paths; sidebar bookmarks you add with right-click → *Add to Sidebar* or by dragging a folder into the sidebar (the same bookmarks GTK file dialogs use); folder icons — a symbol on each user folder and a library of 260 symbols, or your own SVG/PNG, for any folder (right-click → *Customize Folder Icon*).
 - **Lock screen with PAM auth** — blurred wallpaper backdrop, themed clock, avatar and status pills (keyboard layout, battery, weather).
 - **i18n** — English and Spanish, switchable live from Settings (dates, weather and all UI strings included).
 - **Virtual machines** — a built-in VM manager (Super+V) on libvirt/QEMU: create, start, stop, snapshots, shared folders, TPM for Windows 11, OVA import/export, NAT/host-only/internal networks and a graphical display window (also on the dedicated GPU of hybrid laptops).
@@ -150,7 +151,7 @@ The optional pieces (libvirt, Bluetooth, NetworkManager, PipeWire, the power ser
 - **The desktop:** Hyprland, the greetd greeter, portals, polkit, PipeWire (with its PulseAudio server), NetworkManager, UPower, power-profiles-daemon (unless TLP or auto-cpufreq is active), udisks2, PAM for the lock screen, fonts and cursors.
 - **Virtual machines:** `virtualisation.libvirtd` with `qemu_kvm`, swtpm (TPM for Windows 11) and virtiofsd (shared folders), `virt-viewer`, your user in the `libvirtd` group, and narrow firewall exceptions for libvirt's bridges (`virbr*`) in whichever firewall you use (iptables or nftables) so VMs get DHCP, DNS and NAT. The rest of your firewall is untouched.
 - **Bluetooth:** `hardware.bluetooth` (bluetoothd only runs when an adapter is present).
-- **Screen recording and the rest:** `wf-recorder`, `hyprpicker`, `pactl` (from `pulseaudio`, no daemon) and `fuser` (`psmisc`).
+- **Screen recording and the rest:** `wf-recorder`, `hyprpicker`, `pactl` (from `pulseaudio`, no daemon), `fuser` (`psmisc`) and `xdg-user-dirs` (the file manager's user folders).
 - **Settings → Modules:** a boot unit (`vexyon-modules.service`), a start condition on every service of a module, and a polkit action for the one privileged operation the shell can ask for — see [Optional modules](#optional-modules).
 
 If your configuration already sets one of these itself (for example `virtualisation.libvirtd.enable = true` from Vexyon 2.x's old setup instructions), nothing breaks: your value is used. You can delete those old lines now; the module covers them.
@@ -193,6 +194,12 @@ nix build .#tests.x86_64-linux.modules-gating   # VM test of Settings → Module
 - **Greeter state is in `/var/lib/vexyon-greeter`**, not `/etc`. It has to be writable: the bridge rewrites the greeter's theme snapshot on every theme change, and the GPU hotplug handler rewrites the pin there. It is owned by `services.vexyon.user` so none of that needs privilege escalation.
 - **Module choices live in `/var/lib/vexyon/modules`**, root-owned, written only by the `vexyon-modules` helper through polkit. They survive rebuilds, updates and generation switches; a file there means "off from the next boot".
 - **The Arch/CachyOS installer (`install.sh`) lives in the [vexyon_shell](https://github.com/vexyon/vexyon_shell) repository** and is not used here.
+
+## File manager
+
+- **Clipboard.** Files you copy or cut are served by `wl-copy` (from `wl-clipboard`), so they stay on the clipboard after the file manager window closes and across a shell restart, until something else is copied. Like any Wayland clipboard, it ends with the session unless a clipboard manager keeps it. Pasting never overwrites: a name that already exists is skipped and the card offers **Keep both**; pasting into the same folder makes a copy named "name (copy)".
+- **User folders.** If `~/.config/user-dirs.dirs` does not exist yet, the file manager runs `xdg-user-dirs-update` once, the same thing other desktops do at login. Existing folders and paths are never changed.
+- **Where things are kept.** Bookmarks: `~/.config/gtk-3.0/bookmarks` (shared with GTK file dialogs, Nautilus and Thunar; lines Vexyon cannot show, like `sftp://`, are kept). Folder icons: `~/.local/share/vexyon/folder-icons.json` and, for your own images, a sanitised copy in `~/.local/share/vexyon/folder-icons/`. Nothing is written inside your folders.
 
 ## Optional modules
 

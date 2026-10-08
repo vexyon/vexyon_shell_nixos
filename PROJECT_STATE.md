@@ -20,6 +20,217 @@ VEXYON OUT-OF-THE-BOX POLICY Every Vexyon feature must ship together with all re
 
 PERMANENT POLICY: If Vexyon's installation changes, its GitHub README.md MUST be updated in the same development task. No exceptions.
 
+## Session: File Manager — system clipboard between windows, XDG user folders, folder icons, sidebar bookmarks
+
+### Why
+
+Four requests for the File Manager (Super+E), one of them a bug:
+
+1. **Copy/paste between two File Manager windows did not work.** Root cause:
+   `FileManager.qml` kept copied files in two properties of the window itself
+   (`clipPaths` / `clipMode`). Every Super+E creates a new `FloatingWindow`
+   instance, each with its own empty copy of those properties, and nothing was
+   ever written to the Wayland clipboard — so another window, another process
+   or another file manager had nothing to paste.
+2. The sidebar's places were hard-coded English paths (`~/Documents`,
+   `~/Pictures`…), wrong on any translated system (`~/Documentos`).
+3. Folder icons: a symbol on the user folders and a way to choose one for any
+   folder.
+4. Sidebar bookmarks: add (right-click, drag), reorder, remove.
+
+### What changed
+
+| file | change |
+|---|---|
+| `config/vexyon/bin/vexyon-fm-helper` (new, Python, on demand) | system clipboard (`clip-set` / `clip-get` / `clip-done`), XDG user folders + bookmarks (`places`, `bm-add`, `bm-remove`, `bm-move`, `bm-moved`), folder icons (`icons`, `icon-set`, `icon-image`, `icon-reset`, `icon-moved`, `icon-adopt`). One call, one line of JSON, exit. |
+| `config/vexyon/bin/vexyon-fm-xfer` | `--keep-both` (new name instead of skipping), `--copy-word` (translated "copy"), pasting into the source folder duplicates as "name (copy).ext" / "(copy 2)" (`.tar.gz` kept whole), a folder is never copied/moved into itself (`@@ERR … @self`), top-level conflicts reported as `@@CONFLICT <source>`; move counters fixed so a conflict elsewhere does not keep a cross-filesystem move's sources. |
+| `config/vexyon/services/FmHelper.qml` (new) | runs the helper: one short-lived `Process` per call (two windows never share one), callback with parsed JSON; a binary that cannot start still answers (127). |
+| `config/vexyon/services/FileClipboard.qml` (new) | the clipboard state every window shares (mode, paths, cut set) — refreshed on request only. |
+| `config/vexyon/services/Places.qml` (new) | XDG user folders (built-in sidebar rows) + bookmarks; XDG key → default symbol. |
+| `config/vexyon/services/FolderIcons.qml` (new) | the 260-symbol library (19 categories), the per-folder choices, default symbols, inode index for renames done elsewhere, theme-aware ink colour. |
+| `config/vexyon/components/FolderGlyph.qml` (new) | the item glyph + the symbol composited on the folder body (measured from the real font, so it lands right at every size/zoom). |
+| `config/vexyon/modules/FolderIconPicker.qml` (new) | the "Customize Folder Icon" dialog. |
+| `config/vexyon/modules/FileManager.qml` | system clipboard; XDG places; bookmarks section (scrollable sidebar, Trash pinned at the bottom), drop between rows = bookmark, drag rows to reorder, sidebar context menu; context-menu entries (Paste into Folder, Add to / Remove from Sidebar, Customize Folder Icon…); Ctrl+D; image-pick mode for custom icons; notices and "Keep both" on the transfer cards; `find` also prints `%D:%i` of each folder; listing at `/` no longer builds `//name` paths; renames/moves made in Vexyon carry icon and bookmark along; a transfer whose helper cannot start now says so instead of "working out how much there is…" forever. |
+| `config/vexyon/services/I18n.qml` | Spanish for every new string, the 19 categories, the 256 symbol names and the helper's error messages. |
+| `install.sh` (Arch) / `nix/module.nix` + `nix/package.nix` (NixOS) | `xdg-user-dirs` (package + helper wrapper PATH on NixOS). |
+| `README.md` (both), `CHANGELOG.md` | features, dependency, a "File manager" section (clipboard lifetime, where data is kept). |
+
+All files under `config/vexyon/` are byte-identical in both repositories
+(checked with the AGENTS.md loop: only the allowed platform files differ).
+
+### How it works
+
+**Clipboard (item 8).** Ctrl+C / Ctrl+X / menu → `clip-set`: the selection as
+`text/uri-list` (RFC 2483, CRLF, every path percent-encoded from its bytes, so
+spaces, `#`, `%` and Unicode survive) served by `wl-copy --foreground` started
+in its own session — it outlives the window and a shell restart and exits by
+itself when anything else is copied (wl-copy also offers the same text as
+`text/plain`, so pasting into a terminal still gives the URIs). Ctrl+V →
+`clip-get` reads the clipboard as it is now: `x-special/gnome-copied-files`
+(Nautilus/Thunar/Nemo copy or cut), `text/uri-list` (+ Dolphin's
+`application/x-kde-cutselection`), or `text/plain` made only of `file://`
+lines (a file list picked again from the clipboard history). A Vexyon cut is
+recorded in `$XDG_RUNTIME_DIR/vexyon/fm-clipboard.json` with the PID of the
+wl-copy that serves it; it is a cut only while that wl-copy is alive and the
+clipboard holds exactly those URIs (NixOS's wrapped `.wl-copy-wrapped` is
+recognised). Anything else is a copy, which can never lose data. After a cut
+is pasted, `clip-done` clears the clipboard only if it still holds that cut.
+The transfer itself is the existing `vexyon-fm-xfer` (progress, no
+overwrite, source deleted only after a complete move). No polling: the shared
+state is refreshed when a window opens, when a context menu opens, on our own
+copy/cut and on paste.
+
+**XDG folders (items 2, 7).** `places` parses `user-dirs.dirs` (`$HOME/…` and
+absolute values, shell escapes, `=$HOME` meaning "disabled"); if the file does
+not exist it runs `xdg-user-dirs-update` once — the standard tool, which only
+creates what is missing. The sidebar shows Home + Desktop, Documents,
+Downloads, Pictures, Music, Videos that exist, labelled with the real folder
+name. Read when a window opens, so a folder created later appears then.
+
+**Folder icons (items 1, 3, 4).** Symbols are Material Design glyphs of the
+Nerd Font the shell already installs (U+F0001–U+F1AF0, verified present in
+JetBrainsMono Nerd Font 3.4.0): no icon pack. Drawn with the proportional
+build ("JetBrainsMono Nerd Font Propo") so they centre exactly, on the
+folder's front panel, sized from the folder glyph's measured ink. Colour:
+`onAccent`, or whichever of `base` / `text` contrasts more when `onAccent` is
+under 3:1 against the folder colour (WCAG) — computed from theme tokens, so it
+re-tints live. A custom image sits on a small disc of the theme's `base`.
+Defaults: Desktop monitor, Documents document, Downloads arrow, Pictures
+image, Music note, Videos play, Templates pencil-ruler, Public share,
+Projects (xdg-user-dirs ≥ 0.19) braces, Home house in the grid (the sidebar
+keeps its usual house). Choices live in
+`~/.local/share/vexyon/folder-icons.json` keyed by path **with device+inode**:
+a rename/move made by Vexyon updates the key (`icon-moved`, also across file
+systems); a rename made by another program on the same file system is found
+at the next listing (`icon-adopt`: same inode, old path gone). Custom SVGs are
+untrusted input: DTD/entities rejected, parsed and rebuilt from an allowlist
+(no script, style, foreignObject, image, a, animation, event attributes,
+external `href`/`url()`); PNGs checked (signature, ≤ 4 MiB, ≤ 4096×4096);
+only the sanitised copy in `~/.local/share/vexyon/folder-icons/` is loaded,
+and unused copies are deleted. Nothing is written inside the folders; no root.
+
+**Bookmarks (items 5, 6).** The GTK bookmarks file
+(`~/.config/gtk-3.0/bookmarks`), the one GTK file choosers, Nautilus, Thunar
+and Nemo share — there was no Vexyon mechanism to reuse, and this one makes
+Vexyon's bookmarks show up in every GTK file dialog. Every change re-reads the
+file under a lock and rewrites it atomically; lines Vexyon cannot show
+(`sftp://`, `smb://`) and custom labels are kept; duplicates and the built-in
+places are refused. Dropping folders **between** sidebar rows (or on the
+"Drop a folder here" slot) adds bookmarks at that position — never a move or
+copy; dropping **on** a row still moves into it, as before. Works from the
+same window (internal gesture) and from another window/app (Wayland drop on
+the sidebar). Reorder by dragging a bookmark; the sidebar's context menu has
+Open, Customize Folder Icon…, Move up/down, Remove from Sidebar (removes the
+line only). A bookmark whose folder disappeared stays, dimmed, until removed.
+
+**No bloat (item 9).** Classified **on demand** (like file transfers): no
+module, no daemon, no watcher, no timer. The helper runs only when asked and
+exits; the only process left behind is the `wl-copy` that serves a file list
+while it is on the clipboard — the same thing any `wl-copy` or Wayland app
+does, gone as soon as something else is copied. The file manager's own
+singletons live in the shell process only after the first Super+E.
+
+### Verification (what was actually run)
+
+Lab: headless sway 1.12 + Quickshell 0.3.0 (Mesa llvmpipe), wl-clipboard
+2.3.0 and xdg-user-dirs 0.20 from nixpkgs, a lab-only virtual pointer
+(zwlr_virtual_pointer) and `wtype` for real input; a test `$HOME` with
+**Spanish** user folders (`Escritorio`, `Documentos`, `Descargas`, `Imágenes`,
+`Vídeos`…) plus an English `Documents` that must NOT get a symbol. Two (or
+three) File Manager windows of the same shell.
+
+Clipboard — all with two windows on different folders:
+1. Copy (multi-selection: a file with a space, a folder with a subfolder, a
+   symlink to `/etc`) in window A → paste in B: copied recursively, the
+   symlink recreated as a link (not followed), sources intact. Clipboard
+   offers `text/uri-list` + text types, CRLF, percent-encoded.
+2. Cut (file `mover ñ.txt` + folder) in A → paste in B: moved, sources gone,
+   clipboard empty afterwards, A shows cut items dimmed before the paste.
+3. Same with **real keys** (Ctrl+C in A, Ctrl+V in B; Ctrl+X in A, Ctrl+V in
+   B; Ctrl+A) — pass.
+4. Paste into the same folder twice: `keep (copy).txt`, `keep (copy 2).txt`.
+5. Paste where the name exists: skipped, card "already existed" with **Keep
+   both** → clicked with the real pointer → `keep (copy).txt`, original
+   untouched.
+6. Folder into itself: refused, red notice; nothing copied.
+7. Another program's copy (`wl-copy -t text/uri-list`) → pasted.
+8. Another program reads ours (`wl-paste`) → correct uri-list.
+9. GNOME-style cut (`x-special/gnome-copied-files` "cut") → moved, clipboard
+   cleared.
+10. Copy in A, **close A**, open a new window, paste → works; and after a
+    **full shell restart** the new process still sees and pastes it.
+Also: source deleted before pasting → "No such file or directory" card;
+read-only destination (ro bind mount) → "Read-only file system" card;
+`sftp://` mixed with `file://` → local part pasted, the rest reported;
+`text/plain` made of file URIs → pasted. Helper unit tests: cut marker
+invalidated when anything else is copied, PID check with NixOS's wrapper.
+
+XDG: localized folders resolved; English `Documents` not treated as one;
+`Música` created while the shell ran → appears in the sidebar and gets its
+symbol at the next window; no `user-dirs.dirs` → `xdg-user-dirs-update` ran
+once, second call does nothing; escaped quotes, absolute path, `=$HOME/` and a
+relative (invalid) value handled.
+
+Icons: defaults in grid and list; picker (search "game" → 15 results, select,
+preview, Apply with real clicks) → persisted; overriding an XDG default and
+Reset; rename in Vexyon, move in Vexyon (cut/paste), rename outside Vexyon
+(`mv`), move to another file system (tmpfs) and back — the icon followed every
+time; custom PNG via the image-pick mode (double-click) → shown on its disc;
+hostile SVG → scripts/styles/foreignObject/images/handlers/external URLs
+stripped; entity bomb, oversized PNG, fake PNG rejected with a message;
+change in one window shows in the other at once; persisted across shell
+restart. Themes: crimson-voltage, White, Catppuccin Latte and a test theme with
+a very pale accent — symbol readable in all; computed contrast ≥ 3.68:1 for
+all 26 bundled themes.
+
+Bookmarks: pre-existing GTK file with an `sftp://` line, a built-in path and a
+labelled bookmark → shown correctly, all lines kept through every change; Add
+to Sidebar from the context menu (real right-click/click) for `Ñandú #1 100%`
+(stored percent-encoded); duplicate and file refused with a notice; drag from
+the grid between two bookmarks → insertion line + "Add to Sidebar" ghost →
+bookmark at that position, folder not moved; drag onto a bookmark → moved into
+it (old behaviour); drag-reorder; Remove from Sidebar (real clicks) → line
+gone, folder intact; drag from window A onto window B's sidebar (Wayland
+drop) → bookmark; rename of a bookmarked folder in Vexyon → bookmark and icon
+follow; folder deleted outside → bookmark shown dimmed; second window updated
+at once.
+
+Performance: a folder with 6000 entries (3000 folders) listed and shown in
+≈ 140 ms in the lab; shell RSS +10 MB; no helper process left running after
+any test.
+
+Static/build: `py_compile` + `pyflakes` clean on both helpers; `bash -n` and
+shellcheck on `install.sh` (same single pre-existing warning as before);
+`nix-instantiate --parse` of both Nix files; `nix build` of the package (the
+helper's wrapper carries wl-clipboard 2.3.0 and xdg-user-dirs 0.20, and the
+store-built helper ran with `PATH=/usr/bin:/bin`); a full NixOS evaluation with
+the module (toplevel derivation produced, `xdg-user-dirs` in systemPackages);
+I18n check: every new key translated.
+
+### NOT verified
+
+- **Hyprland itself and real hardware.** All runtime tests ran on headless
+  sway; Super+E, Hyprland's DnD handling and HiDPI scale > 1 were not run.
+- **Arch / CachyOS** only statically: `install.sh` syntax/shellcheck. The
+  package name `xdg-user-dirs` could not be checked against the live Arch
+  repositories from this machine (archlinux.org is blocked here); if it were
+  missing, the sidebar simply shows Home only until user-dirs exist.
+- **Real Nautilus / Thunar / Dolphin.** Their clipboard formats were simulated
+  with `wl-copy`; Dolphin's `application/x-kde-cutselection` path could not be
+  produced (wl-copy offers one type) and was only reviewed. Because a Wayland
+  clipboard written by wl-copy carries one type, a Vexyon **cut pasted in
+  another file manager is a copy** there (never a loss of data).
+- **Permission errors as a normal user**: the lab runs as root; an EROFS
+  destination was used to exercise the same error path.
+- Clipboard keepers (wl-clip-persist): handled in code, not run. The
+  clipboard does not survive the end of the session (normal Wayland
+  behaviour; documented in the README).
+- Clipboard state shown in the status bar is refreshed on window open, menu
+  open and paste, not on window focus (Quickshell exposes no focus signal for
+  the window): text copied elsewhere shows up at the next of those moments.
+- The NixOS VM test (`modules-gating`) was not re-run: no module or boot unit
+  changed.
+
 ## Session: Vexyon 3.0 — optional modules (Settings → Modules) and out-of-the-box installation
 
 Version **3.0** (About page), **3.0.0** where semver is used (NixOS package).

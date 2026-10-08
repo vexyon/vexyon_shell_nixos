@@ -13,6 +13,7 @@
   python3,
   grim,
   wl-clipboard,
+  xdg-user-dirs,
   libnotify,
   xdg-utils,
   glib,
@@ -40,7 +41,8 @@ let
     jq
     pythonEnv
     grim
-    wl-clipboard
+    wl-clipboard # también el portapapeles del gestor de ficheros (vexyon-fm-helper)
+    xdg-user-dirs # xdg-user-dirs-update, carpetas de usuario del gestor de ficheros
     libnotify
     xdg-utils
     glib # gsettings, para el color-scheme del portal
