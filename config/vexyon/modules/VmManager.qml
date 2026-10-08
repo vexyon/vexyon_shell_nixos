@@ -797,7 +797,7 @@ FloatingWindow {
                                 }
                                 Text {
                                     Layout.fillWidth: true
-                                    text: I18n.t("Open Settings → Virtualization for the exact setup steps for your system.")
+                                    text: I18n.t("Settings → Virtualization shows exactly what is missing and how to fix it.")
                                     color: Theme.subtext0; wrapMode: Text.Wrap
                                     horizontalAlignment: Text.AlignHCenter
                                     font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
@@ -2053,13 +2053,15 @@ FloatingWindow {
                                         tone: "warn"
                                         text: I18n.t("virtiofsd is not installed on this computer. A VM with a shared folder will refuse to start without it, so this is disabled.")
                                     }
+                                    //  3.0: virtiofsd lo instala Vexyon. Si falta,
+                                    //  se dice cómo volver a ponerlo, no qué teclear.
                                     Note {
                                         visible: Vm.detected && !Vm.has.virtiofs && Vm.platform === "nixos"
-                                        text: "virtualisation.libvirtd.qemu.vhostUserPackages = [ pkgs.virtiofsd ];"
+                                        text: I18n.t("Vexyon's NixOS module installs it. If it is missing, your configuration sets its own virtualisation.libvirtd.qemu.vhostUserPackages: add pkgs.virtiofsd to that list, or remove the line, and rebuild.")
                                     }
                                     Note {
                                         visible: Vm.detected && !Vm.has.virtiofs && Vm.platform === "arch"
-                                        text: "sudo pacman -S --needed virtiofsd"
+                                        text: I18n.t("Vexyon's installer installs it. Run ./install.sh again to put back what is missing.")
                                     }
                                     Repeater {
                                         model: Vm.detail.fs
@@ -2596,7 +2598,7 @@ FloatingWindow {
                         Text {
                             Layout.fillWidth: true
                             visible: cOs.value === "win11" && Vm.detected && !Vm.has.swtpm
-                            text: I18n.t("swtpm is not installed on this computer, so the TPM cannot be emulated and the VM will fail to start. Install it first (see Settings → Virtualization).")
+                            text: I18n.t("swtpm is missing on this computer, so the TPM cannot be emulated and the VM will fail to start. Settings → Virtualization says how to put it back.")
                             color: Theme.red; wrapMode: Text.Wrap
                             font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
                         }

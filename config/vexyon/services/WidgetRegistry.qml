@@ -54,16 +54,16 @@ Singleton {
         { type: "sysupdate",     name: I18n.t("System update"),desc: I18n.t("Checks for updates"),             icon: Icons.download,    group: "Utilidades" },
         { type: "appsdock",      name: I18n.t("Active apps / Dock"),    desc: I18n.t("Open and pinned apps"),                icon: Icons.bars,        group: "Utilidades" },
         // Virtualización: la pastilla de control en vivo de las VMs. Solo se
-        // ofrece en el catálogo cuando el interruptor de Ajustes →
-        // Virtualización está encendido, así que con él apagado no se puede
-        // ni añadir a la barra. ⚠️ Se pregunta a Config DIRECTAMENTE y no a
-        // `Vm.enabled`: preguntar al singleton Vm lo INSTANCIARÍA, y el
-        // catálogo se evalúa siempre — justo lo contrario de "coste cero con
-        // el interruptor apagado". Ver PROJECT_STATE.md.
+        // ofrece en el catálogo con el módulo «Virtual machines» activo
+        // (Ajustes → Módulos), así que con él apagado no se puede ni añadir a
+        // la barra. ⚠️ Se pregunta a `Modules` y no a `Vm.enabled`: preguntar
+        // al singleton Vm lo INSTANCIARÍA, y el catálogo se evalúa siempre —
+        // justo lo contrario de "coste cero con el módulo apagado". Ver
+        // PROJECT_STATE.md.
         { type: "vm",            name: I18n.t("Virtual machines"), desc: I18n.t("Live control of running VMs"), icon: Icons.desktop, group: "Sistema" },
         // Grabación de pantalla: el indicador (tiempo + parar) que SOLO existe
         // mientras se graba. Mismo trato que "vm": solo en el catálogo con el
-        // interruptor de Ajustes → Grabación de pantalla encendido.
+        // módulo «Screen recording» encendido.
         { type: "recorder",      name: I18n.t("Screen recording"), desc: I18n.t("Elapsed time and stop button, only while recording"), icon: Icons.record, group: "Sistema" },
         { type: "spacer",        name: I18n.t("Spacer"),             desc: I18n.t("Configurable empty space"),              icon: Icons.arrowsH,     group: I18n.t("Layout") },
         { type: "separator",     name: I18n.t("Separator"),              desc: I18n.t("Visual divider between widgets"),            icon: Icons.dragHandle,  group: I18n.t("Layout") }
@@ -73,8 +73,8 @@ Singleton {
     // apagado por interruptor. `catalog` sigue completo para que meta() sepa
     // pintar una pastilla ya colocada aunque su interruptor se apague después.
     readonly property var visibleCatalog: {
-        var vmOn = Config.get("virtualization", "enabled", false) === true;
-        var recOn = Config.get("recording", "enabled", false) === true;
+        var vmOn = Modules.vmOn;
+        var recOn = Modules.recorderOn;
         return root.catalog.filter(function(e) {
             return (e.type !== "vm" || vmOn) && (e.type !== "recorder" || recOn);
         });
@@ -214,7 +214,7 @@ Singleton {
     // the widget manager edits the full section().
     function barSection(name) {
         var list = section(name);
-        if (Config.get("recording", "enabled", false) === true) return list;
+        if (Modules.recorderOn) return list;
         return list.filter(function(e) { return e.type !== "recorder"; });
     }
 

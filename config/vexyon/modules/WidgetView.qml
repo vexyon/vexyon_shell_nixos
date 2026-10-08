@@ -97,8 +97,8 @@ Item {
         case "media":         openPanel("mediaPlayer"); break;
         case "clipboard":     openPanel("clipboardPanel"); break;
         case "vm":            openPanel("vmPanel"); break;
-        // Config primero: con el interruptor apagado no se toca Recorder.
-        case "recorder":      if (Config.get("recording", "enabled", false) === true) Recorder.stop(); break;
+        // Modules primero: con el módulo apagado no se toca Recorder.
+        case "recorder":      if (Modules.recorderOn) Recorder.stop(); break;
         case "cpu": case "memory": case "disk": case "cputemp": case "gputemp": openPanel("sysMonitor"); break;
         case "keyboardlayout": KeyboardState.cycle(); break;
         case "notes":         Quickshell.execDetached(["bash", "-c", "ghostty -e bash -c '${EDITOR:-nano} ~/notes.md' || true"]); break;
@@ -742,7 +742,7 @@ Item {
     Component { id: cRecorder
         Item {
             id: recW
-            readonly property bool live: Config.get("recording", "enabled", false) === true && Recorder.recording
+            readonly property bool live: Modules.recorderOn && Recorder.recording
             readonly property bool selfHide: !recW.live
             implicitWidth: recLd.item ? recLd.item.implicitWidth : 0
             implicitHeight: recLd.item ? recLd.item.implicitHeight : 0

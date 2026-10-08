@@ -26,6 +26,12 @@
         inherit (self.packages.${pkgs.stdenv.hostPlatform.system}) vexyon-shell;
       });
 
+      # Prueba en VM de Ajustes → Módulos (arranques reales, ver el fichero).
+      # Fuera de `checks` a propósito: necesita KVM, o mucha paciencia sin él.
+      tests = forAllSystems (pkgs: {
+        modules-gating = import ./nix/tests/modules-gating.nix { inherit self pkgs; };
+      });
+
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           packages = with pkgs; [ quickshell hyprland jq python3 ];

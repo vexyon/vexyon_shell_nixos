@@ -7,7 +7,7 @@ import qs.components
 
 // ============================================================================
 //  RecorderPanel — what to record. Opened by the recorder shortcut
-//  (Super+Shift+R by default), the launcher entry or Settings.
+//  (Super+Shift+V by default; Super+Shift+R before 3.0), the launcher entry or Settings.
 //
 //  Lives behind a LazyLoader in shell.qml (active = Panels.recorder AND the
 //  Screen recording switch): while closed there is no window and no object.

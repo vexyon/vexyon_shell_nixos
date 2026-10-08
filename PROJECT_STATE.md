@@ -6,6 +6,364 @@
 > instead of replacing it. The same entries are in both trees (`vexyon_shell`
 > for Arch/CachyOS and `vexyon_shell_nixos` for NixOS).
 
+## Permanent policies (read before any change)
+
+These are design and acceptance rules for every task, on both repositories.
+`AGENTS.md` (imported by `CLAUDE.md`) carries them with the practical
+checklists.
+
+### VEXYON OUT-OF-THE-BOX POLICY
+
+VEXYON OUT-OF-THE-BOX POLICY Every Vexyon feature must ship together with all required dependencies and system integration. A successful Vexyon installation must produce a fully functional shell without manual package installation, systemd commands or hand-editing system configuration. Optional features must be controllable through Vexyon Settings. Disabling them must prevent unnecessary exclusive runtime services from starting at the next boot while keeping the feature ready to be enabled again without reinstalling dependencies. This is a permanent design and acceptance requirement for every future Vexyon feature on both NixOS and Arch/CachyOS.
+
+### README policy
+
+PERMANENT POLICY: If Vexyon's installation changes, its GitHub README.md MUST be updated in the same development task. No exceptions.
+
+## Session: Vexyon 3.0 — optional modules (Settings → Modules) and out-of-the-box installation
+
+Version **3.0** (About page), **3.0.0** where semver is used (NixOS package).
+Also applies last session's pending request: the recorder's default shortcut
+is now **Super+Shift+V**.
+
+### Files changed
+
+Byte-identical in both trees unless the table says otherwise.
+
+| file | what |
+|---|---|
+| `config/vexyon/bin/vexyon-modules` | **new**. The module helper: `status` (any user), `set <id> on\|off` (root; as a user it re-runs the root-owned copy through pkexec), `boot-apply` (root, once per boot) |
+| `config/polkit/org.vexyon.modules.policy` | **new**. polkit action `org.vexyon.modules.set`: admin password (`auth_admin_keep`), active local sessions only, matched by exec path + `argv1 = set` |
+| `config/vexyon/services/Modules.qml` | **new**. The only place the shell asks whether an optional part is on: catalog, `vmOn` / `bluetoothOn` / `recorderOn`, active vs desired vs pending, `set()` with error mapping |
+| `config/vexyon/modules/Settings.qml` | **System → Modules** page; `ModuleCard` component (also at the top of Virtualization and Screen recording); setup recipes replaced by recovery help; About says 3.0 |
+| `config/vexyon/services/Vm.qml` | switch = `Modules.vmOn`; `kvm` group no longer required, `/dev/kvm` must exist; `start()` brings up the VM's stopped networks first; `setAutostart(on)` also autostarts its networks |
+| `config/vexyon/services/Bluetooth.qml` | BlueZ is not touched while the module is off this boot (`moduleOn` / `moduleOff`) |
+| `config/vexyon/services/Recorder.qml` | switch = `Modules.recorderOn` (still `recording.enabled` in shell.json, default now on) |
+| `shell.qml`, `Launcher.qml`, `WidgetRegistry.qml`, `WidgetView.qml` | every switch read goes through `Modules` |
+| `QuickSettingsPanel.qml` | Bluetooth tile says "Module off" and opens Settings → Modules |
+| `VmManager.qml` | virtiofsd / swtpm / "libvirt not ready" hints point to recovery, not install commands |
+| `RecorderPanel.qml` | comment only (shortcut) |
+| `services/I18n.qml` | 59 new Spanish strings; 64 strings of the removed setup recipes deleted |
+| `services/Icons.qml` | `puzzle` (fa-puzzle-piece) for the Modules page |
+| `config/vexyon/shell.json` | seed: `recording.enabled: true`, `virtualization: {}`, recorder bind `V` |
+| `share/vexyon/defaults/keybinds.json` | recorder bind `V` |
+| `install.sh` (Arch only) | packages, module system part, VM/Bluetooth/NetworkManager setup, migrations, 3.0 banner |
+| `config/vexyon/bin/vexyon-seed` (NixOS only) | one-time recorder shortcut migration |
+| `nix/module.nix` (NixOS only) | libvirt, Bluetooth, packages, firewall exceptions, boot unit, gating, migration |
+| `nix/package.nix` (NixOS only) | 3.0.0; root helper copy in `libexec/vexyon`; polkit action with the store path |
+| `nix/tests/modules-gating.nix`, `flake.nix` (NixOS only) | **new** VM test of the module gating across four boots; flake output `tests.<system>.modules-gating` (not in `checks`: it needs KVM) |
+| `README.md` (both, different) | install contract, what gets set up, Optional modules, version badge; NixOS README stale references fixed |
+| `CHANGELOG.md`, `AGENTS.md`, `CLAUDE.md` | **new**, identical in both repos |
+
+### Classification
+
+| kind | features |
+|---|---|
+| **Core** — always on | bar, launcher, panels, notifications, OSD, lock screen, greeter, wallpaper (awww daemon), clipboard history (`wl-paste --watch cliphist store`), night light (`hyprsunset`), the bridge, polkit agent, portals; system: PipeWire/WirePlumber/pipewire-pulse, NetworkManager, UPower, power-profiles-daemon, udisks2 (D-Bus activated), PAM, GPU pin udev rules |
+| **Optional module, system scope** (restart) | `vm` — libvirt/QEMU and the VM manager; `bluetooth` — BlueZ and the Bluetooth controls |
+| **Optional module, session scope** (instant) | `recorder` — screen recording UI; no service |
+| **On demand** — nothing resident | calculator, screenshots, color picker (hyprpicker), file manager transfers, sshfs mounts, OVA import/export, weather fetch, update count, wallpaper generator, `wf-recorder` while recording, `vexyon-modules` itself, libvirtd after boot (socket-activated, exits after 120 s idle) |
+
+Considered and **not** made modules: clipboard history and night light. Both
+are one small resident process started by `hyprland.lua`; making them modules
+would need the shell to own those processes and a refresh of every installed
+`hyprland.lua` (on NixOS `vexyon-seed` never overwrites it). Left as core and
+listed under "Resource consumers" below.
+
+### How a system module works
+
+```
+Settings switch ── Modules.set() ── vexyon-modules set vm off   (user)
+                                      └─ pkexec <root copy> set vm off
+                                           polkit org.vexyon.modules.set (admin password)
+                                           └─ /var/lib/vexyon/modules/vm.disabled   (desired)
+
+next boot: vexyon-modules.service (Before=sysinit.target) ── boot-apply
+             /run/vexyon/modules/vm.disabled   applied: off this boot
+             /run/vexyon/modules/vm.gated      services may not start
+               (or vm.shared if other software uses libvirt: not gated)
+
+every libvirt unit:  ConditionPathExists=!/run/vexyon/modules/vm.gated
+                     Wants= + After=vexyon-modules.service
+```
+
+- **Desired state:** `/var/lib/vexyon/modules/<id>.disabled`; no file = on.
+  Directory root:root 0755, files 0644, written atomically (temp file in the
+  same directory, `sync`, `mv`) and only by the root helper. Unknown files
+  there are left alone. Survives logouts, reboots, updates and (NixOS)
+  generation switches. Fresh installs have no file: everything on.
+- **Applied state:** `/run/vexyon/modules/` (tmpfs, so per boot), plus
+  `boot_id`. The shell's UI follows the applied state, so the VM manager stays
+  usable until the restart after turning it off; the card shows
+  "On until the next restart" and Settings → Modules a banner with a
+  "Restart…" button that opens the normal power menu.
+- **Only at boot:** `boot-apply` checks `systemctl is-system-running` and acts
+  only while it is `initializing` (before `basic.target`). Started later — a
+  `nixos-rebuild switch` starting the new unit, an installer re-run — it
+  applies nothing. So no socket that is already listening ever gets gated
+  under a running daemon, and a choice never takes effect mid-session.
+- **Gating** uses a start condition, so a gated unit does not start by any
+  route: boot target, socket activation (the sockets themselves are gated),
+  D-Bus activation (`dbus-org.bluez.service` is the same unit), or a
+  dependency. A unit that is already running is never stopped.
+- **Fail-open:** no snapshot (boot unit missing, helper broken, first boot
+  after installing) → nothing gated → everything starts as before 3.0. If the
+  helper is missing, the cards say so and the switches are disabled.
+- **Least privilege:** the QML gets exactly one privileged operation,
+  `set <vm|bluetooth> <on|off>`, validated by the root copy (whitelist, refuses
+  non-root-owned or symlinked state directories, fixed paths, no environment
+  used as root). pkexec clears the environment; the NixOS copy sets its own
+  fixed `PATH`. No daemon, no setuid binary of ours, nothing writable by the
+  user that root later executes (the Arch root copy is
+  `/usr/local/lib/vexyon/vexyon-modules`, never the one in `~/.config`).
+- **Shared services** (`module_consumers` in the helper, checked at each
+  boot, existence tests only — nothing found is executed as root):
+  `vm` is shared when virt-manager, cockpit-machines or minikube's kvm2
+  driver is installed (they use the system libvirtd; GNOME Boxes and plain
+  virt-install use the per-user `qemu:///session` and do not count).
+  `bluetooth` is shared when Blueman, Blueberry, Overskride or another
+  desktop (GNOME Shell, Plasma, COSMIC, Cinnamon, Budgie) is installed. A
+  shared module that is off only hides Vexyon's part; the card names the
+  software.
+- **Never gated** (shared with the rest of the system): polkit, D-Bus,
+  NetworkManager, PipeWire, systemd-machined, the firewall (iptables /
+  nftables / firewalld), `dnsmasq.service` (libvirt runs its own dnsmasq
+  instances, which are not a unit).
+
+### Session module (screen recording)
+
+`recording.enabled` in shell.json, as before 3.0, read through
+`Modules.recorderOn`; applies at once. It never had a resident process: the
+singleton is not even created while it is off.
+
+### NixOS
+
+`services.vexyon = { enable = true; user = "…"; };` is the whole setup:
+
+- `virtualisation.libvirtd.enable = mkDefault true` with `qemu.package =
+  mkDefault pkgs.qemu_kvm`, `swtpm.enable`, `vhostUserPackages = [ virtiofsd ]`;
+  `virt-viewer`; the user in `libvirtd`.
+- `hardware.bluetooth.enable = mkDefault true`.
+- `wf-recorder`, `hyprpicker`, `pulseaudio` (only `pactl`), `psmisc` (`fuser`).
+- Firewall: the `virbr*` exceptions that Settings used to ask users to paste
+  (iptables: rpfilter RETURN; nftables: rpfilter accept, DHCP/DNS input,
+  forward when `filterForward`), only for the flavour in use.
+- `systemd.services.vexyon-modules` (`DefaultDependencies = false`,
+  `WantedBy = sysinit.target`, `restartIfChanged = false`) and `moduleGate`
+  on `libvirtd`, `libvirtd-config`, `libvirt-guests`, `virtlogd`, `virtlockd`,
+  `virt-secret-init-encryption` (services) and `libvirtd`, `libvirtd-ro`,
+  `libvirtd-admin`, `virtlogd`, `virtlogd-admin`, `virtlockd`,
+  `virtlockd-admin` (sockets), plus `bluetooth`. The conditions are added only
+  when those services exist (no stub units if the user turns libvirt or
+  Bluetooth off in their own configuration).
+- `ConditionPathExists` is given as a list so it merges with any other
+  condition instead of conflicting.
+- **Toggling never needs a rebuild:** the units are always in the system;
+  the boot unit decides.
+- Migration (`system.activationScripts.vexyonModules`): once, if the user's
+  shell.json says `virtualization.enabled == false` (the 2.x switch), the VM
+  module is set off. Marked done only when the home directory was readable.
+  A symlinked or broken shell.json is ignored.
+
+### Arch / CachyOS (install.sh)
+
+- Core packages added: `hyprpicker pacman-contrib libpulse psmisc`.
+- Module packages, own transaction (a conflict there does not stop the rest of
+  the install): `wf-recorder bluez libvirt dnsmasq virt-viewer swtpm virtiofsd
+  edk2-ovmf`, `qemu-desktop` only if no QEMU is installed (`qemu-full` /
+  `qemu-base` conflict with it and `pacman --noconfirm` would abort), `nftables`
+  only if neither `nft` nor `iptables` exists. Names are the ones the project
+  already used in Settings and from knowledge of the Arch repos; this session
+  could not query archlinux.org (blocked by the container's network policy),
+  so they are **not verified against the live repositories**.
+- System part of modules: helper at `/usr/local/lib/vexyon/vexyon-modules`
+  (root 0755), the polkit action in `/usr/share/polkit-1/actions/`,
+  `/etc/systemd/system/vexyon-modules.service` (enabled), and
+  `/etc/systemd/system/<unit>.d/50-vexyon-modules.conf` for `libvirtd`
+  (+ `.socket`, `-ro`, `-admin`, `-tcp`, `-tls`), `virtlogd` / `virtlockd`
+  (+ sockets, admin sockets), `libvirt-guests`, `virt-secret-init-encryption`
+  and `bluetooth.service`. `daemon-reload` only; nothing restarted.
+- VMs: `systemctl enable libvirtd.service` (daemon at boot for autostart VMs,
+  sockets via `Also=`), sockets started now if the module is on, user added to
+  `libvirt`, libvirt's default network defined if missing (not started), and
+  `firewall_backend = "iptables"` appended to `/etc/libvirt/network.conf`
+  when Docker or ufw is installed and no backend was set. Left alone: a masked
+  `libvirtd`, an existing modular-daemon setup (`virtqemud`), a backend line
+  someone wrote.
+- Bluetooth: `bluetooth.service` enabled (and started if the module is on);
+  masked stays masked.
+- NetworkManager: enabled (from the next boot, not started) only if no other
+  manager is enabled or active (`systemd-networkd`, `connman`, `dhcpcd`, `iwd`,
+  `netctl`, `wicd`). Before 3.0 it was installed but never enabled.
+- Migration: same rule as NixOS, marker `/var/lib/vexyon/modules/.migrated-3.0`.
+- `libvirt-guests` is **not** enabled on Arch (it is on NixOS by the
+  libvirtd module): enabling it would change what happens to running VMs at
+  shutdown (managed save instead of being stopped), which is a behaviour
+  change outside this task. Its unit is still gated if someone enables it.
+
+### Resource consumers
+
+| what | when the module is on | when it is off |
+|---|---|---|
+| libvirtd | at boot (starts autostart VMs), exits after 120 s idle (`--timeout 120`), socket-activated afterwards | no process, no listening socket |
+| virtlogd / virtlockd | socket-activated, run while VMs run | no process, no socket |
+| dnsmasq (per active libvirt network) | 2 processes, 3.7 MiB measured last session, while the network is active; networks now start with the VM that needs them unless marked autostart | none (libvirtd never starts) |
+| libvirt-guests (NixOS) | oneshot at boot/shutdown | skipped |
+| bluetoothd | only with an adapter (its own condition) | no process, D-Bus activation refused |
+| Vm / Recorder singletons, VM manager, VM panel | created when used | never created |
+| `vexyon-modules status` | one short run at shell start, then only after a change or when Settings → Modules opens | same |
+| clipboard watcher, hyprsunset (core) | one small process each, always | — |
+
+Not measured this session: bluetoothd's RSS (no adapter in any lab), and the
+shell's own RAM difference with modules on/off.
+
+### VM manager changes (behaviour kept, two fixes)
+
+Creation, start/stop, progress, monitor/workspace placement, the windowed
+viewer, the dGPU viewer, existing networks and storage are unchanged. Two
+changes, both measured against real libvirt 12.2 in the lab:
+
+- `start()` first starts the VM's networks that are stopped. Before: with the
+  `default` network stopped, Start failed with
+  `network 'default' is not active` (NixOS defines `default` without
+  autostart; OVA imports hit it too). After: both networks come up and the VM
+  starts.
+- `setAutostart(on)` also marks the VM's networks autostart (a VM started by
+  libvirt at boot has nobody to start its networks). Turning autostart off does
+  not touch networks (another VM may need them). A failing `virsh autostart`
+  is still reported (exit 1).
+
+### Super+Shift+V for the recorder
+
+Seeds use `V`. Existing installs: moved once (marker
+`state.migrations: ["recorder-super-shift-v"]` in shell.json), only if the
+recorder is still on the old default Super+Shift+R and Super+Shift+V is free.
+Arch: `seed_media_keybinds` in install.sh; NixOS: `seed_late_keybinds` in
+vexyon-seed. A user who later picks R again keeps it.
+
+### Verified (cloud container — NOT the owner's machines)
+
+- **NixOS package:** `nix build` of `vexyon-shell-3.0.0` against nixos-26.05.
+  The polkit action names the store path of the root copy
+  (`…/libexec/vexyon/vexyon-modules`, `argv1 = set`); that copy's wrapper sets
+  a fixed `PATH`; the `bin/` wrapper exports `VEXYON_MODULES_HELPER`. The
+  policy file is well-formed XML.
+- **NixOS module, evaluated as full systems** (only `services.vexyon = {
+  enable; user; }` plus a user): toplevel evaluates with the iptables firewall
+  and with nftables + `filterForward`; libvirtd on with `qemu_kvm`, swtpm,
+  virtiofsd; Bluetooth on; the user in `libvirtd`; `wf-recorder`,
+  `hyprpicker`, `pulseaudio`, `psmisc`, `virt-viewer` installed; the firewall
+  lines land only in the flavour in use; every gated unit carries
+  `ConditionPathExists=!/run/vexyon/modules/<id>.gated` + `Wants`/`After`;
+  `/share/polkit-1` is linked into the system profile. With the user's own
+  `virtualisation.libvirtd.enable = false` and `hardware.bluetooth.enable =
+  false`: no stub units, no `libvirtd` group, no `virt-viewer`, no firewall
+  line.
+- **NixOS boot test** (`nix/tests/modules-gating.nix`, a real NixOS VM
+  under QEMU — software emulation here, no KVM — with only
+  `services.vexyon = { enable; user; }`; passed, four boots, ~10 min):
+  - boot 1: `vexyon-modules.service` ran before sysinit; status all on;
+    libvirt sockets listening, `virsh` answers; bluetoothd starts; the user is
+    in `libvirtd`; restarting the boot unit mid-session logged "nothing
+    applied now".
+  - turning VM off as the unprivileged user through the real path
+    (`vexyon-modules` → pkexec → polkit action → root store copy) and
+    Bluetooth off as root: root 0644 files in a root 0755 directory; the user
+    cannot write there; unknown module ids and values are refused; everything
+    keeps running this boot ("desired=off applied=on").
+  - boot 2: `libvirtd.service`, `libvirtd.socket`, `-ro`, `-admin`,
+    `virtlogd.socket`, `virtlockd.socket`, `libvirt-guests`,
+    `libvirtd-config` all inactive with `ConditionResult=no`; no libvirt
+    socket file; no libvirtd, virtlogd, dnsmasq or bluetoothd process; a
+    direct `systemctl start libvirtd`, a `virsh` connection and a D-Bus
+    `StartServiceByName org.bluez` all leave them stopped; polkit and
+    NetworkManager still active; the VM disk and definition still there;
+    virsh, virt-viewer, wf-recorder still installed.
+  - boot 3 (VM still off, a `virt-manager` present, Bluetooth back on): VM
+    reported `shared=1 consumers=virt-manager`, not gated, libvirt answers;
+    Bluetooth starts again.
+  - boot 4 (VM back on): libvirt answers and the test VM is listed with its
+    data, nothing reinstalled.
+  - Test-only adjustments, not part of what is tested: fonts removed from the
+    VM, the bluetooth kernel module loaded (there is no adapter), a polkit rule
+    standing in for the password dialog, longer device timeouts for emulation.
+- **NixOS migration** (the real activation script, run as root against a fake
+  home): 2.x switch off → `vm.disabled`; switch on, no shell.json, broken JSON
+  or a symlinked shell.json → module stays on; turned on later and rebuilt →
+  stays on (one-time marker); home directory missing (e.g. not mounted yet) →
+  nothing marked, retried at the next activation.
+- **Recorder shortcut migration** (the real Python from `install.sh` and from
+  `vexyon-seed`): old default with V free → moved; V taken → kept on R; custom
+  bind → untouched; R chosen after the migration → untouched; no recorder bind
+  → seeded on V. A second run changes nothing.
+- **Arch static checks:** `bash -n install.sh`; `shellcheck -S warning` on
+  `install.sh` and `vexyon-modules` (only the pre-existing SC2154 on the ERR
+  trap); the installer's real `install_modules_system` / `write_gate` code run
+  into a scratch root (with `systemctl` stubbed) produces the helper, the
+  polkit action, the boot unit and 15 drop-ins, and `systemd-analyze verify`
+  accepts the boot unit and the drop-ins on top of the unit they extend.
+- **Helper:** `status` with no state (all on, `boot=0`); `set` as root writes
+  root 0644 files atomically; a run outside boot (`systemctl
+  is-system-running` = offline/running) applies nothing; `boot-apply --force`
+  snapshots and gates; a second run in the same boot changes nothing; as a
+  normal user without the system part, `set` exits 3 with "not installed",
+  `boot-apply` refuses.
+- **QML lab** (Quickshell 0.3.0 under headless sway, Mesa llvmpipe, the real
+  shell tree in the Arch layout, the real helper; a lab-only IPC hook opened
+  pages): Settings → Modules in every state — not installed, on, "On until the
+  next restart" (after switching VM off from the UI: the root file appeared),
+  off after a simulated boot (VM manager not loaded, Virtualization page shows
+  only the card), "Off until the next restart"; a dismissed password dialog
+  (pkexec exit 126, from a stand-in) → "Cancelled — nothing was changed." and
+  the switch back where it was; screen recording off/on applies at once and is
+  written to shell.json; Bluetooth tile "Module off"; Screen recording page
+  shows Super+Shift+V; About shows 3.0. No new QML warning in the log.
+  qmllint, old vs new: no new warning categories; it found one duplicated id
+  in Settings.qml (introduced here), fixed.
+- **VM manager vs real libvirt 12.2** (lab daemon in its own network
+  namespace, temporary test VM and network, both deleted afterwards): the old
+  Start fails with `network 'default' is not active`; the new one starts both
+  of the VM's networks and the VM. Autostart on marks the VM's networks
+  autostart; off leaves networks alone; a failing `virsh autostart` still
+  exits 1.
+- **Shared files:** every changed file under `config/`, `share/` and the new
+  root files are `cmp`-identical in both repos; the only differences left are
+  the platform-specific files listed in `AGENTS.md`.
+
+### Not verified (and why)
+
+- **No Arch/CachyOS system here** and archlinux.org is blocked: the installer
+  never ran end to end; the Arch package names were not checked against the
+  live repositories; Arch's real libvirt unit list is assumed to be upstream's
+  (a drop-in for a unit that does not exist is inert).
+- **The polkit password dialog with a person:** the NixOS boot test replaces
+  the dialog with a test-only polkit rule; the rest of that path (pkexec, the
+  action match on path + `set`, the root copy) is real. The lab shell ran as
+  root, so it took the direct path.
+- **Hyprland itself:** the QML ran under sway.
+- **Real hardware:** KVM acceleration, Bluetooth adapters, hybrid GPUs, a
+  CachyOS install with ufw enabled — none available.
+- **bluetoothd's memory**, and the shell's RAM with modules on vs off: not
+  measured.
+
+### To check by hand on the tower
+
+1. Arch: `git pull && ./install.sh`, reboot. Settings → Modules: three cards,
+   all "On". `systemctl status vexyon-modules` ran at boot.
+2. NixOS: update the input, rebuild, reboot. Same check. If your
+   configuration still has the 2.x lines (`virtualisation.libvirtd…`,
+   `virt-viewer`, firewall lines), the build must still succeed; they can be
+   removed afterwards.
+3. Turn Virtual machines off: the password dialog appears once; the card says
+   "On until the next restart"; a VM that is running keeps running.
+4. Reboot: `systemctl status libvirtd.socket libvirtd.service` → "skipped,
+   unmet condition"; `pgrep -a libvirtd dnsmasq` → nothing; Super+V opens
+   Settings → Virtualization. `ls /var/lib/libvirt/images` unchanged.
+5. Turn it back on, reboot: the VM manager lists your VMs (Ryoku2 included)
+   exactly as before.
+6. Same for Bluetooth with a headset.
+7. Recorder: Super+Shift+V opens it (if the old default R was still in place).
+
 ## Session: audio silent below ~8% volume, profile photo shows only the initial
 
 ### Files changed

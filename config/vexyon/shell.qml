@@ -63,32 +63,32 @@ ShellRoot {
     Component { id: fmFactory; FileManager {} }
     GlobalShortcut { appid: "quickshell"; name: "filemanager";   onPressed: fmFactory.createObject(shell) }
 
-    // Super+V: gestor de VMs, con salida por si no está encendido.
-    //  ⚠️ Se lee Config DIRECTAMENTE, NUNCA `Vm.enabled`: tocar el singleton
-    //  aquí lo instanciaría en cada arranque y se acabó el coste cero con el
-    //  interruptor apagado. Es el mismo motivo por el que los otros tres sitios
-    //  que preguntan por virtualización (catálogo de widgets, lanzador y los
-    //  LazyLoader de abajo) tampoco lo tocan.
+    // Super+V: gestor de VMs, con salida por si el módulo no está activo.
+    //  ⚠️ Se pregunta a `Modules.vmOn`, NUNCA a `Vm.enabled`: tocar el
+    //  singleton aquí lo instanciaría en cada arranque y se acabó el coste
+    //  cero con el módulo apagado. Es el mismo motivo por el que los otros
+    //  tres sitios que preguntan por virtualización (catálogo de widgets,
+    //  lanzador y los LazyLoader de abajo) tampoco lo tocan.
     //  Apagado NO significa no hacer nada: lleva a Ajustes → Virtualización,
-    //  que es donde se enciende y donde están las instrucciones de instalación.
-    //  Encenderlo lo hace el usuario, no el atajo.
+    //  que dice si el módulo está apagado o pendiente de reinicio y lo
+    //  enciende. Encenderlo lo hace el usuario, no el atajo.
     GlobalShortcut {
         appid: "quickshell"; name: "vmmanager"
         onPressed: {
-            if (Config.get("virtualization", "enabled", false) === true) Panels.open("vmManager");
+            if (Modules.vmOn) Panels.open("vmManager");
             else Panels.openSettingsAt("virtualization");
         }
     }
 
-    // Super+Shift+R: grabación de pantalla. Grabando → para. Si no → abre el
+    // Super+Shift+V (Super+Shift+R antes de 3.0): grabación de pantalla. Grabando → para. Si no → abre el
     // selector (qué grabar). Apagado en Ajustes → lleva a Ajustes → Grabación
     // de pantalla, igual que Super+V con las VMs.
-    //  ⚠️ Config PRIMERO y return antes de tocar `Recorder`: con el
-    //  interruptor apagado el singleton no se crea nunca.
+    //  ⚠️ Modules PRIMERO y return antes de tocar `Recorder`: con el
+    //  módulo apagado el singleton no se crea nunca.
     GlobalShortcut {
         appid: "quickshell"; name: "recorder"
         onPressed: {
-            if (Config.get("recording", "enabled", false) !== true) { Panels.openSettingsAt("recording"); return; }
+            if (!Modules.recorderOn) { Panels.openSettingsAt("recording"); return; }
             if (Recorder.recording) Recorder.stop();
             else if (Panels.recordRegion) Panels.close("recordRegion");
             else Panels.toggle("recorder");
@@ -140,19 +140,20 @@ ShellRoot {
     }
     // Virtualización: gestor de VMs + panel de barra. AMBOS detrás del mismo
     // LazyLoader, con la MISMA forma que el de Onboarding de arriba. Con el
-    // interruptor apagado (que es el defecto) el Loader está inactivo y estos
-    // dos árboles NO EXISTEN: ni ventana, ni PanelWindow, ni el singleton Vm
-    // (nadie lo referencia), ni un solo proceso. Encenderlo los crea; apagarlo
-    // los destruye y la RAM vuelve.
+    // módulo «Virtual machines» apagado en este arranque el Loader está
+    // inactivo y estos dos árboles NO EXISTEN: ni ventana, ni PanelWindow, ni
+    // el singleton Vm (nadie lo referencia), ni un solo proceso. El módulo se
+    // aplica por arranque (Modules.vmOn no cambia hasta reiniciar), así que
+    // apagarlo deja el gestor usable hasta entonces.
     //
-    // ⚠️ Se consulta Config DIRECTAMENTE y no `Vm.enabled`: preguntar al
+    // ⚠️ Se consulta `Modules.vmOn` y no `Vm.enabled`: preguntar al
     // singleton lo instanciaría, que es justo lo que este Loader evita.
     LazyLoader {
-        active: Config.ready && Config.get("virtualization", "enabled", false) === true
+        active: Modules.vmOn
         VmManager {}
     }
     LazyLoader {
-        active: Config.ready && Config.get("virtualization", "enabled", false) === true
+        active: Modules.vmOn
         VmPanel {}
     }
     // Calculadora: solo existe mientras está abierta. Panels.toggle fija
@@ -163,9 +164,9 @@ ShellRoot {
         Calculator {}
     }
     // Grabación: el selector solo existe mientras está abierto, y nunca con
-    // el interruptor apagado (Config leído directamente, no Recorder.enabled).
+    // el módulo apagado (Modules.recorderOn, no Recorder.enabled).
     LazyLoader {
-        active: Panels.recorder && Config.get("recording", "enabled", false) === true
+        active: Panels.recorder && Modules.recorderOn
         RecorderPanel {}
     }
     ScreenshotOverlay {}

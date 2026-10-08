@@ -99,15 +99,15 @@ PanelWindow {
     //  keywords), pero al activarlas se abre la ventana del shell en vez de
     //  lanzar un proceso (ver launch()).
     //
-    //  El gestor de VMs SOLO aparece con el interruptor de Ajustes →
-    //  Virtualización encendido: apagado, esta lista sale vacía y no hay
-    //  entrada de lanzador que valga. ⚠️ Se lee Config y no `Vm.enabled` a
-    //  propósito: preguntar al singleton Vm lo instanciaría.
-    //  La grabadora, igual: solo con Ajustes → Grabación de pantalla
-    //  encendido, y leyendo Config, no `Recorder.enabled`.
+    //  El gestor de VMs SOLO aparece con el módulo «Virtual machines» activo
+    //  en este arranque (Ajustes → Módulos): apagado, esta lista sale vacía y
+    //  no hay entrada de lanzador que valga. ⚠️ Se pregunta a `Modules` y no a
+    //  `Vm.enabled` a propósito: preguntar al singleton Vm lo instanciaría.
+    //  La grabadora, igual: solo con el módulo «Screen recording» encendido,
+    //  y preguntando a `Modules`, no a `Recorder.enabled`.
     function shellEntries() {
         var out = [];
-        if (Config.get("virtualization", "enabled", false) === true) out.push({
+        if (Modules.vmOn) out.push({
             shellPanel: "vmManager",
             id: "vexyon-vm-manager",
             name: I18n.t("Virtual machines"),
@@ -117,7 +117,7 @@ PanelWindow {
             icon: "virt-viewer",
             noDisplay: false
         });
-        if (Config.get("recording", "enabled", false) === true) out.push({
+        if (Modules.recorderOn) out.push({
             shellPanel: "recorder",
             id: "vexyon-screen-recorder",
             name: I18n.t("Screen recorder"),

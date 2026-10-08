@@ -247,7 +247,7 @@
         "SUPER",
         "SHIFT"
       ],
-      "key": "R",
+      "key": "V",
       "action": "global",
       "arg": "recorder",
       "desc": "Screen recording: open the recorder / stop recording",
@@ -567,10 +567,8 @@
       "desc": "Resize floating window (hold Super + Right click)"
     }
   ],
-  "virtualization": {
-    "enabled": false
-  },
+  "virtualization": {},
   "recording": {
-    "enabled": false
+    "enabled": true
   }
 }

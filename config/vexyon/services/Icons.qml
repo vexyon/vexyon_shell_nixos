@@ -103,4 +103,5 @@ Singleton {
     readonly property string copy:        "\uf0c5"   // fa-copy (clipboard entry)
     readonly property string record:      "\uf111"   // fa-circle (screen recording)
     readonly property string stop:        "\uf04d"   // fa-stop (stop recording)
+    readonly property string puzzle:      "\uf12e"   // fa-puzzle-piece (Settings → Modules)
 }

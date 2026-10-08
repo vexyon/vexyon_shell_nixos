@@ -11,14 +11,18 @@ import qs.services
 //  the shell and the recorder: the picker, the bar indicator and the Settings
 //  page all read from here, and nobody else starts a recording.
 //
-//  Backend: wf-recorder is an opt-in HOST prerequisite, exactly like
-//  libvirt/QEMU for the VM manager. It is not in the Nix module nor in
-//  install.sh; Settings → Screen recording detects it and shows the install
-//  lines for the running OS. Video comes from the compositor's screencopy
-//  protocol (the same one grim uses for screenshots), sound from PipeWire
-//  through its PulseAudio server (pipewire-pulse, already a shell dependency).
+//  Backend: wf-recorder, installed by Vexyon itself (install.sh on Arch, the
+//  NixOS module) like every other dependency since 3.0. Settings → Screen
+//  recording still detects it, so a broken install says what is missing.
+//  Video comes from the compositor's screencopy protocol (the same one grim
+//  uses for screenshots), sound from PipeWire through its PulseAudio server
+//  (pipewire-pulse, already a shell dependency).
 //
-//  ZERO COST WITH THE SWITCH OFF — the rule above everything:
+//  The switch is the "Screen recording" module (Settings → Modules,
+//  services/Modules.qml). It is a session module: no service behind it, so
+//  it applies at once.
+//
+//  ZERO COST WITH THE MODULE OFF — the rule above everything:
 //   * No Process here has `running: true`. Each starts from a function, and
 //     every public function returns early when `enabled` is false.
 //   * No Timer at all. `recording` IS the recorder process's running state;
@@ -26,16 +30,18 @@ import qs.services
 //     disappears when it exits — no polling. Elapsed seconds come from the
 //     shared Time clock, which only ticks per second while someone (the
 //     indicator, while it exists) holds a Time.ssWatchers reference.
-//   * The places that must not create this singleton while the switch is off
-//     (bar, widget catalog, launcher, shell.qml, Settings) read Config
-//     DIRECTLY, Config first: `Config... === true && Recorder.x` stops at the
-//     first operand, so the singleton is never touched. Same rule as Vm.
+//   * The places that must not create this singleton while the module is off
+//     (bar, widget catalog, launcher, shell.qml, Settings) ask Modules first:
+//     `Modules.recorderOn && Recorder.x` stops at the first operand, so the
+//     singleton is never touched. Same rule as Vm.
 // ============================================================================
 Singleton {
     id: root
 
     // ---- switch and options (shell.json "recording") -------------------------
-    readonly property bool enabled: Config.get("recording", "enabled", false) === true
+    //  `enabled` mirrors the module; `recording.enabled` stays the key in
+    //  shell.json, so a choice made before 3.0 is kept.
+    readonly property bool enabled: Modules.recorderOn
     readonly property string audio: Config.get("recording", "audio", "system")   // none | system | mic
     readonly property string format: Config.get("recording", "format", "mp4")    // mp4 | mkv
     readonly property string dir: Config.get("recording", "dir", "~/Videos/Recordings")

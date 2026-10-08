@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  vexyon-modules — Vexyon's optional modules (Settings → Modules).
+#
+#  ONE script with three jobs. The same file ships in both repos.
+#
+#    status                 Any user, read-only. One line per module, parsed
+#                           by services/Modules.qml.
+#    set <module> on|off    Root only. Records the choice for the NEXT boot and
+#                           touches nothing that is running. As a normal user
+#                           it hands over to the root-owned copy through
+#                           pkexec (polkit action org.vexyon.modules.set,
+#                           admin password), so the shell never gets more than
+#                           this one narrow, validated operation.
+#    boot-apply             Root only, once per boot, from
+#                           vexyon-modules.service (ordered before
+#                           sysinit.target). Freezes this boot's module state
+#                           in /run and decides which services are gated.
+#
+#  State
+#    /var/lib/vexyon/modules/<id>.disabled  desired: off from the next boot on
+#    /run/vexyon/modules/<id>.disabled      applied: was off when this boot began
+#    /run/vexyon/modules/<id>.gated         its services may not start this boot
+#    /run/vexyon/modules/<id>.shared        off, but other software uses its
+#                                           services, so they were not gated
+#    /run/vexyon/modules/boot_id            the boot the snapshot belongs to
+#
+#  Every service of a module carries a systemd drop-in with
+#      ConditionPathExists=!/run/vexyon/modules/<id>.gated
+#  so a gated service, socket or D-Bus activation simply does not start: no
+#  process, no listening socket, nothing to poll. Packages stay installed and
+#  user data (VM disks, pairings, settings) is never touched.
+#
+#  Failure is always "on": no snapshot (unit missing, helper broken, first
+#  boot after installing) means nothing is gated and everything starts as it
+#  did before modules existed.
+#
+#  Modules
+#    vm         libvirt/QEMU for the VM manager. Units: libvirtd(.socket,
+#               -ro, -admin), virtlogd, virtlockd, libvirt-guests,
+#               libvirtd-config (NixOS), virt-secret-init-encryption.
+#    bluetooth  BlueZ. Unit: bluetooth.service (also its D-Bus activation).
+#    Screen recording is a module too, but a session one: it runs no service,
+#    so the shell switches it in shell.json and it never comes through here.
+#
+#  Shared services are never gated. If other software that needs a module's
+#  service is installed (virt-manager and cockpit-machines use the same system
+#  libvirt; GNOME, Plasma or Blueman use the same BlueZ), turning the module
+#  off only hides Vexyon's own part and the service keeps starting. The check
+#  only tests whether files exist; as root it never runs anything it finds.
+# ============================================================================
+set -u
+umask 022
+export LC_ALL=C
+
+readonly STATE_DIR=/var/lib/vexyon/modules
+readonly RUN_DIR=/run/vexyon/modules
+readonly ROOT_HELPER=/usr/local/lib/vexyon/vexyon-modules
+readonly MODULES="vm bluetooth"
+
+fail() {
+  local code=$1
+  shift
+  printf 'vexyon-modules: %s\n' "$*" >&2
+  exit "$code"
+}
+
+usage() {
+  cat <<'EOF'
+usage: vexyon-modules status
+       vexyon-modules set <vm|bluetooth> <on|off>
+       vexyon-modules boot-apply [--force]
+EOF
+  exit "${1:-2}"
+}
+
+is_module() {
+  local m
+  for m in $MODULES; do [ "$m" = "$1" ] && return 0; done
+  return 1
+}
+
+# The unit that must exist for the module to be installed at all.
+module_unit() {
+  case "$1" in
+    vm) echo libvirtd.service ;;
+    bluetooth) echo bluetooth.service ;;
+  esac
+}
+
+unit_exists() {
+  local d
+  for d in /etc/systemd/system /run/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+    [ -e "$d/$1" ] && return 0
+  done
+  return 1
+}
+
+# Hardware the module needs. Reported, never enforced: without it the
+# services' own conditions keep them idle anyway.
+module_hardware() {
+  local f
+  case "$1" in
+    vm) [ -e /dev/kvm ] ;;
+    bluetooth)
+      for f in /sys/class/bluetooth/hci*; do [ -e "$f" ] && return 0; done
+      return 1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# Existence test only — never executes what it finds.
+have_bin() {
+  local d
+  for d in /usr/bin /usr/local/bin /run/current-system/sw/bin \
+           /etc/profiles/per-user/*/bin /home/*/.nix-profile/bin; do
+    [ -e "$d/$1" ] && return 0
+  done
+  return 1
+}
+
+# Other installed software that uses the module's system service, comma
+# separated. Not a consumer: GNOME Boxes and a plain virt-install, which use
+# the per-user qemu:///session libvirt, not the system daemon.
+module_consumers() {
+  local out=() b
+  case "$1" in
+    vm)
+      have_bin virt-manager && out+=(virt-manager)
+      if [ -e /usr/share/cockpit/machines/manifest.json ] ||
+         [ -e /run/current-system/sw/share/cockpit/machines/manifest.json ]; then
+        out+=(cockpit-machines)
+      fi
+      have_bin docker-machine-driver-kvm2 && out+=(minikube)
+      ;;
+    bluetooth)
+      for b in blueman-manager blueberry overskride gnome-shell plasmashell \
+               cosmic-comp cinnamon budgie-desktop; do
+        have_bin "$b" && out+=("$b")
+      done
+      ;;
+  esac
+  local IFS=,
+  printf '%s' "${out[*]:-}"
+}
+
+current_boot_id() {
+  cat /proc/sys/kernel/random/boot_id 2>/dev/null || true
+}
+
+# The snapshot in /run belongs to this boot (it always does once the boot unit
+# ran; /run is a tmpfs). Without it nothing is gated.
+snapshot_current() {
+  local cur
+  cur=$(current_boot_id)
+  [ -n "$cur" ] && [ -r "$RUN_DIR/boot_id" ] && [ "$(cat "$RUN_DIR/boot_id" 2>/dev/null)" = "$cur" ]
+}
+
+cmd_status() {
+  [ $# -eq 0 ] || usage
+  local booted=0 m desired applied gated shared avail hw cons
+  snapshot_current && booted=1
+  local os
+  os=$(sed -n 's/^ID=//p' /etc/os-release 2>/dev/null | tr -d '"' | head -n 1)
+  printf 'vexyon-modules version=1 boot=%s os=%s\n' "$booted" "${os:-unknown}"
+  for m in $MODULES; do
+    desired=on
+    [ -e "$STATE_DIR/$m.disabled" ] && desired=off
+    applied=on gated=0 shared=0
+    if [ "$booted" = 1 ]; then
+      [ -e "$RUN_DIR/$m.disabled" ] && applied=off
+      [ -e "$RUN_DIR/$m.gated" ] && gated=1
+      [ -e "$RUN_DIR/$m.shared" ] && shared=1
+    fi
+    avail=0
+    unit_exists "$(module_unit "$m")" && avail=1
+    hw=0
+    module_hardware "$m" && hw=1
+    cons=$(module_consumers "$m")
+    printf 'id=%s desired=%s applied=%s gated=%s shared=%s available=%s hardware=%s consumers=%s\n' \
+      "$m" "$desired" "$applied" "$gated" "$shared" "$avail" "$hw" "$cons"
+  done
+}
+
+# Root-owned plain directory, or refuse. Never follows a symlink.
+ensure_dir() {
+  local d
+  for d in "$@"; do
+    if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
+      fail 4 "$d is not a plain directory — refusing to write there"
+    fi
+    if [ ! -d "$d" ]; then
+      mkdir -m 0755 "$d" 2>/dev/null || fail 4 "cannot create $d"
+    fi
+    [ "$(stat -c %u "$d" 2>/dev/null)" = 0 ] || fail 4 "$d is not owned by root — refusing to write there"
+  done
+}
+
+cmd_set() {
+  [ $# -eq 2 ] || usage
+  local m=$1 val=$2
+  is_module "$m" || fail 2 "unknown module: $m (known: $MODULES)"
+  case "$val" in
+    on|off) ;;
+    *) fail 2 "expected on or off, got: $val" ;;
+  esac
+
+  if [ "$(id -u)" -ne 0 ]; then
+    # Hand over to the root-owned copy. Never to this file: on Arch it lives
+    # in the user's home. pkexec only matches the polkit action when it runs
+    # exactly the path the action names.
+    local helper=${VEXYON_MODULES_HELPER:-$ROOT_HELPER} pk=""
+    [ -x "$helper" ] || fail 3 "the system part of Vexyon modules is not installed ($helper is missing) — re-run the Vexyon installer"
+    if [ -x /run/wrappers/bin/pkexec ]; then
+      pk=/run/wrappers/bin/pkexec
+    else
+      pk=$(command -v pkexec 2>/dev/null || true)
+    fi
+    [ -n "$pk" ] || fail 3 "pkexec (polkit) is not installed"
+    exec "$pk" "$helper" set "$m" "$val"
+  fi
+
+  ensure_dir /var/lib/vexyon "$STATE_DIR"
+  local f="$STATE_DIR/$m.disabled" tmp
+  if [ "$val" = off ]; then
+    if [ ! -e "$f" ]; then
+      tmp=$(mktemp "$STATE_DIR/.$m.XXXXXX") || fail 4 "cannot write to $STATE_DIR"
+      if ! {
+        printf '# Vexyon: the "%s" module was turned off in Settings → Modules on %s.\n' "$m" "$(date '+%Y-%m-%d %H:%M')"
+        printf '# Its services stay off from the next boot on. Turn it back on in Settings,\n'
+        printf '# or delete this file; nothing has to be reinstalled.\n'
+      } > "$tmp" || ! chmod 0644 "$tmp" || ! sync "$tmp" || ! mv -f "$tmp" "$f"; then
+        rm -f "$tmp"
+        fail 4 "could not save the change in $STATE_DIR"
+      fi
+    fi
+  else
+    rm -f "$f" || fail 4 "could not save the change in $STATE_DIR"
+  fi
+  sync "$STATE_DIR" 2>/dev/null || sync
+  cmd_status | grep "^id=$m " || true
+}
+
+cmd_boot_apply() {
+  local force=0
+  case "${1:-}" in
+    "") ;;
+    --force) force=1 ;;
+    *) usage ;;
+  esac
+  [ "$(id -u)" -eq 0 ] || fail 1 "boot-apply must run as root"
+
+  # Only while the system is booting. Started later (nixos-rebuild switch,
+  # a re-run installer) it would gate services that are already running or
+  # listening, which is exactly the mid-session change modules promise not to
+  # make: choices always take effect at the next boot.
+  if [ "$force" = 0 ]; then
+    local st
+    st=$(systemctl is-system-running 2>/dev/null || true)
+    if [ "$st" != initializing ]; then
+      echo "vexyon-modules: the system is ${st:-unknown}, not booting — nothing applied now; module choices take effect at the next boot"
+      exit 0
+    fi
+  fi
+
+  local cur m cons
+  cur=$(current_boot_id)
+  [ -n "$cur" ] || fail 4 "no boot id — nothing applied"
+  snapshot_current && [ "$force" = 0 ] && exit 0
+
+  ensure_dir /run/vexyon "$RUN_DIR"
+  rm -f "$RUN_DIR/boot_id"
+  for m in $MODULES; do
+    rm -f "$RUN_DIR/$m.disabled" "$RUN_DIR/$m.gated" "$RUN_DIR/$m.shared"
+    [ -e "$STATE_DIR/$m.disabled" ] || continue
+    : > "$RUN_DIR/$m.disabled"
+    cons=$(module_consumers "$m")
+    if [ -n "$cons" ]; then
+      printf '%s\n' "$cons" > "$RUN_DIR/$m.shared"
+      echo "vexyon-modules: $m is off, but its services stay available for: $cons"
+    else
+      : > "$RUN_DIR/$m.gated"
+      echo "vexyon-modules: $m is off — its services will not start this boot"
+    fi
+  done
+  printf '%s\n' "$cur" > "$RUN_DIR/boot_id"
+}
+
+case "${1:-}" in
+  status) shift; cmd_status "$@" ;;
+  set) shift; cmd_set "$@" ;;
+  boot-apply) shift; cmd_boot_apply "$@" ;;
+  -h|--help|help) usage 0 ;;
+  *) usage ;;
+esac

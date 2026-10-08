@@ -126,6 +126,44 @@ let
     export QT_PLUGIN_PATH="${pkgs.qt6.qtimageformats}/${pkgs.qt6.qtbase.qtPluginPrefix}''${QT_PLUGIN_PATH:+:$QT_PLUGIN_PATH}"
   '';
 
+  # --- módulos opcionales (3.0) ---------------------------------------------
+  # Ajustes → Módulos. Cada servicio de un módulo de sistema lleva esta
+  # condición: si vexyon-modules.service decidió al arrancar que el módulo va
+  # apagado (y nada más lo usa), el servicio, su socket y su activación por
+  # D-Bus simplemente NO arrancan. Sin recompilar nada: la decisión se toma
+  # en cada arranque leyendo /var/lib/vexyon/modules, que solo escribe el
+  # ayudante (root, vía pkexec + polkit) cuando el usuario cambia el
+  # interruptor. Lista y no cadena: así se suma a cualquier otra condición.
+  moduleGate = id: {
+    wants = [ "vexyon-modules.service" ];
+    after = [ "vexyon-modules.service" ];
+    unitConfig.ConditionPathExists = [ "!/run/vexyon/modules/${id}.gated" ];
+  };
+  # Todo lo que libvirt arranca solo. machined, el cortafuegos o
+  # NetworkManager NO: son compartidos y no se tocan nunca.
+  vmServices = [
+    "libvirtd"
+    "libvirtd-config"
+    "libvirt-guests"
+    "virtlogd"
+    "virtlockd"
+    "virt-secret-init-encryption"
+  ];
+  vmSockets = [
+    "libvirtd"
+    "libvirtd-ro"
+    "libvirtd-admin"
+    "virtlogd"
+    "virtlogd-admin"
+    "virtlockd"
+    "virtlockd-admin"
+  ];
+  libvirtOn = config.virtualisation.libvirtd.enable;
+  bluetoothOn = config.hardware.bluetooth.enable;
+  fw = config.networking.firewall;
+  nft = config.networking.nftables.enable;
+  userHome = config.users.users.${cfg.user}.home;
+
   vexyonSession = pkgs.writeShellScript "vexyon-session" ''
     ${envExports}
     ${cursorPathExport}
@@ -239,6 +277,11 @@ in
       xdg-utils
       sshfs
       awww
+      # 3.0 — fuera de la caja: lo que pedían las páginas de Ajustes.
+      wf-recorder # grabación de pantalla (solo corre mientras se graba)
+      hyprpicker # widget selector de color
+      pulseaudio # SOLO por `pactl` (Ajustes → Audio, widget de privacidad); ningún demonio
+      psmisc # `fuser`, la comprobación de cámara del widget de privacidad
       # Qt6: lo trae quickshell como dependencia propia. NO se instala qt6ct
       # aunque vexyon-env.lua fije QT_QPA_PLATFORMTHEME=qt6ct.
       #
@@ -256,6 +299,8 @@ in
       # camino es `qt.enable = true; qt.platformTheme = "qt6ct";` — que además
       # exporta la variable por sí solo.
     ])
+    # La ventana de las VMs. Solo con libvirt: sin él no hay nada que mirar.
+    ++ lib.optional libvirtOn pkgs.virt-viewer
     # Los temas de cursor. Tienen que estar en systemPackages y no solo en el
     # entorno del usuario: en NixOS no hay /usr/share/icons y XCursor resuelve
     # los temas por /run/current-system/sw/share/icons, que es también donde
@@ -293,6 +338,119 @@ in
       pulse.enable = lib.mkDefault true;
       wireplumber.enable = lib.mkDefault true;
     };
+
+    # --- módulos opcionales (3.0) -------------------------------------------
+    # REGLA FUERA DE LA CAJA: `services.vexyon.enable = true;` instala y deja
+    # listo todo lo que necesita cada función, sin opciones extra para el
+    # usuario. Los módulos opcionales se APAGAN en Ajustes → Módulos, en
+    # tiempo de ejecución (sin rebuild): el interruptor solo decide si sus
+    # servicios arrancan en el siguiente arranque; los paquetes se quedan.
+    # mkDefault en todo: lo que el usuario declare él mismo, manda.
+
+    # Máquinas virtuales: libvirt + QEMU de la arquitectura del equipo, TPM
+    # emulado (Windows 11) y virtiofsd (carpetas compartidas). libvirtd sale
+    # solo a los 120 s sin uso y lo vuelve a levantar su socket.
+    virtualisation.libvirtd = {
+      enable = lib.mkDefault true;
+      qemu = {
+        package = lib.mkDefault pkgs.qemu_kvm;
+        swtpm.enable = lib.mkDefault true;
+        vhostUserPackages = lib.mkDefault [ pkgs.virtiofsd ];
+      };
+    };
+
+    # Bluetooth. bluetoothd solo arranca si hay adaptador (condición propia
+    # de su unidad).
+    hardware.bluetooth.enable = lib.mkDefault true;
+
+    systemd.services = lib.mkMerge [
+      {
+        # El ayudante, al arrancar, congela en /run el estado de los módulos
+        # y decide qué servicios quedan bloqueados. Antes de sysinit.target:
+        # los sockets (sockets.target) y bluetooth.target van después. Una
+        # sola vez por arranque: nixos-rebuild switch no lo relanza
+        # (restartIfChanged = false) y, si se lanza fuera del arranque, no
+        # aplica nada — los cambios llegan siempre con el siguiente
+        # arranque, nunca a mitad de sesión.
+        vexyon-modules = {
+          description = "Vexyon modules: apply this boot's module choices";
+          wantedBy = [ "sysinit.target" ];
+          before = [
+            "sysinit.target"
+            "shutdown.target"
+          ];
+          after = [ "local-fs.target" ];
+          conflicts = [ "shutdown.target" ];
+          unitConfig = {
+            DefaultDependencies = false;
+            RequiresMountsFor = "/var/lib/vexyon";
+          };
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+            ExecStart = "${vexyon}/libexec/vexyon/vexyon-modules boot-apply";
+          };
+          restartIfChanged = false;
+        };
+      }
+      # Las condiciones, solo sobre unidades que existen: con libvirt o
+      # Bluetooth apagados en la configuración del usuario no se crean
+      # unidades vacías.
+      (lib.mkIf libvirtOn (lib.genAttrs vmServices (_: moduleGate "vm")))
+      (lib.mkIf bluetoothOn { bluetooth = moduleGate "bluetooth"; })
+    ];
+    systemd.sockets = lib.mkIf libvirtOn (lib.genAttrs vmSockets (_: moduleGate "vm"));
+
+    # video/input para el compositor y el brillo. libvirtd: las VMs son de
+    # este usuario sin contraseña (regla de polkit de libvirt para ese grupo);
+    # llega a la sesión en el siguiente inicio.
+    users.users.${cfg.user}.extraGroups = [
+      "video"
+      "input"
+    ]
+    ++ lib.optional libvirtOn "libvirtd";
+
+    # Red de las VMs sin tocar nada: las excepciones acotadas a los puentes de
+    # libvirt (virbr*) que antes había que pegar a mano desde Ajustes →
+    # Virtualización. Medidas en la sesión de redes (PROJECT_STATE.md): solo
+    # tráfico que ENTRA por un puente de libvirt y no va a este equipo se
+    # salta el filtro de ruta inversa; DHCP/DNS de las VMs llegan al dnsmasq
+    # de libvirt. El resto del cortafuegos no cambia. types.lines: se suman a
+    # las líneas del usuario, no las sustituyen. Sin puentes virbr* (módulo
+    # apagado) no casan con nada.
+    networking.firewall.extraCommands = lib.mkIf (libvirtOn && fw.enable && !nft) ''
+      ip46tables -t mangle -I nixos-fw-rpfilter -i virbr+ -m addrtype ! --dst-type LOCAL -j RETURN
+    '';
+    networking.firewall.extraReversePathFilterRules = lib.mkIf (libvirtOn && fw.enable && nft) ''
+      iifname "virbr*" fib daddr type != local accept
+    '';
+    networking.firewall.extraInputRules = lib.mkIf (libvirtOn && fw.enable && nft) ''
+      iifname "virbr*" udp dport { 53, 67 } accept
+      iifname "virbr*" tcp dport 53 accept
+    '';
+    networking.firewall.extraForwardRules = lib.mkIf (libvirtOn && fw.enable && nft && fw.filterForward) ''
+      iifname "virbr*" accept
+    '';
+
+    # Migración de una sola vez desde 2.x: el interruptor de virtualización
+    # vivía en shell.json (`virtualization.enabled`, false por defecto). Quien
+    # lo tenía apagado lo conserva apagado: se le apaga el módulo (que ahora
+    # instala libvirt de serie). Quien no tenía shell.json, o lo tenía
+    # encendido, se queda con el módulo encendido, que es el defecto de 3.0.
+    # Solo se marca hecha si se pudo leer el $HOME (un /home sin montar en la
+    # activación del arranque no debe dar la migración por terminada).
+    system.activationScripts.vexyonModules = ''
+      install -d -m 0755 /var/lib/vexyon /var/lib/vexyon/modules
+      if [ ! -e /var/lib/vexyon/modules/.migrated-3.0 ] && [ -d ${lib.escapeShellArg userHome} ]; then
+        sj=${lib.escapeShellArg "${userHome}/.config/vexyon/shell.json"}
+        if [ -f "$sj" ] && [ ! -L "$sj" ] \
+           && ${pkgs.coreutils}/bin/timeout 5 ${pkgs.jq}/bin/jq -e '.virtualization.enabled == false' "$sj" >/dev/null 2>&1; then
+          ${vexyon}/libexec/vexyon/vexyon-modules set vm off >/dev/null \
+            && echo "vexyon: the Virtual machines module stays off, as it was before 3.0 (Settings → Modules turns it on)"
+        fi
+        : > /var/lib/vexyon/modules/.migrated-3.0
+      fi
+    '';
 
     # --- energía: batería y perfiles ---------------------------------------
     # Los dos widgets de energía del shell son clientes D-Bus de estos dos
@@ -464,12 +622,6 @@ in
           config.users.users.${cfg.user}.home
         }"
       '')
-    ];
-
-    # El usuario necesita video/input para el compositor y el brillo.
-    users.users.${cfg.user}.extraGroups = [
-      "video"
-      "input"
     ];
   };
 }

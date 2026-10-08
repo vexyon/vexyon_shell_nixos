@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  Vexyon — Settings → Modules.
+
+  The ONE privileged thing the shell can ask for: record whether an optional
+  module (virtual machines, Bluetooth) starts with the next boot. pkexec only
+  picks this action when it runs exactly the path below with "set" as its
+  first argument, and the helper itself accepts nothing but
+  `set <known module> <on|off>`. Anything else through pkexec falls back to
+  polkit's generic "run a program as root" action.
+
+  Admin password, kept for a few minutes, active local sessions only.
+  The path is the Arch install location; the NixOS package rewrites it to
+  the store path of its own copy.
+-->
+<policyconfig>
+  <vendor>Vexyon</vendor>
+  <vendor_url>https://github.com/vexyon/vexyon_shell</vendor_url>
+
+  <action id="org.vexyon.modules.set">
+    <description>Turn a Vexyon module on or off</description>
+    <description xml:lang="es">Activar o desactivar un módulo de Vexyon</description>
+    <message>Authentication is required to change which Vexyon modules start with the computer</message>
+    <message xml:lang="es">Se necesita autenticación para cambiar qué módulos de Vexyon arrancan con el equipo</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/lib/vexyon/vexyon-modules</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">set</annotate>
+  </action>
+</policyconfig>

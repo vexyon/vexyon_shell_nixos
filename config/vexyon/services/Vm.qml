@@ -20,11 +20,13 @@ import qs.services
 //     cualquier acción del usuario y con el botón de recargar. Es el mismo
 //     criterio que Drives (que sí tiene monitor porque udisks2 ofrece señales
 //     de D-Bus gratis) pero sin suscripción: aquí no se abre ninguna.
-//   * El interruptor vive en shell.json (`virtualization.enabled`, por defecto
-//     false). Los puntos que NO deben instanciar este singleton cuando está
-//     apagado (catálogo de widgets, lanzador, shell.qml) leen Config
-//     DIRECTAMENTE en vez de mirar `Vm.enabled` — si preguntaran aquí, el mero
-//     hecho de preguntar crearía el singleton. Ver PROJECT_STATE.md.
+//   * El interruptor es el módulo «Virtual machines» (Ajustes → Módulos,
+//     services/Modules.qml): `Modules.vmOn` dice si ESTE arranque lo tiene
+//     encendido; apagarlo además impide que los servicios de libvirt arranquen
+//     en el siguiente arranque. Los puntos que NO deben instanciar este
+//     singleton cuando está apagado (catálogo de widgets, lanzador, shell.qml)
+//     preguntan a `Modules.vmOn` y NUNCA a `Vm.enabled` — si preguntaran aquí,
+//     el mero hecho de preguntar crearía el singleton. Ver PROJECT_STATE.md.
 //
 //  UNA SOLA LECTURA POR REFRESCO: `refresh()` lanza UN bash que emite el estado
 //  entero (dominios + redes + pool) en secciones @@; parsearlo en QML es
@@ -41,7 +43,7 @@ Singleton {
     id: root
 
     // ---- interruptor -------------------------------------------------------
-    readonly property bool enabled: Config.get("virtualization", "enabled", false) === true
+    readonly property bool enabled: Modules.vmOn
 
     readonly property string uri: "qemu:///system"
     // Prefijo común de toda invocación. LC_ALL=C: las etiquetas de `dominfo`
@@ -227,7 +229,7 @@ Singleton {
     property bool detected: false
     property var has: ({
         virsh: false, qemu: false, viewer: false, libvirtd: false,
-        grpLibvirt: false, grpKvm: false, kvmdev: false, swtpm: false, uefi: false,
+        grpLibvirt: false, kvmdev: false, swtpm: false, uefi: false,
         virtiofs: false
     })
     property string osId: ""
@@ -250,9 +252,14 @@ Singleton {
     // Todo lo IMPRESCINDIBLE está. virt-viewer y swtpm quedan fuera a
     // propósito: sin virt-viewer se sigue pudiendo usar la consola de texto y
     // sin swtpm todo funciona salvo un TPM virtual (Windows 11).
+    //  El grupo kvm NO cuenta: QEMU lo arranca libvirt (root por defecto en
+    //  las dos plataformas), nunca el usuario, así que pertenecer a kvm no
+    //  cambia nada. `kvmdev` es si EXISTE /dev/kvm, o sea si el hardware y el
+    //  firmware dan virtualización — lo único de la lista que ningún
+    //  instalador puede poner.
     readonly property bool requirementsMet: root.detected && root.has.virsh && root.has.qemu
                                             && root.has.libvirtd && root.has.grpLibvirt
-                                            && root.has.grpKvm && root.has.kvmdev
+                                            && root.has.kvmdev
 
     // ---- sondas ------------------------------------------------------------
     function detect() {
@@ -456,7 +463,19 @@ Singleton {
                 "[ -n \"$d\" ] && break; " +
                 "sleep 0.5; done"
             : "";
-        root.run("start", "$V start " + q(name) + wait);
+        root.run("start", root._netsUp(name) + "$V start " + q(name) + wait);
+    }
+
+    //  Antes de arrancar, levantar las redes de libvirt que nombra la VM y
+    //  estén paradas. Sin esto la VM no arranca ("network 'default' is not
+    //  active"): pasa con la red `default` en NixOS (libvirt la define pero
+    //  no la pone en autoarranque), tras importar un .ova, o si alguien paró
+    //  la red. Así una red solo corre (con su dnsmasq) cuando una VM la usa.
+    //  Todo a /dev/null: `run` toma cualquier stderr por error, y si la red
+    //  no se puede levantar el propio `virsh start` lo dice con su mensaje.
+    function _netsUp(name) {
+        return "for n in $($V domiflist " + q(name) + " 2>/dev/null | awk 'NR>2 && $2==\"network\" {print $3}' | sort -u); do " +
+               "$V net-info \"$n\" 2>/dev/null | grep -q '^Active: *no' && $V net-start \"$n\" >/dev/null 2>&1; done; ";
     }
     readonly property bool openOnStart: Config.get("virtualization", "openOnStart", true) === true
     function shutdown(name)   { root.run("shutdown", "$V shutdown " + q(name)); }
@@ -498,8 +517,14 @@ Singleton {
         root.run("setmem", "$V setmem " + q(name) + " " + (mib * 1024) + " --config"
                  + (live ? " && $V setmem " + q(name) + " " + (mib * 1024) + " --live" : ""));
     }
+    //  Con autoarranque, libvirt arranca la VM al arrancar el equipo, cuando
+    //  aún no hay nadie que levante sus redes: se ponen también en
+    //  autoarranque (solo las que nombra la VM; quitarlo no las toca, otra
+    //  VM puede necesitarlas).
     function setAutostart(name, on) {
-        root.run("autostart", "$V autostart " + (on ? "" : "--disable ") + q(name));
+        root.run("autostart", "$V autostart " + (on ? "" : "--disable ") + q(name) + " || exit 1" +
+            (on ? "; for n in $($V domiflist " + q(name) + " 2>/dev/null | awk 'NR>2 && $2==\"network\" {print $3}' | sort -u); do " +
+                  "$V net-autostart \"$n\" >/dev/null 2>&1; done; :" : ""));
     }
 
     // ---- snapshots ---------------------------------------------------------
@@ -1486,20 +1511,20 @@ Singleton {
                          : I18n.t("NixOS's reverse-path filter has no exception for libvirt bridges"),
                     brnf ? I18n.t("Internal networks (the host has no route to them) and a router VM's clients are cut off.")
                          : I18n.t("Fine while br_netfilter is not loaded. Once Docker, Incus or Kubernetes load it, internal networks and router VMs stop working."),
-                    I18n.t("The exception is one line in configuration.nix — see Settings → Virtualization → Firewall."), "", true);
+                    I18n.t("Vexyon's NixOS module adds this exception since 3.0: rebuild with the current Vexyon. If you wrote your own firewall rules, see Settings → Virtualization → VM networking."), "", true);
             if (sys.fwfile.nixnft) {
                 if (!sys.fw["nixnft:inexc"])
                     add("bad", I18n.t("The NixOS nftables firewall drops DHCP and DNS from VMs"),
                         I18n.t("VMs on libvirt networks get no address. libvirt's own nftables rules cannot accept what another table drops."),
-                        I18n.t("See Settings → Virtualization → Firewall."), "", true);
+                        I18n.t("Vexyon's NixOS module adds this exception since 3.0: rebuild with the current Vexyon. If you wrote your own firewall rules, see Settings → Virtualization → VM networking."), "", true);
                 if (sys.fw["nixnft:rp"] && !sys.fw["nixnft:rpexc"] && brnf)
                     add("bad", I18n.t("NixOS's reverse-path filter drops traffic between VMs"),
                         I18n.t("Internal networks (the host has no route to them) and a router VM's clients are cut off."),
-                        I18n.t("See Settings → Virtualization → Firewall."), "", true);
+                        I18n.t("Vexyon's NixOS module adds this exception since 3.0: rebuild with the current Vexyon. If you wrote your own firewall rules, see Settings → Virtualization → VM networking."), "", true);
                 if (sys.fw["nixnft:ff"] && !sys.fw["nixnft:ffexc"])
                     add("bad", I18n.t("networking.firewall.filterForward drops the VMs' forwarded traffic"),
                         I18n.t("NAT to the internet, and with br_netfilter also traffic between VMs, is dropped."),
-                        I18n.t("See Settings → Virtualization → Firewall."), "", true);
+                        I18n.t("Vexyon's NixOS module adds this exception since 3.0: rebuild with the current Vexyon. If you wrote your own firewall rules, see Settings → Virtualization → VM networking."), "", true);
             }
         } else {
             var who = [];
@@ -1508,13 +1533,13 @@ Singleton {
             if (who.length > 0 && String(sys.backend || "").indexOf("nftables") === 0)
                 add("bad", I18n.t("libvirt's nftables rules cannot override the DROP policy set by") + " " + who.join(", "),
                     I18n.t("VMs lose DHCP (ufw) and all forwarded traffic: the internet and, with br_netfilter, each other."),
-                    I18n.t("Make libvirt write its rules into the same iptables tables: firewall_backend = \"iptables\" in /etc/libvirt/network.conf, then restart libvirtd."),
+                    I18n.t("Vexyon's installer sets this up when Docker or ufw is installed: run ./install.sh again. It writes firewall_backend = \"iptables\" in /etc/libvirt/network.conf; a network picks it up the next time it starts."),
                     "", root.platform === "arch");
             if (sys.units.nftables && (sys.fw["etcnft:hook input"] || sys.fw["etcnft:hook forward"])
                     && !sys.fw["etcnft:virbr"])
                 add("warn", I18n.t("nftables.service filters traffic and has no rule for the libvirt bridges"),
                     I18n.t("If its input or forward chain drops by default, VMs get no address and cannot reach anything."),
-                    I18n.t("Allow the libvirt bridges (virbr*) in /etc/nftables.conf: see Settings → Virtualization → Firewall."),
+                    I18n.t("Allow the libvirt bridges (virbr*) in /etc/nftables.conf: see Settings → Virtualization → VM networking."),
                     "", root.platform === "arch");
             if (sys.units.nftables && sys.fw["etcnft:flush ruleset"])
                 add("info", I18n.t("/etc/nftables.conf starts with flush ruleset"),
@@ -1808,7 +1833,7 @@ Singleton {
         // Sin virt-viewer, `execDetached` no falla de forma visible: el proceso
         // simplemente no arranca y el usuario ve... nada. Se dice.
         if (root.detected && !root.has.viewer) {
-            root.lastError = I18n.t("virt-viewer is not installed, so the VM's display cannot be opened. Use the text console, or install it (see Settings → Virtualization).");
+            root.lastError = I18n.t("virt-viewer is missing, so the VM's display cannot be opened. Use the text console for now; Settings → Virtualization says how to put it back.");
             return;
         }
         var cmd = ["virt-viewer", "-c", root.uri, "-a", "--auto-resize=always",
@@ -2321,8 +2346,7 @@ Singleton {
             "virsh -c " + root.uri + " version >/dev/null 2>&1 && echo libvirtd=1 || echo libvirtd=0; " +
             "g=\" $(id -nG 2>/dev/null) \"; " +
             "case \"$g\" in *' libvirt '*|*' libvirtd '*) echo grpLibvirt=1;; *) echo grpLibvirt=0;; esac; " +
-            "case \"$g\" in *' kvm '*) echo grpKvm=1;; *) echo grpKvm=0;; esac; " +
-            "{ [ -r /dev/kvm ] && [ -w /dev/kvm ] && echo kvmdev=1; } || echo kvmdev=0; " +
+            "{ [ -e /dev/kvm ] && echo kvmdev=1; } || echo kvmdev=0; " +
             // swtpm en NixOS NO está en el PATH del usuario aunque
             // qemu.swtpm.enable esté puesto: se lo inyecta systemd SOLO al
             // servicio (medido: la unidad libvirtd lleva swtpm-0.10.1/bin en su
@@ -2360,7 +2384,7 @@ Singleton {
                 root.has = {
                     virsh: m.virsh === "1", qemu: m.qemu === "1", viewer: m.viewer === "1",
                     libvirtd: m.libvirtd === "1", grpLibvirt: m.grpLibvirt === "1",
-                    grpKvm: m.grpKvm === "1", kvmdev: m.kvmdev === "1",
+                    kvmdev: m.kvmdev === "1",
                     swtpm: m.swtpm === "1", uefi: m.uefi === "1",
                     virtiofs: m.virtiofs === "1"
                 };

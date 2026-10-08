@@ -94,7 +94,7 @@
       "SUPER",
       "SHIFT"
     ],
-    "key": "R",
+    "key": "V",
     "action": "global",
     "arg": "recorder",
     "desc": "Screen recording: open the recorder / stop recording",

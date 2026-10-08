@@ -134,8 +134,29 @@ try:
 except Exception:
     raise SystemExit(0)          # config a medio escribir: ya se intentara
 kbs = cfg.setdefault("keybinds", [])
+before = list((cfg.get("state") or {}).get("migrations") or []) if isinstance(cfg.get("state"), dict) else []
 have_ids = {k.get("id") for k in kbs}
 combos = {(tuple(sorted(k.get("mods", []))), k.get("key")) for k in kbs}
+# 3.0: the recorder's default moved from Super+Shift+R to Super+Shift+V.
+# An existing bind moves only while it still sits on the old default and V is
+# free, and only once: a later deliberate choice of R is never undone.
+MIG = "recorder-super-shift-v"
+state = cfg.get("state")
+if not isinstance(state, dict):
+    state = cfg["state"] = {}
+done = state.get("migrations")
+if not isinstance(done, list):
+    done = state["migrations"] = []
+moved = False
+if MIG not in done:
+    for k in kbs:
+        if k.get("id") == "recorder" and sorted(k.get("mods", [])) == ["SHIFT", "SUPER"] and k.get("key") == "R":
+            if (("SHIFT", "SUPER"), "V") not in combos:
+                k["key"] = "V"
+                moved = True
+            break
+    done.append(MIG)
+    combos = {(tuple(sorted(k.get("mods", []))), k.get("key")) for k in kbs}
 added = []
 for k in defaults:
     if k.get("category") != "Media" and k.get("id") not in LATE:
@@ -146,13 +167,16 @@ for k in defaults:
         continue                 # ese combo ya lo usa el usuario para otra cosa
     kbs.append(k)
     added.append(k["id"])
-if added:
+if added or MIG not in before:
     tmp = sj + ".tmp"
     with open(tmp, "w") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
         f.write("\n")
     os.replace(tmp, sj)
-    print("vexyon-seed: atajo(s) sembrado(s): " + ", ".join(added))
+    if added:
+        print("vexyon-seed: atajo(s) sembrado(s): " + ", ".join(added))
+    if moved:
+        print("vexyon-seed: grabadora movida de Super+Shift+R a Super+Shift+V")
 PYEOF
 }
 seed_late_keybinds

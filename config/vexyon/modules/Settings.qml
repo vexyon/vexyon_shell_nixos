@@ -75,6 +75,7 @@ FloatingWindow {
             { "id": "recording", "label": "Screen recording", "icon": Icons.record }
         ] },
         { "title": "System", "icon": Icons.gear, "items": [
+            { "id": "modules",  "label": "Modules",            "icon": Icons.puzzle },
             { "id": "audio",    "label": "Audio",              "icon": Icons.volumeHigh },
             { "id": "network",  "label": "Network",            "icon": Icons.wifi },
             { "id": "displays", "label": "Displays",           "icon": Icons.desktop },
@@ -131,6 +132,7 @@ FloatingWindow {
                     "behavior": "Behavior",
                     "virtualization": "Virtualization",
                     "recording": "Screen recording",
+                    "modules": "Modules",
                     "about": "About Vexyon" };
         return I18n.t(map[id] || id);
     }
@@ -392,6 +394,207 @@ FloatingWindow {
         font.family: Theme.fontFamily
         font.pixelSize: Theme.fontSize - 1
         font.bold: true
+    }
+
+    // ---- Módulos (3.0) -------------------------------------------------------
+    //  Una tarjeta por módulo opcional: en Ajustes → Módulos y arriba de la
+    //  página propia de cada uno (Virtualización, Grabación). El interruptor es
+    //  lo ELEGIDO — lo que tendrá el siguiente arranque, o ya mismo si el
+    //  módulo es de sesión —; la línea de estado dice lo que corre AHORA, y si
+    //  falta reiniciar la tarjeta se marca en ámbar. Toda la lógica vive en
+    //  services/Modules.qml; aquí solo se pinta.
+    component ModuleCard: Rectangle {
+        id: mc
+        property string mod: ""
+        property bool showLink: true
+        readonly property var meta: Modules.meta(mc.mod) || ({ name: "", desc: "", icon: "", page: "", scope: "" })
+        readonly property var info: Modules.info(mc.mod)
+        readonly property bool system: mc.meta.scope === "system"
+        readonly property bool isOn: Modules.active(mc.mod)
+        readonly property bool want: Modules.desired(mc.mod)
+        readonly property bool pending: Modules.pending(mc.mod)
+        readonly property bool working: Modules.busy === mc.mod
+        readonly property bool missing: mc.system && Modules.helperOk && mc.info !== null && !mc.info.available
+        readonly property bool noHelper: mc.system && Modules.ready && !Modules.helperOk
+        readonly property bool locked: mc.system && (!Modules.ready || !Modules.helperOk || Modules.busy !== "")
+        readonly property var users: mc.system && mc.info ? mc.info.consumers : []
+        readonly property string statusText: {
+            if (mc.system && !Modules.ready) return I18n.t("Checking…");
+            if (mc.working) return I18n.t("Waiting for permission…");
+            if (mc.missing) return I18n.t("Not installed");
+            if (mc.pending) return mc.isOn ? I18n.t("On until the next restart") : I18n.t("Off until the next restart");
+            return mc.isOn ? I18n.t("On") : I18n.t("Off");
+        }
+        Layout.fillWidth: true
+        implicitHeight: mcCol.implicitHeight + 26
+        radius: Theme.radius
+        color: Theme.surface0
+        border.width: mc.pending ? 1 : 0
+        border.color: Theme.yellow
+        ColumnLayout {
+            id: mcCol
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: 14
+            anchors.rightMargin: 12
+            spacing: 5
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                Text {
+                    text: mc.meta.icon
+                    color: mc.isOn ? Theme.accent : Theme.overlay1
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fontSize + 2
+                }
+                Text {
+                    Layout.fillWidth: true
+                    text: I18n.t(mc.meta.name)
+                    color: Theme.text
+                    elide: Text.ElideRight
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fontSize
+                    font.bold: true
+                }
+                // Cuándo se aplica: lo dice la propia tarjeta, no un manual.
+                Rectangle {
+                    Layout.alignment: Qt.AlignVCenter
+                    implicitWidth: mcScope.implicitWidth + 12
+                    implicitHeight: 20
+                    radius: 6
+                    color: Theme.surface1
+                    Text {
+                        id: mcScope
+                        anchors.centerIn: parent
+                        text: mc.system ? I18n.t("At restart") : I18n.t("Instant")
+                        color: Theme.subtext0
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSize - 4
+                    }
+                }
+                Toggle {
+                    id: mcSw
+                    enabled: !mc.locked && !mc.missing
+                    opacity: enabled || mc.working ? 1 : 0.45
+                    // Mientras se pide permiso enseña lo pedido; al terminar,
+                    // lo que de verdad quedó guardado (cancelar lo devuelve).
+                    checked: mc.working ? Modules.busyTo : mc.want
+                    onToggled: function(v) {
+                        mcSw.checked = Qt.binding(function() { return mc.working ? Modules.busyTo : mc.want; });
+                        Modules.set(mc.mod, v);
+                    }
+                }
+            }
+            Text {
+                Layout.fillWidth: true
+                text: I18n.t(mc.meta.desc)
+                color: Theme.subtext0
+                wrapMode: Text.Wrap
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fontSize - 2
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.topMargin: 2
+                spacing: 8
+                Rectangle {
+                    Layout.alignment: Qt.AlignVCenter
+                    implicitWidth: 8
+                    implicitHeight: 8
+                    radius: 4
+                    color: mc.pending ? Theme.yellow : mc.isOn && !mc.missing ? Theme.green : Theme.overlay1
+                }
+                Text {
+                    Layout.fillWidth: true
+                    text: mc.statusText
+                    color: mc.pending ? Theme.yellow : Theme.subtext1
+                    wrapMode: Text.Wrap
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fontSize - 2
+                    font.bold: true
+                }
+                Text {
+                    visible: mc.showLink && mc.meta.page !== "" && mc.isOn
+                    text: I18n.t("Settings") + " ›"
+                    color: mcLinkMa.containsMouse ? Theme.accent : Theme.subtext0
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fontSize - 2
+                    MouseArea {
+                        id: mcLinkMa
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: win.current = mc.meta.page
+                    }
+                }
+            }
+            Text {
+                Layout.fillWidth: true
+                visible: text !== ""
+                text: !mc.system ? I18n.t("Applies immediately. Nothing runs in the background either way.")
+                    : !mc.pending ? ""
+                    : !mc.want ? (mc.mod === "vm"
+                                  ? I18n.t("Saved. From the next restart libvirt's services no longer start. Your VMs, disks and networks are kept, and a VM running now is not touched.")
+                                  : I18n.t("Saved. From the next restart the Bluetooth service no longer starts, so Bluetooth devices will not connect. Pairings are kept."))
+                    : I18n.t("Saved. It is back from the next restart. Nothing has to be downloaded or installed.")
+                color: mc.pending ? Theme.yellow : Theme.subtext0
+                wrapMode: Text.Wrap
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fontSize - 3
+            }
+            Text {
+                Layout.fillWidth: true
+                visible: mc.users.length > 0
+                text: I18n.t("Also used by %1. With this module off its service keeps starting for that software; only Vexyon's part is hidden.").arg(mc.users.join(", "))
+                color: Theme.subtext0
+                wrapMode: Text.Wrap
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fontSize - 3
+            }
+            Text {
+                Layout.fillWidth: true
+                visible: mc.missing
+                text: Modules.nixos
+                      ? I18n.t("Vexyon's NixOS module installs this. If it is missing, your configuration turns it off (%1): remove that line and rebuild.")
+                            .arg(mc.mod === "vm" ? "virtualisation.libvirtd.enable = false" : "hardware.bluetooth.enable = false")
+                      : I18n.t("Its packages are missing. Run the Vexyon installer again: it installs what is missing and keeps your settings.")
+                color: Theme.yellow
+                wrapMode: Text.Wrap
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fontSize - 3
+            }
+            Text {
+                Layout.fillWidth: true
+                visible: mc.noHelper
+                text: I18n.t("The system part of Vexyon modules is not installed, so this switch cannot change anything yet. Run the Vexyon installer again (on NixOS: rebuild your system).")
+                color: Theme.yellow
+                wrapMode: Text.Wrap
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fontSize - 3
+            }
+            Text {
+                Layout.fillWidth: true
+                // En la página propia del módulo lo explica la página entera.
+                visible: mc.showLink && mc.system && mc.want && !mc.missing && mc.info !== null && !mc.info.hardware
+                text: mc.mod === "vm"
+                      ? I18n.t("This computer is not offering hardware virtualization (/dev/kvm is missing). Turn on Intel VT-x or AMD-V (SVM) in the firmware (BIOS/UEFI) settings — no installer can do that.")
+                      : I18n.t("No Bluetooth adapter is connected right now. The Bluetooth service only starts when there is one.")
+                color: Theme.subtext0
+                wrapMode: Text.Wrap
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fontSize - 3
+            }
+            Text {
+                Layout.fillWidth: true
+                visible: Modules.errorId === mc.mod && Modules.error !== ""
+                text: Modules.error
+                color: Theme.red
+                wrapMode: Text.Wrap
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fontSize - 3
+            }
+        }
     }
 
     // ---- controles de opciones por-instancia (Gestor de widgets, patrón DMS)
@@ -1000,6 +1203,7 @@ FloatingWindow {
                                        : win.current === "behavior" ? cmpBehavior
                                        : win.current === "virtualization" ? cmpVirt
                                        : win.current === "recording" ? cmpRec
+                                       : win.current === "modules" ? cmpModules
                                        : cmpAbout
                     }
                 }
@@ -2911,50 +3115,13 @@ FloatingWindow {
                     width: parent.width
                     spacing: 12
 
-                    // ---------- interruptor ----------
-                    Rectangle {
-                        Layout.fillWidth: true
-                        implicitHeight: swCol.implicitHeight + 26
-                        radius: Theme.radius
-                        color: Theme.surface0
-                        ColumnLayout {
-                            id: swCol
-                            anchors.left: parent.left
-                            anchors.right: parent.right
-                            anchors.verticalCenter: parent.verticalCenter
-                            anchors.leftMargin: 14
-                            anchors.rightMargin: 12
-                            spacing: 4
-                            RowLayout {
-                                Layout.fillWidth: true
-                                spacing: 10
-                                Text {
-                                    Layout.fillWidth: true
-                                    text: I18n.t("Enable virtualization")
-                                    color: Theme.text
-                                    font.family: Theme.fontFamily
-                                    font.pixelSize: Theme.fontSize
-                                }
-                                Toggle {
-                                    checked: Config.get("virtualization", "enabled", false)
-                                    onToggled: function(v) {
-                                        Config.set("virtualization", "enabled", v);
-                                        if (v) Vm.detect();
-                                    }
-                                }
-                            }
-                            Text {
-                                Layout.fillWidth: true
-                                text: I18n.t("Off by default. While it is off, nothing related to virtual machines is loaded: no process, no bar widget, no launcher entry, no memory used.")
-                                color: Theme.subtext0
-                                wrapMode: Text.Wrap
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize - 2
-                            }
-                        }
-                    }
+                    // ---------- módulo ----------
+                    //  El interruptor es el del módulo «Virtual machines» (la
+                    //  misma tarjeta que en Ajustes → Módulos). Se aplica por
+                    //  arranque: lo de abajo sigue a lo que corre AHORA.
+                    ModuleCard { mod: "vm"; showLink: false }
 
-                    // Todo lo de abajo solo tiene sentido con el interruptor puesto.
+                    // Todo lo de abajo solo tiene sentido con el módulo activo en este arranque.
                     ColumnLayout {
                         Layout.fillWidth: true
                         visible: Vm.enabled
@@ -3028,14 +3195,8 @@ FloatingWindow {
                             }
                             ReqRow {
                                 pending: !Vm.detected
-                                ok: Vm.has.grpKvm
-                                label: I18n.t("Your user is in the kvm group")
-                                note: Vm.has.grpKvm ? "" : I18n.t("Group membership only takes effect after you log out and back in.")
-                            }
-                            ReqRow {
-                                pending: !Vm.detected
                                 ok: Vm.has.kvmdev
-                                label: I18n.t("/dev/kvm is readable and writable — hardware acceleration works")
+                                label: I18n.t("Hardware virtualization is available (/dev/kvm)")
                             }
                             ReqRow {
                                 pending: !Vm.detected
@@ -3066,326 +3227,130 @@ FloatingWindow {
                             }
                         }
 
-                        // ---------- instrucciones por plataforma ----------
-                        SsHeader { text: I18n.t("SETUP FOR YOUR SYSTEM"); visible: Vm.detected }
+                        // ---------- si falta algo ----------
+                        //  Desde 3.0 TODO lo de la lista lo instala y configura
+                        //  Vexyon (install.sh en Arch, el módulo de NixOS): aquí
+                        //  ya no hay pasos de instalación, solo qué hacer si una
+                        //  instalación quedó a medias y lo que ningún instalador
+                        //  puede poner (la virtualización del firmware, la
+                        //  sesión nueva para el grupo).
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            visible: Vm.detected && (!Vm.requirementsMet || !Vm.has.viewer || !Vm.has.swtpm
+                                                     || !Vm.has.virtiofs || !Vm.has.uefi)
+                            spacing: 6
+
+                            SsHeader { text: I18n.t("IF SOMETHING IS MISSING") }
+                            Text {
+                                Layout.fillWidth: true
+                                text: I18n.t("Vexyon installs and sets up everything in this list: libvirt, QEMU, virt-viewer, swtpm, virtiofsd, UEFI firmware, the default NAT network and your place in the libvirt group. None of it should need a command.")
+                                color: Theme.text
+                                wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 1
+                            }
+                            PartLabel {
+                                visible: !Vm.has.kvmdev
+                                tag: I18n.t("FIRMWARE")
+                                tone: Theme.red
+                                title: I18n.t("Hardware virtualization is turned off")
+                                body: I18n.t("/dev/kvm does not exist, so this computer is not offering hardware virtualization. Turn on Intel VT-x or AMD-V (SVM) in the firmware (BIOS/UEFI) settings and restart.")
+                            }
+                            PartLabel {
+                                visible: Vm.has.virsh && !Vm.has.grpLibvirt
+                                tag: I18n.t("LOG OUT")
+                                tone: Theme.yellow
+                                title: I18n.t("Log out and back in")
+                                body: I18n.t("You were added to the libvirt group when Vexyon was installed, but a group only reaches sessions that start afterwards.")
+                            }
+                            PartLabel {
+                                visible: Vm.platform === "nixos" && (!Vm.has.virsh || !Vm.has.qemu || !Vm.has.libvirtd
+                                         || !Vm.has.viewer || !Vm.has.swtpm || !Vm.has.virtiofs || !Vm.has.uefi)
+                                tag: "NixOS"
+                                tone: Theme.blue
+                                title: I18n.t("Something in your configuration overrides Vexyon")
+                                body: I18n.t("Vexyon's NixOS module provides all of this by default. If a piece is still missing, your own configuration turns it off or replaces it — for example virtualisation.libvirtd.enable = false, or your own qemu.package, swtpm or vhostUserPackages lines. Remove those lines and rebuild.")
+                            }
+                            PartLabel {
+                                visible: Vm.platform === "arch" && (!Vm.has.virsh || !Vm.has.qemu || !Vm.has.libvirtd
+                                         || !Vm.has.viewer || !Vm.has.swtpm || !Vm.has.virtiofs || !Vm.has.uefi)
+                                tag: "Arch"
+                                tone: Theme.blue
+                                title: I18n.t("Run the Vexyon installer again")
+                                body: I18n.t("It installs only what is missing, sets up libvirt again and keeps all your settings. Run ./install.sh from the vexyon_shell folder.")
+                            }
+
+                            // ======== plataforma desconocida ========
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                visible: Vm.platform === "unknown"
+                                spacing: 6
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: I18n.t("This system was not recognised, so no package names are shown — guessing them would be worse than nothing. Install the following components the way your distribution does it:")
+                                    color: Theme.text
+                                    wrapMode: Text.Wrap
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: Theme.fontSize - 1
+                                }
+                                Repeater {
+                                    model: [
+                                        I18n.t("libvirt (the daemon and the virsh client)"),
+                                        I18n.t("QEMU with KVM support"),
+                                        I18n.t("virt-viewer — for the graphical display"),
+                                        I18n.t("swtpm — only if you want emulated TPM"),
+                                        I18n.t("virtiofsd — only if you want shared folders"),
+                                        I18n.t("dnsmasq — for libvirt's default NAT network"),
+                                        I18n.t("Enable the libvirt daemon or its socket"),
+                                        I18n.t("Add your user to the libvirt group, then log out and back in")
+                                    ]
+                                    delegate: RowLayout {
+                                        required property var modelData
+                                        Layout.fillWidth: true
+                                        spacing: 8
+                                        Text {
+                                            Layout.alignment: Qt.AlignTop
+                                            text: "•"
+                                            color: Theme.overlay2
+                                            font.family: Theme.fontFamily
+                                            font.pixelSize: Theme.fontSize - 1
+                                        }
+                                        Text {
+                                            Layout.fillWidth: true
+                                            text: modelData
+                                            color: Theme.subtext1
+                                            wrapMode: Text.Wrap
+                                            font.family: Theme.fontFamily
+                                            font.pixelSize: Theme.fontSize - 2
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---------- red de las VMs y cortafuegos propios ----------
+                        //  Medido en la sesión de redes (PROJECT_STATE.md): los
+                        //  cortafuegos que Vexyon conoce ya quedan resueltos — el
+                        //  de NixOS con las excepciones virbr* del módulo, Docker
+                        //  y ufw en Arch con el motor iptables de libvirt que pone
+                        //  el instalador, firewalld con su zona libvirt. Solo un
+                        //  conjunto de reglas ESCRITO A MANO puede seguir cortando,
+                        //  y ese no se toca nunca por detrás.
+                        SsHeader { text: I18n.t("VM NETWORKING") }
                         Text {
                             Layout.fillWidth: true
-                            text: Vm.osName !== "" ? (I18n.t("Detected system") + ": " + Vm.osName) : ""
-                            visible: text !== ""
+                            text: I18n.t("VM networks work out of the box: Vexyon opens what they need in NixOS's firewall, switches libvirt to its iptables backend when Docker or ufw are installed on Arch, and firewalld needs nothing. Only a firewall ruleset you wrote yourself can still block them. If Diagnose networks, in the VM manager's Host networks tab, points to your firewall, allow these on libvirt's bridges — the first two in its input chain, the last two in its forward chain:")
                             color: Theme.subtext0
                             wrapMode: Text.Wrap
                             font.family: Theme.fontFamily
                             font.pixelSize: Theme.fontSize - 2
                         }
-
-                        // ======== NixOS ========
-                        ColumnLayout {
-                            Layout.fillWidth: true
-                            visible: Vm.detected && Vm.platform === "nixos"
-                            spacing: 6
-
-                            Text {
-                                Layout.fillWidth: true
-                                text: I18n.t("These go in your configuration.nix. They come in TWO parts and they are NOT interchangeable — read the label on each one before pasting.")
-                                color: Theme.text
-                                wrapMode: Text.Wrap
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize - 1
-                            }
-
-                            PartLabel {
-                                tag: I18n.t("PART A")
-                                tone: Theme.green
-                                title: I18n.t("Paste this as a NEW block")
-                                body: I18n.t("Nobody normally has these attributes already, so pasting the whole block is safe. Put it anywhere at the top level of configuration.nix.")
-                            }
-                            CodeBlock {
-                                tone: "add"
-                                code: "virtualisation.libvirtd = {\n"
-                                    + "  enable = true;\n"
-                                    + "  qemu = {\n"
-                                    + "    package = pkgs.qemu_kvm;\n"
-                                    + "    runAsRoot = true;\n"
-                                    + "    swtpm.enable = true;\n"
-                                    + "  };\n"
-                                    + "};"
-                            }
-                            Text {
-                                Layout.fillWidth: true
-                                text: I18n.t("Note: do NOT add a qemu.ovmf line. That submodule was removed — NixOS now refuses to build if you set it, because every OVMF/UEFI image shipped with QEMU is already available by default. It is why UEFI already shows as available above.")
-                                color: Theme.subtext0
-                                wrapMode: Text.Wrap
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize - 3
-                            }
-
-                            PartLabel {
-                                tag: I18n.t("PART B")
-                                tone: Theme.yellow
-                                title: I18n.t("ADD these to lists you ALREADY have")
-                                body: I18n.t("Do NOT paste these as new blocks. Nix does not merge two definitions of the same attribute in one file: a second environment.systemPackages or extraGroups makes the build fail with \"attribute already defined\". Open the lists you already have and add the entries inside them.")
-                            }
-                            Text {
-                                Layout.fillWidth: true
-                                text: I18n.t("Inside your existing environment.systemPackages, add:")
-                                color: Theme.text
-                                wrapMode: Text.Wrap
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize - 2
-                            }
-                            CodeBlock { tone: "merge"; code: "virt-viewer" }
-                            Text {
-                                Layout.fillWidth: true
-                                text: I18n.t("Inside your existing users.users.<your-name>.extraGroups, add:")
-                                color: Theme.text
-                                wrapMode: Text.Wrap
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize - 2
-                            }
-                            CodeBlock { tone: "merge"; code: "\"libvirtd\" \"kvm\"" }
-
-                            Text {
-                                Layout.fillWidth: true
-                                text: I18n.t("Only if you want shared folders, also add this as a NEW attribute:")
-                                color: Theme.text
-                                wrapMode: Text.Wrap
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize - 2
-                            }
-                            CodeBlock {
-                                tone: "add"
-                                code: "virtualisation.libvirtd.qemu.vhostUserPackages = [ pkgs.virtiofsd ];"
-                            }
-
-                            //  Cortafuegos: SOLO si hace falta (el diagnóstico de redes del
-                            //  gestor de VMs dice si aplica). Medido con el cortafuegos real
-                            //  que genera nixpkgs, libvirt 12.2 y el Docker real — ver la
-                            //  sesión de redes en PROJECT_STATE.md. Nada de apagar el
-                            //  cortafuegos ni de bridge-nf-call-iptables = 0: son
-                            //  excepciones acotadas a los puentes de libvirt (virbr*).
-                            PartLabel {
-                                tag: I18n.t("FIREWALL")
-                                tone: Theme.peach
-                                title: I18n.t("Only if VMs cannot reach each other, or get no address")
-                                body: I18n.t("Two parts of the NixOS firewall can cut libvirt traffic. Once br_netfilter is loaded (Docker, Incus and Kubernetes load it), the strict reverse-path filter also checks frames passing between VMs, and internal networks and a router VM's clients stop working. With networking.nftables.enable, the firewall also drops the DHCP and DNS requests VMs send to libvirt, because libvirt's own nftables rules cannot accept what another table drops. Diagnose networks, in the VM manager's Host networks tab, tells you which one applies.")
-                            }
-                            Text {
-                                Layout.fillWidth: true
-                                text: I18n.t("With the default (iptables) firewall, add this line inside networking.firewall.extraCommands — create the attribute if you do not have it yet:")
-                                color: Theme.text
-                                wrapMode: Text.Wrap
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize - 2
-                            }
-                            CodeBlock {
-                                tone: "merge"
-                                code: "networking.firewall.extraCommands = ''\n"
-                                    + "  ip46tables -t mangle -I nixos-fw-rpfilter -i virbr+ -m addrtype ! --dst-type LOCAL -j RETURN\n"
-                                    + "'';"
-                            }
-                            Text {
-                                Layout.fillWidth: true
-                                text: I18n.t("With networking.nftables.enable = true, add these instead:")
-                                color: Theme.text
-                                wrapMode: Text.Wrap
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize - 2
-                            }
-                            CodeBlock {
-                                tone: "merge"
-                                code: "networking.firewall.extraReversePathFilterRules = ''\n"
-                                    + "  iifname \"virbr*\" fib daddr type != local accept\n"
-                                    + "'';\n"
-                                    + "networking.firewall.extraInputRules = ''\n"
-                                    + "  iifname \"virbr*\" udp dport { 53, 67 } accept\n"
-                                    + "  iifname \"virbr*\" tcp dport 53 accept\n"
-                                    + "'';"
-                            }
-                            Text {
-                                Layout.fillWidth: true
-                                text: I18n.t("And only if you also set networking.firewall.filterForward = true:")
-                                color: Theme.text
-                                wrapMode: Text.Wrap
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize - 2
-                            }
-                            CodeBlock {
-                                tone: "merge"
-                                code: "networking.firewall.extraForwardRules = ''\n"
-                                    + "  iifname \"virbr*\" accept\n"
-                                    + "'';"
-                            }
-                            Text {
-                                Layout.fillWidth: true
-                                text: I18n.t("What this opens, and nothing more: frames that arrive through a libvirt bridge (virbr*) and are not addressed to this computer skip the reverse-path check, VMs reach libvirt's DHCP and DNS, and VMs may forward. Traffic to this computer is still checked, the rest of the firewall is untouched, and libvirt's own rules still decide what each network may reach — an internal network still cannot get out.")
-                                color: Theme.subtext0
-                                wrapMode: Text.Wrap
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize - 3
-                            }
-
-                            PartLabel {
-                                tag: I18n.t("THEN")
-                                tone: Theme.blue
-                                title: I18n.t("Rebuild, then log out and back in")
-                                body: I18n.t("The rebuild brings up libvirtd. Group membership only reaches your session at login, so a rebuild alone is not enough.")
-                            }
-                            CodeBlock { code: "sudo nixos-rebuild switch" }
-                            Text {
-                                Layout.fillWidth: true
-                                text: I18n.t("If your configuration is a flake, use your usual flake command instead (for example: sudo nixos-rebuild switch --flake /etc/nixos#your-hostname).")
-                                color: Theme.subtext0
-                                wrapMode: Text.Wrap
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize - 3
-                            }
-                        }
-
-                        // ======== Arch / CachyOS ========
-                        ColumnLayout {
-                            Layout.fillWidth: true
-                            visible: Vm.detected && Vm.platform === "arch"
-                            spacing: 6
-
-                            Text {
-                                Layout.fillWidth: true
-                                text: I18n.t("Run these three commands, then log out and back in.")
-                                color: Theme.text
-                                wrapMode: Text.Wrap
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize - 1
-                            }
-                            PartLabel {
-                                tag: "1"
-                                tone: Theme.green
-                                title: I18n.t("Install the packages")
-                                body: I18n.t("All five are in the official repositories. dnsmasq is what provides DHCP for libvirt's default NAT network — without it new VMs get no address.")
-                            }
-                            CodeBlock {
-                                tone: "add"
-                                code: "sudo pacman -S --needed libvirt qemu-desktop virt-viewer swtpm dnsmasq"
-                            }
-                            PartLabel {
-                                tag: "2"
-                                tone: Theme.green
-                                title: I18n.t("Start the libvirt socket")
-                                body: I18n.t("The socket activates the daemon on demand, so nothing runs until something asks for it.")
-                            }
-                            CodeBlock { tone: "add"; code: "sudo systemctl enable --now libvirtd.socket" }
-                            PartLabel {
-                                tag: "3"
-                                tone: Theme.yellow
-                                title: I18n.t("Add yourself to the groups")
-                                body: I18n.t("On Arch the group is called libvirt (not libvirtd). -aG appends, so your existing groups are kept — do not leave out the a.")
-                            }
-                            CodeBlock { tone: "merge"; code: "sudo usermod -aG libvirt,kvm $USER" }
-                            Text {
-                                Layout.fillWidth: true
-                                text: I18n.t("Only if you want shared folders, also install:")
-                                color: Theme.text
-                                wrapMode: Text.Wrap
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize - 2
-                            }
-                            CodeBlock { tone: "add"; code: "sudo pacman -S --needed virtiofsd" }
-                            Text {
-                                Layout.fillWidth: true
-                                text: I18n.t("Group membership only takes effect after you log out and back in.")
-                                color: Theme.subtext0
-                                wrapMode: Text.Wrap
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize - 3
-                            }
-
-                            //  Cortafuegos en Arch: NO es el de NixOS. No hay rpfilter de
-                            //  netfilter por defecto (systemd pone rp_filter=2 en el kernel,
-                            //  que no mira las tramas puenteadas); lo que corta es la
-                            //  política DROP de Docker o ufw en las tablas de iptables
-                            //  frente a las reglas nftables de libvirt, o un
-                            //  nftables.service propio. Medido en laboratorio con el Docker
-                            //  real — ver PROJECT_STATE.md.
-                            PartLabel {
-                                tag: I18n.t("FIREWALL")
-                                tone: Theme.peach
-                                title: I18n.t("Only if you use Docker or ufw")
-                                body: I18n.t("Docker and ufw set a DROP policy in the iptables tables. libvirt writes its own rules with nftables, into a separate table, and an accept there cannot undo a drop in another table: VMs lose the internet, each other (once br_netfilter is loaded), and with ufw also DHCP. Switching libvirt to its iptables backend puts its rules in the same tables, ahead of theirs. Diagnose networks, in the VM manager's Host networks tab, tells you if this applies.")
-                            }
-                            CodeBlock {
-                                tone: "add"
-                                code: "sudo sed -i '/^[[:space:]]*firewall_backend[[:space:]]*=/d' /etc/libvirt/network.conf\n"
-                                    + "echo 'firewall_backend = \"iptables\"' | sudo tee -a /etc/libvirt/network.conf\n"
-                                    + "sudo systemctl restart libvirtd"
-                            }
-                            Text {
-                                Layout.fillWidth: true
-                                text: I18n.t("Only if you enabled nftables.service and its /etc/nftables.conf drops by default: add the first two lines inside its input chain and the last two inside its forward chain, then restart nftables and libvirtd.")
-                                color: Theme.text
-                                wrapMode: Text.Wrap
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize - 2
-                            }
-                            CodeBlock {
-                                tone: "merge"
-                                code: "iifname \"virbr*\" udp dport { 53, 67 } accept\n"
-                                    + "iifname \"virbr*\" tcp dport 53 accept\n"
-                                    + "iifname \"virbr*\" accept\n"
-                                    + "oifname \"virbr*\" ct state established,related accept"
-                            }
-                            Text {
-                                Layout.fillWidth: true
-                                text: I18n.t("firewalld needs nothing: libvirt puts its networks in firewalld's libvirt zone, which already allows DHCP, DNS and forwarding.")
-                                color: Theme.subtext0
-                                wrapMode: Text.Wrap
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize - 3
-                            }
-                        }
-
-                        // ======== plataforma desconocida ========
-                        ColumnLayout {
-                            Layout.fillWidth: true
-                            visible: Vm.detected && Vm.platform === "unknown"
-                            spacing: 6
-                            Text {
-                                Layout.fillWidth: true
-                                text: I18n.t("This system was not recognised, so no package names are shown — guessing them would be worse than nothing. Install the following components the way your distribution does it:")
-                                color: Theme.text
-                                wrapMode: Text.Wrap
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize - 1
-                            }
-                            Repeater {
-                                model: [
-                                    I18n.t("libvirt (the daemon and the virsh client)"),
-                                    I18n.t("QEMU with KVM support"),
-                                    I18n.t("virt-viewer — for the graphical display"),
-                                    I18n.t("swtpm — only if you want emulated TPM"),
-                                    I18n.t("virtiofsd — only if you want shared folders"),
-                                    I18n.t("dnsmasq — for libvirt's default NAT network"),
-                                    I18n.t("Enable the libvirt daemon or its socket"),
-                                    I18n.t("Add your user to the libvirt and kvm groups, then log out and back in")
-                                ]
-                                delegate: RowLayout {
-                                    required property var modelData
-                                    Layout.fillWidth: true
-                                    spacing: 8
-                                    Text {
-                                        Layout.alignment: Qt.AlignTop
-                                        text: "•"
-                                        color: Theme.overlay2
-                                        font.family: Theme.fontFamily
-                                        font.pixelSize: Theme.fontSize - 1
-                                    }
-                                    Text {
-                                        Layout.fillWidth: true
-                                        text: modelData
-                                        color: Theme.subtext1
-                                        wrapMode: Text.Wrap
-                                        font.family: Theme.fontFamily
-                                        font.pixelSize: Theme.fontSize - 2
-                                    }
-                                }
-                            }
+                        CodeBlock {
+                            tone: "merge"
+                            code: "iifname \"virbr*\" udp dport { 53, 67 } accept\n"
+                                + "iifname \"virbr*\" tcp dport 53 accept\n"
+                                + "iifname \"virbr*\" accept\n"
+                                + "oifname \"virbr*\" ct state established,related accept"
                         }
 
                         // ---------- atajos ----------
@@ -3463,11 +3428,10 @@ FloatingWindow {
         }
 
         // ==================== Grabación de pantalla ====================
-        //  Mismo esquema que Virtualización: interruptor + comprobación
-        //  granular + instrucciones PROPIAS DE LA PLATAFORMA. wf-recorder es un
-        //  requisito opcional del ANFITRIÓN (como libvirt/qemu): ni el módulo de
-        //  Nix ni install.sh lo instalan. Ver PROJECT_STATE.md para dónde se
-        //  comprobó cada nombre de paquete.
+        //  Mismo esquema que Virtualización: tarjeta del módulo + comprobación
+        //  granular + qué hacer si falta algo. Desde 3.0 wf-recorder lo instala
+        //  Vexyon (install.sh en Arch, el módulo de NixOS), así que aquí ya no
+        //  hay pasos de instalación. Ver PROJECT_STATE.md.
         Component {
             id: cmpRec
             Flickable {
@@ -3480,62 +3444,19 @@ FloatingWindow {
                     width: parent.width
                     spacing: 12
 
-                    // ---------- interruptor ----------
-                    Rectangle {
-                        Layout.fillWidth: true
-                        implicitHeight: recSwCol.implicitHeight + 26
-                        radius: Theme.radius
-                        color: Theme.surface0
-                        ColumnLayout {
-                            id: recSwCol
-                            anchors.left: parent.left
-                            anchors.right: parent.right
-                            anchors.verticalCenter: parent.verticalCenter
-                            anchors.leftMargin: 14
-                            anchors.rightMargin: 12
-                            spacing: 4
-                            RowLayout {
-                                Layout.fillWidth: true
-                                spacing: 10
-                                Text {
-                                    Layout.fillWidth: true
-                                    text: I18n.t("Enable screen recording")
-                                    color: Theme.text
-                                    font.family: Theme.fontFamily
-                                    font.pixelSize: Theme.fontSize
-                                }
-                                Toggle {
-                                    checked: Config.get("recording", "enabled", false)
-                                    onToggled: function(v) {
-                                        Config.set("recording", "enabled", v);
-                                        // El indicador de barra va con la función: sin
-                                        // él no se vería que se está grabando. Solo
-                                        // existe mientras se graba, así que ponerlo no
-                                        // cambia nada en la barra el resto del tiempo.
-                                        if (v && !WidgetRegistry.hasWidget("recorder"))
-                                            WidgetRegistry.addWidgetAt("right", "recorder", 0);
-                                    }
-                                }
-                            }
-                            Text {
-                                Layout.fillWidth: true
-                                text: I18n.t("Off by default. While it is off, nothing related to recording is loaded: no process, no bar indicator, no launcher entry, no memory used.")
-                                color: Theme.subtext0
-                                wrapMode: Text.Wrap
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize - 2
-                            }
-                        }
-                    }
+                    // ---------- módulo ----------
+                    //  Módulo de sesión: no hay servicio detrás, así que el
+                    //  interruptor se aplica al momento.
+                    ModuleCard { mod: "recorder"; showLink: false }
 
-                    // Todo lo demás solo con el interruptor puesto. Un Loader y
+                    // Todo lo demás solo con el módulo encendido. Un Loader y
                     // no `visible`: un ítem invisible sigue evaluando sus
-                    // bindings, y estos leen Recorder — con el interruptor
-                    // apagado el singleton no debe existir.
+                    // bindings, y estos leen Recorder — con el módulo apagado
+                    // el singleton no debe existir.
                     Loader {
                         Layout.fillWidth: true
                         Layout.preferredHeight: item ? item.implicitHeight : 0
-                        active: Config.get("recording", "enabled", false) === true
+                        active: Modules.recorderOn
                         visible: active
                         sourceComponent: ColumnLayout {
                             spacing: 12
@@ -3610,128 +3531,45 @@ FloatingWindow {
                                 }
                             }
 
-                            // ---------- instrucciones por plataforma ----------
-                            //  Solo si falta algo: con todo instalado no hay nada
-                            //  que copiar y la página se queda corta.
+                            // ---------- si falta algo ----------
+                            //  Solo si falta algo. wf-recorder y pipewire-pulse
+                            //  los instala Vexyon; aquí solo queda qué hacer si
+                            //  una instalación quedó a medias o la configuración
+                            //  del usuario los quita.
                             ColumnLayout {
                                 Layout.fillWidth: true
                                 visible: Recorder.detected && (!Recorder.has.recorder || !Recorder.has.pulse)
                                 spacing: 6
 
-                                SsHeader { text: I18n.t("SETUP FOR YOUR SYSTEM") }
+                                SsHeader { text: I18n.t("IF SOMETHING IS MISSING") }
                                 Text {
                                     Layout.fillWidth: true
-                                    text: Recorder.osName !== "" ? (I18n.t("Detected system") + ": " + Recorder.osName) : ""
-                                    visible: text !== ""
-                                    color: Theme.subtext0
+                                    text: I18n.t("Vexyon installs wf-recorder and PipeWire's PulseAudio server itself, so none of this should need a command.")
+                                    color: Theme.text
                                     wrapMode: Text.Wrap
                                     font.family: Theme.fontFamily
-                                    font.pixelSize: Theme.fontSize - 2
+                                    font.pixelSize: Theme.fontSize - 1
                                 }
-
-                                // ======== NixOS ========
-                                ColumnLayout {
-                                    Layout.fillWidth: true
-                                    visible: Recorder.platform === "nixos"
-                                    spacing: 6
-
-                                    Text {
-                                        Layout.fillWidth: true
-                                        text: I18n.t("This goes in your configuration.nix. As with virtualization it comes in two parts, but here the first one is empty: screen recording is ONE entry inside a list you already have.")
-                                        color: Theme.text
-                                        wrapMode: Text.Wrap
-                                        font.family: Theme.fontFamily
-                                        font.pixelSize: Theme.fontSize - 1
-                                    }
-                                    PartLabel {
-                                        tag: I18n.t("PART A")
-                                        tone: Theme.green
-                                        title: I18n.t("Nothing to paste as a new block")
-                                        body: I18n.t("Screen recording needs no service and no option of its own: wf-recorder is a plain program that only runs while you record.")
-                                    }
-                                    PartLabel {
-                                        visible: !Recorder.has.recorder
-                                        tag: I18n.t("PART B")
-                                        tone: Theme.yellow
-                                        title: I18n.t("ADD this to a list you ALREADY have")
-                                        body: I18n.t("Do NOT paste it as a new block. Nix does not merge two definitions of the same attribute in one file: a second environment.systemPackages makes the build fail with \"attribute already defined\". Open the list you already have and add the entry inside it.")
-                                    }
-                                    Text {
-                                        Layout.fillWidth: true
-                                        visible: !Recorder.has.recorder
-                                        text: I18n.t("Inside your existing environment.systemPackages, add:")
-                                        color: Theme.text
-                                        wrapMode: Text.Wrap
-                                        font.family: Theme.fontFamily
-                                        font.pixelSize: Theme.fontSize - 2
-                                    }
-                                    CodeBlock { visible: !Recorder.has.recorder; tone: "merge"; code: "wf-recorder" }
-                                    Text {
-                                        Layout.fillWidth: true
-                                        visible: !Recorder.has.recorder
-                                        text: I18n.t("If you install your packages with Home Manager instead, add it to your home.packages list the same way.")
-                                        color: Theme.subtext0
-                                        wrapMode: Text.Wrap
-                                        font.family: Theme.fontFamily
-                                        font.pixelSize: Theme.fontSize - 3
-                                    }
-                                    PartLabel {
-                                        visible: !Recorder.has.pulse
-                                        tag: I18n.t("SOUND")
-                                        tone: Theme.yellow
-                                        title: I18n.t("CHANGE the line you already have")
-                                        body: I18n.t("The Vexyon module already turns PipeWire's PulseAudio server on, so if it is off your configuration sets it to false somewhere. Change THAT line to true: adding a second line makes the build fail with conflicting values.")
-                                    }
-                                    CodeBlock { visible: !Recorder.has.pulse; tone: "merge"; code: "services.pipewire.pulse.enable = true;" }
-
-                                    PartLabel {
-                                        tag: I18n.t("THEN")
-                                        tone: Theme.blue
-                                        title: I18n.t("Rebuild")
-                                        body: I18n.t("No need to log out: when the rebuild finishes, press the refresh button above.")
-                                    }
-                                    CodeBlock { code: "sudo nixos-rebuild switch" }
-                                    Text {
-                                        Layout.fillWidth: true
-                                        text: I18n.t("If your configuration is a flake, use your usual flake command instead (for example: sudo nixos-rebuild switch --flake /etc/nixos#your-hostname).")
-                                        color: Theme.subtext0
-                                        wrapMode: Text.Wrap
-                                        font.family: Theme.fontFamily
-                                        font.pixelSize: Theme.fontSize - 3
-                                    }
+                                PartLabel {
+                                    visible: Recorder.platform === "nixos" && !Recorder.has.recorder
+                                    tag: "NixOS"
+                                    tone: Theme.blue
+                                    title: I18n.t("Rebuild your system")
+                                    body: I18n.t("Vexyon's NixOS module installs wf-recorder. If it is missing, this system was built with an older Vexyon: update the Vexyon flake input and rebuild.")
                                 }
-
-                                // ======== Arch / CachyOS ========
-                                ColumnLayout {
-                                    Layout.fillWidth: true
+                                PartLabel {
+                                    visible: Recorder.platform === "nixos" && !Recorder.has.pulse
+                                    tag: I18n.t("SOUND")
+                                    tone: Theme.yellow
+                                    title: I18n.t("Your configuration turns PipeWire's PulseAudio server off")
+                                    body: I18n.t("The Vexyon module turns it on, so your configuration sets services.pipewire.pulse.enable = false somewhere. Remove that line (or set it to true) and rebuild. Without it recordings are silent; video works the same.")
+                                }
+                                PartLabel {
                                     visible: Recorder.platform === "arch"
-                                    spacing: 6
-
-                                    PartLabel {
-                                        visible: !Recorder.has.recorder
-                                        tag: "1"
-                                        tone: Theme.green
-                                        title: I18n.t("Install the package")
-                                        body: I18n.t("wf-recorder is in the official extra repository. It talks to the compositor directly, so there is nothing to enable afterwards.")
-                                    }
-                                    CodeBlock { visible: !Recorder.has.recorder; tone: "add"; code: "sudo pacman -S --needed wf-recorder" }
-                                    PartLabel {
-                                        visible: !Recorder.has.pulse
-                                        tag: Recorder.has.recorder ? "1" : "2"
-                                        tone: Theme.yellow
-                                        title: I18n.t("Only for sound: PipeWire's PulseAudio server")
-                                        body: I18n.t("Vexyon's installer already installs pipewire-pulse. If it was removed or is not running, put it back and start it for your user:")
-                                    }
-                                    CodeBlock { visible: !Recorder.has.pulse; tone: "add"; code: "sudo pacman -S --needed pipewire-pulse" }
-                                    CodeBlock { visible: !Recorder.has.pulse; tone: "add"; code: "systemctl --user enable --now pipewire-pulse.socket" }
-                                    Text {
-                                        Layout.fillWidth: true
-                                        text: I18n.t("No need to log out: press the refresh button above afterwards.")
-                                        color: Theme.subtext0
-                                        wrapMode: Text.Wrap
-                                        font.family: Theme.fontFamily
-                                        font.pixelSize: Theme.fontSize - 3
-                                    }
+                                    tag: "Arch"
+                                    tone: Theme.blue
+                                    title: I18n.t("Run the Vexyon installer again")
+                                    body: I18n.t("It installs only what is missing and keeps all your settings. Run ./install.sh from the vexyon_shell folder, then press the refresh button above.")
                                 }
 
                                 // ======== plataforma desconocida ========
@@ -3906,6 +3744,115 @@ FloatingWindow {
             }
         }
 
+        // ==================== Módulos (3.0) ====================
+        //  Las partes opcionales de Vexyon, cada una con su tarjeta (ver
+        //  ModuleCard arriba y services/Modules.qml). Lo que no está aquí es
+        //  núcleo y no se puede apagar. Ver PROJECT_STATE.md → Vexyon 3.0.
+        Component {
+            id: cmpModules
+            Flickable {
+                contentHeight: modCol.implicitHeight
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                // Una lectura al abrir: lo que comparte cada servicio (p. ej.
+                // virt-manager instalado después) puede haber cambiado.
+                Component.onCompleted: Modules.refresh()
+
+                ColumnLayout {
+                    id: modCol
+                    width: parent.width
+                    spacing: 12
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: I18n.t("Optional parts of Vexyon. Everything they need was installed with Vexyon, and all of them are on by default. Turning one off stops what it runs in the background; your files, VMs and settings stay, and turning it back on needs no download.")
+                        color: Theme.subtext0
+                        wrapMode: Text.Wrap
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSize - 1
+                    }
+
+                    // ---------- cambios pendientes de reinicio ----------
+                    Rectangle {
+                        Layout.fillWidth: true
+                        visible: Modules.anyPending
+                        implicitHeight: pendRow.implicitHeight + 22
+                        radius: Theme.radius
+                        color: Qt.rgba(Theme.yellow.r, Theme.yellow.g, Theme.yellow.b, 0.12)
+                        border.width: 1
+                        border.color: Theme.yellow
+                        RowLayout {
+                            id: pendRow
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.leftMargin: 14
+                            anchors.rightMargin: 12
+                            spacing: 10
+                            Text {
+                                text: Icons.info
+                                color: Theme.yellow
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize + 4
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: I18n.t("Your changes are saved. They take effect the next time the computer starts.")
+                                color: Theme.text
+                                wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 1
+                            }
+                            // Abre el menú de energía de siempre (con su propia
+                            // confirmación): aquí no se reinicia nada por sorpresa.
+                            Rectangle {
+                                implicitWidth: modRestartTxt.implicitWidth + 24
+                                implicitHeight: 32
+                                radius: Theme.radius
+                                color: modRestartMa.containsMouse ? Theme.surface2 : Theme.surface1
+                                Behavior on color { ColorAnimation { duration: Theme.dur(120) } }
+                                Text {
+                                    id: modRestartTxt
+                                    anchors.centerIn: parent
+                                    text: I18n.t("Restart…")
+                                    color: Theme.text
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: Theme.fontSize - 1
+                                }
+                                MouseArea {
+                                    id: modRestartMa
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: Panels.open("powermenu")
+                                }
+                            }
+                        }
+                    }
+
+                    Repeater {
+                        model: Modules.catalog
+                        delegate: ModuleCard {
+                            required property var modelData
+                            mod: modelData.id
+                        }
+                    }
+
+                    SsHeader { text: I18n.t("ALWAYS ON") }
+                    Text {
+                        Layout.fillWidth: true
+                        text: I18n.t("The core of Vexyon cannot be turned off: the bar, launcher, panels, notifications, lock and login screens, wallpaper, clipboard history, night light, audio (PipeWire), networking (NetworkManager) and power (UPower, power profiles). Tools such as the calculator, screenshots, the color picker and the file manager run only while you use them.")
+                        color: Theme.subtext0
+                        wrapMode: Text.Wrap
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSize - 2
+                    }
+
+                    Item { Layout.fillHeight: true }
+                }
+            }
+        }
+
         Component {
             id: cmpAbout
             ColumnLayout {
@@ -3930,7 +3877,7 @@ FloatingWindow {
                 }
                 Text {
                     Layout.topMargin: 4
-                    text: I18n.t("Version") + " 1.8"
+                    text: I18n.t("Version") + " 3.0"
                     color: Theme.subtext0
                     font.family: Theme.fontFamily
                     font.pixelSize: Theme.fontSize - 1

@@ -117,11 +117,16 @@ AnchoredPanel {
                     Layout.fillWidth: true
                     icon: Icons.bluetooth
                     title: "Bluetooth"
-                    subtitle: !Bluetooth.present ? I18n.t("No adapter")
+                    // Módulo Bluetooth apagado (Ajustes → Módulos): se dice
+                    // así, no "Sin adaptador", y el clic lleva a donde se
+                    // enciende.
+                    subtitle: Bluetooth.moduleOff ? I18n.t("Module off")
+                              : !Bluetooth.present ? I18n.t("No adapter")
                               : !Bluetooth.enabled ? I18n.t("Disabled")
                               : Bluetooth.connectedCount > 0 ? Bluetooth.firstDeviceName : I18n.t("Enabled")
                     active: Bluetooth.present && Bluetooth.enabled
                     onClicked: {
+                        if (Bluetooth.moduleOff) { Panels.openSettingsAt("modules"); return; }
                         Panels.networkInitTab = "bt";
                         Panels.open("networkPanel");
                     }

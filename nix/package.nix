@@ -18,6 +18,7 @@
   glib,
   hyprland,
   quickshell,
+  systemd,
 }:
 
 let
@@ -55,7 +56,7 @@ let
 in
 stdenvNoCC.mkDerivation (finalAttrs: {
   pname = "vexyon-shell";
-  version = "0.1.0";
+  version = "3.0.0";
 
   src = lib.cleanSourceWith {
     src = ../.;
@@ -130,6 +131,24 @@ stdenvNoCC.mkDerivation (finalAttrs: {
     install -Dm644 config/polkit/49-vexyon-power.rules \
       $share/polkit/49-vexyon-power.rules
 
+    # --- módulos (3.0): la ÚNICA operación privilegiada del shell ------------
+    # Copia de root del ayudante, la que ejecuta pkexec. Va en libexec y con
+    # un PATH FIJO (--set, no --prefix): pkexec limpia el entorno y deja un
+    # PATH de /usr/bin que en NixOS no existe, y como root no debe heredar
+    # nada del usuario. systemd por `systemctl is-system-running` (boot-apply).
+    install -Dm755 config/vexyon/bin/vexyon-modules $out/libexec/vexyon/vexyon-modules
+    patchShebangs $out/libexec/vexyon
+    wrapProgram $out/libexec/vexyon/vexyon-modules \
+      --set PATH "${lib.makeBinPath [ coreutils gnugrep gnused systemd ]}"
+    # La acción de polkit tiene que nombrar EXACTAMENTE la ruta que ejecuta
+    # pkexec (la compara tras realpath): aquí, la de esta copia en el store.
+    # Llega a /run/current-system/sw/share/polkit-1/actions por systemPackages.
+    install -d $out/share/polkit-1/actions
+    substitute config/polkit/org.vexyon.modules.policy \
+      $out/share/polkit-1/actions/org.vexyon.modules.policy \
+      --replace-fail '/usr/local/lib/vexyon/vexyon-modules' \
+                     "$out/libexec/vexyon/vexyon-modules"
+
     # --- helpers ----------------------------------------------------------
     install -d $out/bin
     for f in config/vexyon/bin/*; do
@@ -144,7 +163,8 @@ stdenvNoCC.mkDerivation (finalAttrs: {
         --prefix PATH : "${runtimeBin}" \
         --set-default VEXYON_SHARE "$share" \
         --set-default VEXYON_BIN_DIR "$out/bin" \
-        --set-default VEXYON_GREETER_STATE_DIR "${greeterStateDir}"
+        --set-default VEXYON_GREETER_STATE_DIR "${greeterStateDir}" \
+        --set VEXYON_MODULES_HELPER "$out/libexec/vexyon/vexyon-modules"
     done
 
     runHook postInstall
