@@ -413,9 +413,14 @@ Singleton {
     //  proceso que ya existía — NO es un sondeo: no hay Timer, no hay nada
     //  repitiéndose en el shell, y cuando la orden acaba no queda nada vivo.
     property string _startedName: ""
-    function start(name) {
+    property bool _startedDgpu: false
+    // `onDgpu`: el botón "Iniciar (pantalla en la GPU dedicada)". Abre SIEMPRE
+    // la pantalla al terminar (es lo único que cambia respecto a Iniciar), así
+    // que espera al display aunque openOnStart esté apagado.
+    function start(name, onDgpu) {
         root._startedName = name;
-        var wait = root.openOnStart
+        root._startedDgpu = onDgpu === true;
+        var wait = (root.openOnStart || root._startedDgpu)
             ? "; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do " +
                 "d=$($V domdisplay " + q(name) + " 2>/dev/null); " +
                 "[ -n \"$d\" ] && break; " +
@@ -1342,7 +1347,7 @@ Singleton {
     //  márgenes. Necesita el agente `spice-vdagent` DENTRO del invitado y el
     //  canal `com.redhat.spice.0` en el dominio (Vm.hasSpiceAgent): sin las dos
     //  cosas virt-viewer no puede pedirle nada al invitado. La UI lo dice.
-    function openViewer(name) {
+    function openViewer(name, onDgpu) {
         if (!root.enabled || !name) return;
         // Sin virt-viewer, `execDetached` no falla de forma visible: el proceso
         // simplemente no arranca y el usuario ve... nada. Se dice.
@@ -1354,7 +1359,44 @@ Singleton {
                    "--hotkeys=" + root.viewerHotkeys];
         if (root.viewerFullscreen) cmd.push("-f");
         cmd.push(name);
+        // En la GPU dedicada: el MISMO virt-viewer con las variables que da
+        // vexyon-gpu-detect (ver `dgpu`) delante, vía `env`. `env` hace exec,
+        // así que la ventana sigue siendo de clase "virt-viewer" y le siguen
+        // valiendo la regla del monitor enfocado (bridge) y la apertura en
+        // ventana: nada de lo arreglado cambia.
+        if (onDgpu === true && root.dgpu.state === "on" && root.dgpu.env.length > 0)
+            cmd = ["env"].concat(root.dgpu.env).concat(cmd);
         Quickshell.execDetached(cmd);
+    }
+
+    // ---- GPU dedicada para el VISOR (no para la VM) --------------------------
+    //  En portátiles híbridos (iGPU + dGPU: Intel/AMD + Nvidia, Intel + AMD,
+    //  AMD + AMD…) el gestor ofrece abrir la pantalla con la dGPU. Eso SOLO
+    //  elige qué GPU del ANFITRIÓN usa la ventana de virt-viewer; la VM no
+    //  recibe ninguna GPU (eso sería passthrough VFIO, descartado a propósito).
+    //  Y con el display que crea este gestor (SPICE sin GL) spice-gtk pinta la
+    //  pantalla del invitado con cairo en la CPU: medido, el visor no carga
+    //  ningún driver de GPU con o sin estas variables. La UI lo dice.
+    //
+    //  La decisión NO se toma aquí: la toma `vexyon-gpu-detect offload`, el
+    //  MISMO script que fija el shell a la iGPU (mismo escaneo de sysfs, mismos
+    //  modos). Devuelve state on/off/none, el motivo si está apagada y las
+    //  variables que ponen UNA app en la dGPU (el trío de prime-run con el
+    //  driver de Nvidia, DRI_PRIME=pci-… con Mesa). Se pregunta UNA vez al
+    //  abrir el gestor — sin sondeo: una dGPU solo cambia de estado reiniciando
+    //  o cerrando sesión (envycontrol, supergfxctl).
+    //   none -> no hay botón (una sola GPU, como la torre)
+    //   off  -> botón gris y el motivo debajo
+    //   on   -> botón activo
+    property var dgpu: ({ state: "none", name: "", why: "", driver: "", env: [] })
+    readonly property string gpuBin: {
+        var d = Quickshell.env("VEXYON_BIN_DIR");
+        var base = (d && d !== "") ? d : Quickshell.env("HOME") + "/.config/vexyon/bin";
+        return base + "/vexyon-gpu-detect";
+    }
+    function detectGpu() {
+        if (!root.enabled || gpuProbe.running) return;
+        gpuProbe.running = true;
     }
     // En VENTANA por defecto. A pantalla completa se pasa desde el compositor
     // (Super+Shift+F), que es lo mismo que se hace con cualquier otra ventana.
@@ -1586,8 +1628,8 @@ Singleton {
             // terminar la orden (que ya ha esperado a que el dominio publique
             // su display), no al pulsar: lanzarlo antes abría un visor que se
             // cerraba solo.
-            if (code === 0 && root.lastAction === "start" && root.openOnStart)
-                root.openViewer(root._startedName);
+            if (code === 0 && root.lastAction === "start" && (root.openOnStart || root._startedDgpu))
+                root.openViewer(root._startedName, root._startedDgpu);
             root.actionDone(root.lastAction, code === 0);
             // Releer SIEMPRE tras una acción: es el mecanismo por el que la
             // pastilla de barra aparece/desaparece sin ningún temporizador.
@@ -1761,6 +1803,26 @@ Singleton {
                 for (var i = 0; i < ls.length; i++)
                     if (ls[i].trim() !== "") out.push(ls[i].trim());
                 root.hostBridges = out;
+            }
+        }
+    }
+
+    Process {
+        id: gpuProbe
+        // con bash delante: una subida por la web de GitHub pierde el +x
+        command: ["bash", root.gpuBin, "offload"]
+        stdout: StdioCollector {
+            onStreamFinished: {
+                var m = {}, ls = this.text.split("\n");
+                for (var i = 0; i < ls.length; i++) {
+                    var e = ls[i].indexOf("=");
+                    if (e > 0) m[ls[i].slice(0, e)] = ls[i].slice(e + 1).trim();
+                }
+                var st = (m.state === "on" || m.state === "off") ? m.state : "none";
+                root.dgpu = {
+                    state: st, name: m.name || "", why: m.why || "", driver: m.driver || "",
+                    env: (m.env || "").split(" ").filter(function(x) { return x.indexOf("=") > 0; })
+                };
             }
         }
     }

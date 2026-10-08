@@ -6,6 +6,204 @@
 > instead of replacing it. The same entries are in both trees (`vexyon_shell`
 > for Arch/CachyOS and `vexyon_shell_nixos` for NixOS).
 
+## Session: VM manager — open a VM's display on the dedicated GPU (hybrid laptops)
+
+### Files changed
+
+| file | what |
+|---|---|
+| `config/vexyon/bin/vexyon-gpu-detect` | new `offload` subcommand (same block in both trees) |
+| `config/vexyon/services/Vm.qml` | `dgpu` + `detectGpu()`; `start(name, onDgpu)`, `openViewer(name, onDgpu)` |
+| `config/vexyon/modules/VmManager.qml` | two buttons + the explanation line; probe once when the manager opens |
+| `config/vexyon/services/I18n.qml` | ES strings (11) |
+
+**Byte-identical across trees:**
+- `Vm.qml`, `VmManager.qml` and `I18n.qml` are `cmp`-identical, as before.
+- `vexyon-gpu-detect` gets the same `offload` block in both trees. The two
+  files still differ only where they already did: the NixOS-only `is-igpu`
+  subcommand, its header lines, and the usage line.
+
+**Not touched:** the bar panel (`VmPanel.qml`), whose "Display" button keeps
+the normal launch; the bridge; `install.sh`; the Nix module.
+
+### Read this first: what the button does, and what it does not
+
+- **It only chooses which host GPU the viewer window (`virt-viewer`) may use.**
+  The VM gets no GPU. That would be VFIO passthrough, which this project rules
+  out; nothing about the domain or the guest changes.
+- **Measured before building:** for the VMs this manager creates (SPICE without
+  GL; `<graphics type='spice'>` has no `<gl enable='yes'/>`), the viewer does
+  not use any GPU at all.
+  - Setup: real QEMU 10.2.4 (qxl, SPICE, no GL), real `remote-viewer`
+    (virt-viewer 11.0, spice-gtk 0.42) under Wayland.
+  - The guest displayed fine. All 52 frames were `wl_shm` (CPU) buffers, and
+    no GL/EGL/GPU driver library was mapped into the process.
+  - Re-run with exactly the variables `prime-run` sets, plus `DRI_PRIME=1`:
+    identical.
+  - The source agrees: spice-gtk switches to its GL widget only when the server
+    sends a GL scanout (SPICE GL); otherwise it paints with cairo.
+- **So with these VMs the difference may be none,** and the UI says so. It can
+  only matter for a domain the user defined with SPICE GL, where the viewer
+  composes with GL. Not testable here (no GPU).
+- **The user decided to build it anyway** (asked explicitly this session). The
+  wording below is chosen so it doesn't promise more than that.
+
+### UI wording (exact)
+
+Only on hybrid machines. With no dGPU nothing is added: no button, no line.
+
+| element | EN | ES |
+|---|---|---|
+| next to **Start** | Start (display on dedicated GPU) | Iniciar (pantalla en la GPU dedicada) |
+| next to **Open display** | Open display on dedicated GPU | Abrir pantalla en la GPU dedicada |
+| line under them, dGPU on | Dedicated GPU (NVIDIA): only the window that shows the VM uses it; the VM itself gets no GPU. VMs without 3D, like the ones created here, are drawn on the CPU either way, so the difference may be none. | GPU dedicada (NVIDIA): solo la usa la ventana que muestra la VM; … |
+| line, dGPU off (amber) | Dedicated GPU is currently disabled: \<reason\>. Only the normal start is available. | La GPU dedicada está desactivada: \<motivo\>. … |
+
+**Reasons:** envycontrol is in integrated mode · supergfxctl is in Integrated
+mode · supergfxctl has reserved it for passthrough, Vfio mode · it is bound to
+vfio-pci, reserved for passthrough · no graphics driver is loaded for it.
+
+**Button states:** with the dGPU off both buttons are visible but greyed, and a
+click does nothing. With it on they follow the same rules as Start / Open
+display (Start only when shut off; Open display only when running).
+
+### Detection: reused, not a second detector
+
+`vexyon-gpu-detect offload` runs **after the same sysfs scan and the same
+mode decision** that pin the shell to the iGPU. It does not touch `env`, `lua`
+or `is-igpu`: 72 outputs were compared against the committed script on every
+test layout, all byte-identical.
+
+| `vexyon-gpu-detect` mode | `offload` state | UI |
+|---|---|---|
+| `pin`, `nopin-external` (iGPU candidate + another GPU) | **on** | both buttons active |
+| `static-single`, and the only GPU is an iGPU candidate, but a dGPU is known to be off | **off** | greyed + reason |
+| `static-single` otherwise (one GPU, e.g. RTX-only tower) | none | nothing |
+| `static-nvidia` (Nvidia drives the displays: MUX dGPU mode, desktop) | none | nothing; the dGPU already is the main GPU |
+| `static-none` | none | nothing |
+
+**"on": which card is the dGPU.** Any DRM card that isn't the elected iGPU;
+with several, the Nvidia one, otherwise the one with the most VRAM. Not
+"Nvidia exists": a lone Nvidia is `static-single` → none.
+
+**"off": how a switched-off dGPU is found.** Only checked when the remaining
+GPU is an iGPU candidate:
+1. A PCI display-class device (`0x03xxxx`) with no DRM card: bound to
+   `vfio-pci`, or its driver blacklisted.
+2. `envycontrol --query` = `integrated`, or `supergfxctl -g` =
+   `Integrated` / `Vfio`. Both run with `timeout 3`, and only if the tool is
+   installed.
+   - In integrated mode these tools **remove the dGPU from the PCI bus**, so
+     sysfs has no trace of it. Only they know it exists.
+   - **Limit:** a dGPU removed by some other means looks exactly like a
+     single-GPU machine, so no button appears. That is the honest answer to
+     "if the detection can reliably determine this".
+
+**How to put one app on the dGPU** (`env=`): the same mechanisms the project
+already relies on. `install.sh`/`vexyon-gpu-detect` say the session pin leaves
+"prime-run/DRI_PRIME" working per app.
+- **Proprietary Nvidia driver:** the trio `prime-run` sets,
+  `__NV_PRIME_RENDER_OFFLOAD=1 __VK_LAYER_NV_optimus=NVIDIA_only __GLX_VENDOR_LIBRARY_NAME=nvidia`.
+  The pin mode sets these three the other way for the session; per app they
+  are overridden.
+- **Any Mesa driver** (amdgpu, radeon, i915, xe, nouveau):
+  `DRI_PRIME=pci-<domain_bus_dev_fn>` of that card.
+- `prime-run` itself is **not** hard-coded: the project never installs it
+  (Arch's optional `nvidia-prime`; NixOS has `nvidia-offload` only with
+  `hardware.nvidia.prime.offload.enableOffloadCmd`). The decision stays in
+  `vexyon-gpu-detect`.
+
+**Launch:** `env <vars> virt-viewer <same args as before>`.
+- `env` execs, so the window is still class `virt-viewer`. The bridge's
+  `vexyon-virt-viewer-unset-initial-ws` rule (focused monitor, not DP-1) still
+  matches, and it still opens windowed (`-f` only with
+  `virtualization.viewerFullscreen`).
+- "Start (display on dedicated GPU)" always opens the display when the VM is
+  up, even with `virtualization.openOnStart` off. It uses the same bounded wait
+  for `domdisplay` as Start.
+
+**Cost:** one `bash vexyon-gpu-detect offload` each time the VM manager window
+opens (`Vm.detectGpu()` in `onVisibleChanged`). No daemon, no timer: a dGPU
+only changes state across a reboot or logout (envycontrol, supergfxctl). It is
+run through `bash` because a GitHub web upload drops the `+x` bit.
+
+### Verification
+
+**Static, both trees.** `vexyon-gpu-detect offload` against fake sysfs trees,
+through the script's own `VEXYON_GPU_SYS` override plus the new
+`VEXYON_PCI_SYS`. Same results in both trees:
+
+| layout | mode | offload |
+|---|---|---|
+| RTX 5080 only (the tower) | static-single | **none** |
+| RTX 5080 only + envycontrol/supergfxctl claiming integrated | static-single | **none** (guard) |
+| Intel + NVIDIA (proprietary) | pin | on, NVIDIA, Nvidia trio |
+| Intel + NVIDIA (nouveau) | pin | on, `DRI_PRIME=pci-0000_01_00_0` |
+| AMD APU + NVIDIA | pin | on, NVIDIA, Nvidia trio |
+| Intel + AMD dGPU | pin | on, AMD, `DRI_PRIME=pci-0000_03_00_0` |
+| AMD + AMD (no boot_vga; APU found by smaller VRAM) | pin | on, AMD dGPU, `DRI_PRIME` |
+| Intel + Intel Arc (xe) | pin | on, Intel, `DRI_PRIME` |
+| Intel + NVIDIA, monitor on the dGPU | nopin-external | on |
+| NVIDIA bound to vfio-pci | static-single | off, no-driver / vfio-pci |
+| NVIDIA with no driver | static-single | off, no-driver |
+| dGPU removed + envycontrol `integrated` | static-single | off, envycontrol-integrated |
+| dGPU removed + supergfxctl `Integrated` / `Vfio` / `Hybrid` | static-single | off / off / none |
+| dGPU removed, no switcher | static-single | none (limit above) |
+| MUX dGPU mode (NVIDIA boot_vga) | static-nvidia | none |
+
+`bash -n` passes in both trees. qmllint (Qt 6.11.2, `qs.*` tree), old vs new:
+same warning counts for `Vm.qml`, `VmManager.qml` and `I18n.qml`.
+
+**Live** (cloud container, **not the tower**): real libvirtd 12.2.0 + QEMU
+10.2.4 (TCG) with a throwaway domain `vexyon-throwaway-gpu`, deleted afterwards.
+**Ryoku2 was never touched.** Real shell on headless sway, opened through the
+launcher with real key presses; buttons clicked with real pointer events.
+- **No GPU** (this container has none → `static-single`, the same path as the
+  single-GPU tower): only **Start** and **Open display**, no line.
+- **Normal Start, after the change:** VM running, `virt-viewer` with the same
+  arguments as before and no offload variables, `app_id` `virt-viewer`,
+  `fullscreen_mode` 0.
+- **Fake Intel+NVIDIA layout** → both buttons and the line. "Open display on
+  dedicated GPU" → `virt-viewer` (same arguments) with the Nvidia trio in its
+  environment, class `virt-viewer`, windowed.
+- **Fake Intel+AMD layout, `openOnStart` off** → "Start (display on dedicated
+  GPU)" started the VM and opened the display with
+  `DRI_PRIME=pci-0000_03_00_0`, tiled next to the manager.
+- **Fake vfio layout** → greyed buttons + amber reason; clicking the greyed
+  button launched nothing.
+- **Fake removed dGPU + envycontrol shim, in Spanish** → greyed + "envycontrol
+  está en modo integrada".
+- **Test-only shims, all in the scratch copy, none in the repos:**
+  - the KVM-device and libvirt/kvm group checks were forced to pass (the
+    container has no `/dev/kvm`);
+  - fake sysfs trees;
+  - a fake `envycontrol`.
+
+### Not verified (needs a real hybrid laptop)
+
+- Real dGPU offload: whether the viewer actually lands on the dGPU, power-up
+  and power-down, cross-GPU buffer sharing.
+- Real `envycontrol --query` / `supergfxctl -g` output. The shims print their
+  documented values.
+- Hyprland itself: sway was used. The focused-monitor rule is untouched and the
+  window class is unchanged, which is what it matches on.
+- **This tower** (RTX 5080 only): its `static-single` path was checked with the
+  fake RTX-only layout and the GPU-less container, not on the tower.
+- **Arch:** checked statically only (no pacman here). Its files are identical
+  to NixOS except for the pre-existing `is-igpu` lines.
+
+### To check on a hybrid laptop
+
+1. Open the VM manager. The two "dedicated GPU" buttons and the line should
+   appear, naming the dGPU.
+2. Click "Open display on dedicated GPU" for a running VM. In another terminal,
+   `tr '\0' '\n' < /proc/$(pgrep -n virt-viewer)/environ | grep -E 'PRIME|NV_|GLX'`
+   should show the offload variables.
+3. `envycontrol -s integrated` (or `supergfxctl -m Integrated`), reboot or log
+   in again, and reopen the manager: greyed buttons with the reason.
+
+---
+
 ## Session: built-in screen recorder (wf-recorder, native Quickshell UI, Super+Shift+R)
 
 ### Files changed

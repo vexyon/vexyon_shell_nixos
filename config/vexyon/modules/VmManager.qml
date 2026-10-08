@@ -151,6 +151,22 @@ FloatingWindow {
     //  fuera del shell — apagar el invitado desde dentro, un `virsh destroy`
     //  desde otra terminal, un cuelgue. Se suelta al cerrar, y si no queda
     //  ninguna VM encendida el proceso que escucha desaparece.
+    // Texto bajo los botones de la GPU dedicada (ver Vm.dgpu).
+    function dgpuNote() {
+        var g = Vm.dgpu;
+        if (g.state === "off") {
+            var why = g.why === "envycontrol-integrated" ? I18n.t("envycontrol is in integrated mode")
+                    : g.why === "supergfxctl-integrated" ? I18n.t("supergfxctl is in Integrated mode")
+                    : g.why === "supergfxctl-vfio" ? I18n.t("supergfxctl has reserved it for passthrough, Vfio mode")
+                    : g.driver === "vfio-pci" ? I18n.t("it is bound to vfio-pci, reserved for passthrough")
+                    : I18n.t("no graphics driver is loaded for it");
+            return I18n.t("Dedicated GPU is currently disabled") + ": " + why + ". "
+                 + I18n.t("Only the normal start is available.");
+        }
+        return I18n.t("Dedicated GPU") + (g.name !== "" ? " (" + g.name + ")" : "") + ": "
+             + I18n.t("only the window that shows the VM uses it; the VM itself gets no GPU. VMs without 3D, like the ones created here, are drawn on the CPU either way, so the difference may be none.");
+    }
+
     property bool _watching: false
     function _watch(on) {
         if (on === vm._watching) return;
@@ -164,6 +180,7 @@ FloatingWindow {
             Vm.prime();      // recuerda la petición si Config aún no está lista
             vm._watch(true);
             Vm.refresh();
+            Vm.detectGpu();  // ¿hay GPU dedicada para el visor? Una vez por apertura
             if (vm.selected !== "") Vm.loadDetail(vm.selected);
         } else {
             vm._watch(false);
@@ -877,6 +894,16 @@ FloatingWindow {
                                 enabled: !Vm.busy && vm.sel && vm.sel.state === "shut off"
                                 onClicked: Vm.start(vm.selected)
                             }
+                            // GPU dedicada (portátiles híbridos): SOLO la ventana del
+                            // visor usa la dGPU; la VM no recibe ninguna GPU. Sin
+                            // híbrida (Vm.dgpu.state "none", p.ej. la torre) no existe.
+                            ActBtn {
+                                glyph: Icons.play; label: I18n.t("Start (display on dedicated GPU)")
+                                tint: Theme.green
+                                visible: Vm.dgpu.state !== "none" && Vm.has.viewer
+                                enabled: Vm.dgpu.state === "on" && !Vm.busy && vm.sel && vm.sel.state === "shut off"
+                                onClicked: Vm.start(vm.selected, true)
+                            }
                             ActBtn {
                                 glyph: Icons.pause; label: I18n.t("Pause")
                                 tint: Theme.yellow
@@ -928,11 +955,27 @@ FloatingWindow {
                                 onClicked: Vm.openViewer(vm.selected)
                             }
                             ActBtn {
+                                glyph: Icons.desktop; label: I18n.t("Open display on dedicated GPU")
+                                tint: Theme.blue
+                                visible: Vm.dgpu.state !== "none" && Vm.has.viewer
+                                enabled: Vm.dgpu.state === "on" && vm.sel && vm.sel.state !== "shut off"
+                                onClicked: Vm.openViewer(vm.selected, true)
+                            }
+                            ActBtn {
                                 glyph: Icons.bars; label: I18n.t("Text console")
                                 tint: Theme.mauve
                                 enabled: vm.sel && vm.sel.state !== "shut off"
                                 onClicked: Vm.openConsole(vm.selected)
                             }
+                        }
+                        // Qué hace (y qué NO) la GPU dedicada, o por qué está gris.
+                        Text {
+                            Layout.fillWidth: true
+                            visible: Vm.dgpu.state !== "none" && Vm.has.viewer
+                            text: vm.dgpuNote()
+                            color: Vm.dgpu.state === "off" ? Theme.yellow : Theme.subtext0
+                            wrapMode: Text.Wrap
+                            font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
                         }
 
                         // ---- pestañas ----
