@@ -502,40 +502,78 @@ def cmd_nic_bridge(root, argv):
 
     `attach-interface` sabe crear una en modo bridge, pero CAMBIAR una que ya
     existe no tiene subcomando: se edita el XML.
+
+    Solo se toca el ENGANCHE (`type` y `<source>`). La MAC, el <model>, la
+    <address> PCI, el <target> y el <alias> se quedan como están: es el MISMO
+    adaptador, que solo cambia de red. Por eso dentro del invitado no aparece
+    una tarjeta nueva (quitar + añadir sí la crea, con otra MAC).
     """
     mac, br = argv[0], argv[1]
+    hit = False
     for nic in devices(root).findall("interface"):
         m = nic.find("mac")
         if m is None or m.get("address", "").lower() != mac.lower():
             continue
+        hit = True
         nic.set("type", "bridge")
         src = nic.find("source")
         if src is None:
             src = ET.SubElement(nic, "source")
-        for a in ("network", "dev", "portgroup"):
+        # `portid` es el puerto de la red VIEJA (solo sale en el XML vivo):
+        # arrastrarlo a otra red haría que libvirt buscara un puerto que no es.
+        for a in ("network", "dev", "portgroup", "portid"):
             src.attrib.pop(a, None)
         src.set("bridge", br)
         # el modo de virtualport de una red gestionada no vale para un puente
         for vp in nic.findall("virtualport"):
             nic.remove(vp)
+    if not hit:
+        die("no hay ninguna interfaz con la MAC %s en este dominio" % mac)
     return root
 
 
 def cmd_nic_network(root, argv):
-    """nic-network <mac> <red> — devuelve una interfaz a una red de libvirt."""
+    """nic-network <mac> <red> — pasa una interfaz a una red de libvirt.
+
+    Igual que nic-bridge: cambia el enganche y NADA más del adaptador.
+    """
     mac, net = argv[0], argv[1]
+    hit = False
     for nic in devices(root).findall("interface"):
         m = nic.find("mac")
         if m is None or m.get("address", "").lower() != mac.lower():
             continue
+        hit = True
         nic.set("type", "network")
         src = nic.find("source")
         if src is None:
             src = ET.SubElement(nic, "source")
-        for a in ("bridge", "dev", "portgroup"):
+        # `bridge` y `portid` del XML vivo son el puente y el puerto que libvirt
+        # le dio en la red de ANTES; los de la nueva los pone libvirt.
+        for a in ("bridge", "dev", "portgroup", "portid"):
             src.attrib.pop(a, None)
         src.set("network", net)
+    if not hit:
+        die("no hay ninguna interfaz con la MAC %s en este dominio" % mac)
     return root
+
+
+def cmd_iface_retarget(root, argv):
+    """iface-retarget <mac> network|bridge <nombre> — el <interface> de esa MAC
+    YA reapuntado, listo para `virsh update-device --live`.
+
+    Se le pasa el XML VIVO del dominio (`virsh dumpxml` sin --inactive): el
+    fragmento sale con la misma MAC, el mismo <model>, la misma <address> PCI,
+    el mismo <target dev='vnetN'> y el mismo <alias> que tiene ahora, y solo
+    cambia el enganche. Así libvirt mueve el tap de un puente a otro en
+    caliente (qemuDomainChangeNetBridge) sin desenchufar la tarjeta del
+    invitado, que no ve ningún adaptador nuevo.
+    """
+    mac, kind, name = argv[0], argv[1], argv[2]
+    if kind not in ("network", "bridge"):
+        die("iface-retarget: el tipo tiene que ser network o bridge, no %s" % kind)
+    (cmd_nic_network if kind == "network" else cmd_nic_bridge)(root, [mac, name])
+    return cmd_iface_get(root, [mac])
 
 
 def cmd_desc(root, argv):
@@ -646,6 +684,7 @@ COMMANDS = {
     "desc": cmd_desc,
     "sound": cmd_sound,
     "iface-get": cmd_iface_get,
+    "iface-retarget": cmd_iface_retarget,
     "nic-bridge": cmd_nic_bridge,
     "nic-network": cmd_nic_network,
     "firmware": cmd_firmware,
@@ -655,7 +694,7 @@ COMMANDS = {
 
 
 # Órdenes que ya han escrito su propia salida: no se les añade el dominio.
-SELF_PRINTING = ("info", "iface-get")
+SELF_PRINTING = ("info", "iface-get", "iface-retarget")
 
 
 def main():
@@ -668,8 +707,9 @@ def main():
     except ET.ParseError as e:
         die("XML de dominio ilegible: %s" % e)
     out = COMMANDS[cmd](root, sys.argv[2:])
-    # `info` e `iface-get` escriben ELLAS lo que toca (una tabla, un fragmento);
-    # las demás son filtros y devuelven el dominio entero ya modificado.
+    # `info`, `iface-get` e `iface-retarget` escriben ELLAS lo que toca (una
+    # tabla, un fragmento); las demás son filtros y devuelven el dominio entero
+    # ya modificado.
     if cmd not in SELF_PRINTING:
         emit(out)
 

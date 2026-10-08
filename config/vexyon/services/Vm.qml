@@ -114,6 +114,28 @@ Singleton {
     // un interfaz es un puente si tiene subdirectorio `bridge`. Sin `brctl` ni
     // `bridge-utils`, que no son dependencias del shell.
     property var hostBridges: []
+    //  Los puentes del anfitrión a los que tiene sentido enchufar un adaptador
+    //  en modo puente. Fuera los de las redes de libvirt (virbrN): engancharse
+    //  a uno a pelo se salta la red, y el adaptador se suelta en cuanto esa red
+    //  se reinicia. Fuera también los de Docker (docker0, br-<id>).
+    readonly property var userBridges: root.hostBridges.filter(function(b) {
+        if (b === "docker0" || /^br-[0-9a-f]{12}$/.test(b)) return false;
+        for (var i = 0; i < root.networks.length; i++)
+            if (root.networks[i].bridge === b) return false;
+        return true;
+    })
+    // Adaptadores de las VMs ENCENDIDAS tal como están ahora:
+    // [{ vm, tap, type, source, mac }]. Sale del mismo refresco (un `domiflist`
+    // por VM encendida) y es lo que deja decir ANTES de parar o borrar una red
+    // qué VMs encendidas se quedarían colgando.
+    property var liveNics: []
+    // Resultado del diagnóstico de redes (solo a petición, botón en la pestaña
+    // de redes): [{ level: "bad"|"warn"|"info", title, detail, fix, net,
+    // settings }]. `net` = red con adaptadores que se pueden reenganchar;
+    // `settings` = el arreglo está en Ajustes → Virtualización.
+    property var netDiag: []
+    property bool netDiagRan: false
+    readonly property bool netDiagBusy: netDiagProc.running
     readonly property string ovaBin: {
         var d = Quickshell.env("VEXYON_BIN_DIR");
         var base = (d && d !== "") ? d : Quickshell.env("HOME") + "/.config/vexyon/bin";
@@ -347,6 +369,14 @@ Singleton {
     }
 
     // Traduce el fallo típico de permisos de libvirt a algo que se pueda hacer.
+    //  Texto del aviso ámbar: cada línea se traduce por separado y, si trae
+    //  "clave\tdetalle", se traduce la clave y el detalle va detrás tal cual.
+    function noteText(t) {
+        return String(t || "").split("\n").map(function(l) {
+            var k = l.indexOf("\t");
+            return k === -1 ? I18n.t(l) : I18n.t(l.slice(0, k)) + " " + l.slice(k + 1);
+        }).join("\n");
+    }
     function humanizeError(t) {
         if (t.indexOf("Cannot access storage file") !== -1
             || t.indexOf("Permission denied") !== -1) {
@@ -748,10 +778,40 @@ Singleton {
         if (!root.enabled) return;
         bridgeLister.running = true;
     }
-    // Cambiar una interfaz YA existente a puente (o de vuelta a red gestionada)
-    // no tiene subcomando en virsh: se edita el XML del dominio.
-    function setNicBridge(name, mac, br)  { root.run("nic-bridge",  root.editXml(name, "nic-bridge " + q(mac) + " " + q(br))); }
-    function setNicNetwork(name, mac, net) { root.run("nic-network", root.editXml(name, "nic-network " + q(mac) + " " + q(net))); }
+    //  Cambiar la red de un adaptador EXISTENTE sin cambiar el adaptador.
+    //  ⚠️ Lo que NO hay que hacer (y era lo único que dejaba la ventana):
+    //  quitarlo y añadir otro. Eso es OTRA tarjeta — MAC nueva (attach-interface
+    //  inventa una), otra ranura PCI, y en el invitado un "eth1"/"Ethernet 2"
+    //  nuevo con la configuración vacía.
+    //  Aquí cambia SOLO el enganche (`type` + `<source>`), por las dos vías:
+    //   * persistente: dumpxml --inactive | nic-network/nic-bridge | define;
+    //   * en caliente, si está encendida: `update-device --live` con su propio
+    //     <interface> vivo reapuntado (iface-retarget). libvirt mueve el tap de
+    //     puente sin desenchufar la tarjeta: misma MAC, mismo modelo, misma
+    //     dirección PCI, mismo vnetN.
+    //  Y se COMPRUEBA en /sys que el vnetN quedó colgando del puente nuevo.
+    //  `kind`: "network" (red de libvirt) o "bridge" (puente del anfitrión).
+    function setNicSource(name, mac, kind, target) {
+        var X = q(root.xmlBin);
+        var net = kind !== "bridge";
+        var k = net ? "network" : "bridge";
+        root.run("nic-source",
+            "D=$(mktemp -d) || exit 1; trap 'rm -rf \"$D\"' EXIT; " +
+            //  Una red definida pero parada: el update-device en caliente
+            //  fallaría con "network is not active". Se arranca antes, como en
+            //  addNic().
+            (net ? "$V net-info " + q(target) + " >/dev/null 2>&1 && $V net-start " + q(target) + " >/dev/null 2>&1; " : "") +
+            "S=$($V domstate " + q(name) + " 2>/dev/null); " +
+            root.editXml(name, "nic-" + k + " " + q(mac) + " " + q(target)) + " || exit 1; " +
+            "case \"$S\" in running|paused) ;; *) exit 0;; esac; " +
+            "$V dumpxml " + q(name) + " | " + X + " iface-retarget " + q(mac) + " " + k + " " + q(target) + " > \"$D/l.xml\" && " +
+            "$V update-device " + q(name) + " \"$D/l.xml\" --live >/dev/null 2>&1 || { printf '@@LIVEFAIL' >&2; exit 0; }; " +
+            "tap=$($V domiflist " + q(name) + " 2>/dev/null | awk -v m=" + q(String(mac).toLowerCase()) + " 'NR>2 && tolower($5)==m {print $1}'); " +
+            "BR=" + (net ? "$($V net-info " + q(target) + " 2>/dev/null | sed -n 's/^Bridge: *//p')" : q(target)) + "; " +
+            "M=$(basename \"$(readlink \"/sys/class/net/$tap/master\" 2>/dev/null)\"); " +
+            "[ -n \"$BR\" ] && [ \"$M\" = \"$BR\" ] || " +
+              "printf '@@WARN %s\\t%s\\n' 'Saved, but the running adapter is not on the expected bridge:' \"$tap -> ${M:-none} ($BR)\" >&2; :");
+    }
     function addBridgeNic(name, br, model) {
         var mkMac = "MAC=$(printf '52:54:00:%02x:%02x:%02x' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256))); ";
         var cmd = "$V attach-interface " + q(name) + " bridge " + q(br) +
@@ -947,11 +1007,34 @@ Singleton {
     }
 
     // ---- redes -------------------------------------------------------------
-    function netStart(n)     { root.run("net-start",     "$V net-start " + q(n)); }
+    //  Arrancar una red parada. Si se paró con VMs encendidas dentro, sus
+    //  adaptadores se reenganchan al puente nuevo (ver _netReconnect).
+    function netStart(n)     { root.run("net-start",     "$V net-start " + q(n) + " || exit 1; " + root._netReconnect(n)); }
+    //  Parar. Las VMs encendidas que la usan se quedan sin red hasta que se
+    //  vuelva a arrancar (la ventana lo avisa y dice cuáles ANTES de pedirlo).
     function netStop(n)      { root.run("net-stop",      "$V net-destroy " + q(n)); }
-    //  Borrar de verdad: parar si está en marcha y quitar la definición. El
-    //  `|| :` del destroy no es descuido — una red parada no se puede destruir
-    //  y eso no debe abortar el borrado.
+    //  VMs encendidas con algún adaptador en la red `net` (sin repetir), de la
+    //  caché del último refresco: es lo que el diálogo enseña antes de parar o
+    //  borrar.
+    function vmsOnNet(net) {
+        var out = [];
+        for (var i = 0; i < root.liveNics.length; i++) {
+            var n = root.liveNics[i];
+            if (n.type === "network" && n.source === net && out.indexOf(n.vm) === -1) out.push(n.vm);
+        }
+        return out;
+    }
+    //  Borrar de verdad: parar si está en marcha y quitar la definición.
+    //   * Se para SOLO si está activa, y si no se puede parar NO se sigue: con
+    //     el `destroy || :` de antes, un fallo dejaba la red viva, transitoria
+    //     y con su puente, pero ya sin definición.
+    //   * Una red transitoria desaparece entera al pararla: entonces no queda
+    //     nada a lo que hacer `undefine`.
+    //   * Se COMPRUEBA que el puente ha desaparecido del anfitrión.
+    //   * Las VMs encendidas que la usaban conservan el adaptador (misma MAC),
+    //     pero ya no cuelga de nada. Se avisó al confirmar; aquí se dice cuáles
+    //     quedaron así, no se calla. Si se vuelve a crear una red con el mismo
+    //     nombre, createNetwork() las reengancha.
     //
     //  ⚠️ `default` NO SE BORRA DESDE AQUÍ. Es la única red que sale a internet
     //  sin que el usuario configure nada: la crea libvirt al instalarse, es la
@@ -971,7 +1054,17 @@ Singleton {
             root.lastError = I18n.t("`default` is libvirt's built-in NAT network — the only one that reaches the internet without extra setup, and the one every new VM uses. It cannot be deleted from here. Stop it instead if you want it out of the way.");
             return;
         }
-        root.run("net-delete", "$V net-destroy " + q(n) + " >/dev/null 2>&1 || :; $V net-undefine " + q(n));
+        root.run("net-delete",
+            "I=$($V net-info " + q(n) + ") || exit 1; " +
+            "BR=$(printf '%s\\n' \"$I\" | sed -n 's/^Bridge: *//p'); " +
+            "printf '%s\\n' \"$I\" | grep -q '^Active: *yes' && { $V net-destroy " + q(n) + " >/dev/null || exit 1; }; " +
+            "$V net-info " + q(n) + " >/dev/null 2>&1 && { $V net-undefine " + q(n) + " >/dev/null || exit 1; }; " +
+            "[ -n \"$BR\" ] && [ -e \"/sys/class/net/$BR\" ] && " +
+              "printf '@@WARN %s\\t%s\\n' 'The network was deleted, but its bridge is still on the host:' \"$BR\" >&2; " +
+            "U=$($V list --name 2>/dev/null | while read -r d; do [ -n \"$d\" ] && " +
+              "$V domiflist \"$d\" 2>/dev/null | awk -v d=\"$d\" -v n=" + q(n) + " " +
+              "'NR>2 && $2==\"network\" && $3==n {printf \"%s (%s) \", d, $5}'; done); " +
+            "[ -n \"$U\" ] && printf '@@WARN %s\\t%s\\n' 'These running VMs kept their adapter, but it is connected to nothing until you change its network or create this one again:' \"$U\" >&2; :");
     }
 
     //  Rehacer `default` si alguna vez falta (borrada desde fuera del shell,
@@ -987,9 +1080,12 @@ Singleton {
             //  Si ya está, esto es un no-op que además la deja arrancada y en
             //  autoarranque. NADA por stderr: el colector de `run` convierte
             //  cualquier stderr en el cartel rojo de error, aunque salga con 0.
+            //  Las VMs encendidas que ya la nombraban se reenganchan (ver
+            //  _netReconnect): si la red estaba parada o se rehace aquí, su
+            //  puente es nuevo y nace sin ellas.
             "$V net-info default >/dev/null 2>&1 && { " +
               "$V net-start default >/dev/null 2>&1; $V net-autostart default >/dev/null 2>&1; " +
-              "exit 0; }; " +
+              root._netReconnect("default") + "exit 0; }; " +
             "t=$(mktemp) || exit 1; trap 'rm -f \"$t\"' EXIT; " +
             "for d in /usr/share/libvirt/networks/default.xml " +
                      "/run/current-system/sw/share/libvirt/networks/default.xml " +
@@ -1010,7 +1106,8 @@ Singleton {
             "VEXYONNET\n" +
             "$V net-define \"$t\" || exit 1; " +
             "$V net-start default || exit 1; " +
-            "$V net-autostart default");
+            "$V net-autostart default >/dev/null; " +
+            root._netReconnect("default"));
     }
 
     // ---- redes virtuales nuevas ---------------------------------------------
@@ -1018,16 +1115,28 @@ Singleton {
     //  cualquiera que venga de VirtualBox:
     //
     //   nat       <forward mode='nat'/> + IP en el anfitrión.  Las VMs salen a
-    //             internet a través del anfitrión. Es lo que hace `default`.
+    //             internet a través del anfitrión, que es su puerta de enlace.
+    //             Es lo que hace `default`.
     //   hostonly  SIN <forward>, pero CON IP en el anfitrión.  Las VMs se ven
     //             entre ellas y ven al anfitrión; a la calle no salen. libvirt
     //             lo llama "isolated".
     //   internal  SIN <forward> y SIN IP.  libvirt crea el puente y no le pone
     //             dirección a nadie: las VMs se ven entre ellas y NADIE más,
-    //             ni siquiera el anfitrión. Sin IP no hay DHCP posible.
+    //             ni siquiera el anfitrión. Sin IP no hay DHCP posible, y no se
+    //             genera NINGÚN <ip>.
     //
-    //  El DHCP es de libvirt (su dnsmasq): se puede apagar para direccionar a
-    //  mano dentro de los invitados.
+    //  LA RED Y LA DIRECCIÓN DEL ANFITRIÓN SON DOS COSAS. La red es la subred
+    //  (192.168.100.0/24); la del anfitrión es UNA dirección dentro de ella, la
+    //  que libvirt le pone al puente. Antes la segunda salía a la fuerza de la
+    //  primera (siempre la .1), y en host-only eso le quitaba la .1 justo a lo
+    //  que más la quiere: la VM router (pfSense, OPNsense…) que hace de puerta
+    //  de enlace del laboratorio — dos máquinas con la misma IP en el mismo
+    //  puente. Ahora la del anfitrión se puede escribir, y VACÍA es automática:
+    //   * NAT: la .1. Ahí el anfitrión ES la puerta de enlace, como en `default`.
+    //   * host-only: la ÚLTIMA útil (.254 en una /24), que deja la .1 libre.
+    //  El DHCP (el dnsmasq de libvirt) reparte de la .2 a la última útil SIN la
+    //  del anfitrión — partido en dos rangos si cae en medio. La .1 no se
+    //  reparte nunca. Se puede apagar para direccionar a mano en los invitados.
     function _ip2n(ip) {
         var p = String(ip).split(".");
         return (((+p[0]) << 24) | ((+p[1]) << 16) | ((+p[2]) << 8) | (+p[3])) >>> 0;
@@ -1035,22 +1144,85 @@ Singleton {
     function _n2ip(n) {
         return [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join(".");
     }
-    //  Devuelve null si el CIDR no vale. Se acota a /8../30: por encima no hay
-    //  sitio ni para la puerta de enlace y la difusión, por debajo es absurdo.
-    function cidrInfo(cidr) {
-        var m = /^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/.exec(String(cidr).trim());
-        if (!m) return null;
-        var o = m[1].split(".");
-        for (var i = 0; i < 4; i++) if (+o[i] > 255) return null;
-        var bits = parseInt(m[2], 10);
-        if (bits < 8 || bits > 30) return null;
+    //  "a.b.c.d" -> número, o -1 si no es una IPv4 válida.
+    function _ipNum(s) {
+        var m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(String(s).trim());
+        if (!m) return -1;
+        for (var i = 1; i <= 4; i++) if (+m[i] > 255) return -1;
+        return root._ip2n(m[1] + "." + m[2] + "." + m[3] + "." + m[4]);
+    }
+    //  255.255.255.0 -> 24.
+    function maskBits(m) {
+        var n = root._ipNum(m), b = 0;
+        if (n < 0) return "";
+        while (n & 0x80000000) { b++; n = (n << 1) >>> 0; }
+        return String(b);
+    }
+
+    //  El plan de direcciones de una red NUEVA, sin tocar nada. Lo usan la
+    //  vista previa del diálogo (que lo enseña ANTES de crear) y
+    //  createNetwork() (que lo convierte en XML): lo que se ve es lo que se crea.
+    //   { error, cidr, netmask, host, ranges: [{ start, end }], dhcp, warnings }
+    //  `error` no vacío = no se puede crear; `warnings` avisan pero no bloquean.
+    function netPlan(mode, subnet, hostIp, dhcp) {
+        var p = { error: "", cidr: "", netmask: "", host: "", ranges: [], dhcp: false, warnings: [] };
+        if (mode === "internal") return p;
+        var m = /^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/.exec(String(subnet).trim());
+        var addr = m ? root._ipNum(m[1]) : -1;
+        var bits = m ? parseInt(m[2], 10) : 0;
+        //  /8../30: por encima no hay sitio ni para el anfitrión y la difusión,
+        //  por debajo es absurdo.
+        if (addr < 0 || bits < 8 || bits > 30) {
+            p.error = I18n.t("That subnet is not valid. Write it as an address and a prefix, for example 192.168.100.0/24.");
+            return p;
+        }
         var mask = ((0xFFFFFFFF << (32 - bits)) >>> 0);
-        var net = (root._ip2n(m[1]) & mask) >>> 0;
-        var size = Math.pow(2, 32 - bits);
-        return { netmask: root._n2ip(mask),
-                 host:  root._n2ip(net + 1),              // la IP del anfitrión
-                 first: root._n2ip(net + 2),              // primera del rango
-                 last:  root._n2ip(net + size - 2) };     // última antes de la difusión
+        var net = (addr & mask) >>> 0;
+        var bcast = (net + Math.pow(2, 32 - bits) - 1) >>> 0;
+        p.cidr = root._n2ip(net) + "/" + bits;
+        p.netmask = root._n2ip(mask);
+        var h;
+        if (String(hostIp || "").trim() === "") {
+            h = mode === "nat" ? net + 1 : bcast - 1;
+        } else {
+            h = root._ipNum(hostIp);
+            if (h < 0) { p.error = I18n.t("The host address is not a valid IPv4 address."); return p; }
+            if (((h & mask) >>> 0) !== net) { p.error = I18n.t("The host address is not inside that network."); return p; }
+            if (h === net || h === bcast) { p.error = I18n.t("The host address cannot be the network or the broadcast address."); return p; }
+        }
+        p.host = root._n2ip(h);
+        //  Que se pise con otra red de libvirt. Si esa está ARRANCADA, libvirt
+        //  se negaría a arrancar esta ("Network is already in use by interface
+        //  virbrN"): no se deja ni intentarlo. Si está parada, se avisa: solo
+        //  podrá funcionar una de las dos a la vez. Se pisan si, con la máscara
+        //  más corta de las dos, caen en la misma subred.
+        for (var i = 0; i < root.networks.length; i++) {
+            var o = root.networks[i];
+            var oi = root._ipNum(o.ip), om = root._ipNum(o.netmask);
+            if (oi < 0 || om < 0) continue;
+            var both = (mask & om) >>> 0;
+            if (((net & both) >>> 0) !== ((oi & both) >>> 0)) continue;
+            var what = o.name + " (" + o.ip + "/" + root.maskBits(o.netmask) + ")";
+            if (o.state === "active") {
+                p.error = I18n.t("That network overlaps a running libvirt network:") + " " + what;
+                return p;
+            }
+            p.warnings.push(I18n.t("That network overlaps a stopped libvirt network, so only one of them can run at a time:") + " " + what);
+        }
+        if (mode === "hostonly" && h === net + 1)
+            p.warnings.push(I18n.t("The host takes the .1 address. A router or gateway VM on this network usually wants .1 for itself — leave the host address empty to use the last address instead."));
+        if (dhcp) {
+            var a = net + 2, b = bcast - 1;
+            if (h >= a && h <= b) {
+                if (h > a) p.ranges.push({ start: root._n2ip(a), end: root._n2ip(h - 1) });
+                if (h < b) p.ranges.push({ start: root._n2ip(h + 1), end: root._n2ip(b) });
+            } else if (a <= b) {
+                p.ranges.push({ start: root._n2ip(a), end: root._n2ip(b) });
+            }
+            p.dhcp = p.ranges.length > 0;
+            if (!p.dhcp) p.warnings.push(I18n.t("This network is too small to hand out addresses, so DHCP stays off."));
+        }
+        return p;
     }
 
     function createNetwork(o) {
@@ -1058,19 +1230,21 @@ Singleton {
         if (!root.validName(o.name)) { root.lastError = I18n.t("That name is not valid. Use letters, digits, dots, dashes or underscores."); return; }
         for (var i = 0; i < root.networks.length; i++)
             if (root.networks[i].name === o.name) { root.lastError = I18n.t("There is already a network with that name."); return; }
-        var ip = null;
-        if (o.mode !== "internal") {
-            ip = root.cidrInfo(o.subnet);
-            if (!ip) { root.lastError = I18n.t("That subnet is not valid. Write it as an address and a prefix, for example 192.168.100.0/24."); return; }
-        }
+        var p = root.netPlan(o.mode, o.subnet, o.hostIp, o.dhcp);
+        if (p.error !== "") { root.lastError = p.error; return; }
         var x = [];
         x.push("<network>");
         x.push("  <name>" + root.xmlEsc(o.name) + "</name>");
         if (o.mode === "nat") x.push("  <forward mode='nat'/>");
         x.push("  <bridge stp='on' delay='0'/>");
-        if (ip) {
-            x.push("  <ip address='" + ip.host + "' netmask='" + ip.netmask + "'>");
-            if (o.dhcp) x.push("    <dhcp><range start='" + ip.first + "' end='" + ip.last + "'/></dhcp>");
+        if (o.mode !== "internal") {
+            x.push("  <ip address='" + p.host + "' netmask='" + p.netmask + "'>");
+            if (p.dhcp) {
+                x.push("    <dhcp>");
+                for (var r = 0; r < p.ranges.length; r++)
+                    x.push("      <range start='" + p.ranges[r].start + "' end='" + p.ranges[r].end + "'/>");
+                x.push("    </dhcp>");
+            }
             x.push("  </ip>");
         }
         x.push("</network>");
@@ -1078,8 +1252,290 @@ Singleton {
             "t=$(mktemp) || exit 1; trap 'rm -f \"$t\"' EXIT; cat > \"$t\" <<'VEXYONNET'\n" +
             x.join("\n") + "\nVEXYONNET\n" +
             "$V net-define \"$t\" || exit 1; " +
-            "$V net-start " + q(o.name) + " || exit 1; " +
-            ((o.autostart === false) ? ":" : "$V net-autostart " + q(o.name)));
+            //  Si no arranca (casi siempre: esa subred ya la usa una interfaz
+            //  del anfitrión) se deshace el define. Si no, quedaba una red
+            //  definida, parada e inútil que además ocupaba el nombre.
+            "$V net-start " + q(o.name) + " || { $V net-undefine " + q(o.name) + " >/dev/null 2>&1; exit 1; }; " +
+            ((o.autostart === false) ? "" : "$V net-autostart " + q(o.name) + " >/dev/null; ") +
+            //  Con el MISMO nombre que una red borrada con VMs encendidas
+            //  dentro, esas VMs la siguen nombrando: se reenganchan.
+            root._netReconnect(o.name));
+    }
+
+    // ---- reenganchar adaptadores huérfanos ----------------------------------
+    //  ⚠️ libvirt NO vuelve a meter en el puente a los adaptadores de las VMs
+    //  ENCENDIDAS cuando su red se para y se arranca otra vez, ni cuando se
+    //  borra y se crea otra con el mismo nombre. Medido con libvirt 12.2.0: el
+    //  puente nuevo nace SIN puertos (NO-CARRIER, DOWN) y los vnetN se quedan
+    //  sin `master` — la VM cree que tiene cable y no llega a nadie. Solo un
+    //  reinicio de libvirtd los reengancha, y eso pide root.
+    //  Tampoco vale un `update-device --live` con el mismo XML: libvirt solo
+    //  mueve el tap si cambia el NOMBRE del puente, y una red reiniciada
+    //  conserva el suyo (el virbrN queda escrito en su definición).
+    //  Lo que sí funciona, sin privilegios: aparcar el adaptador en una red
+    //  temporal vacía y devolverlo a la suya — dos `update-device --live` con
+    //  su propio <interface> vivo (vexyon-vm-xml iface-retarget). Cada paso
+    //  cambia de puente, así que libvirt suelta y vuelve a enganchar el TAP en
+    //  el anfitrión; el invitado no se entera: misma MAC, mismo modelo, misma
+    //  dirección PCI, mismo vnetN, la tarjeta no se desenchufa. La red temporal
+    //  es transitoria, aislada, sin IP ni DHCP, y se destruye al acabar.
+    //  Después se COMPRUEBA en /sys que cada vnetN cuelga del puente que toca;
+    //  el que no, se avisa en ámbar con su VM y su MAC.
+    //  Si no hay VMs encendidas en esa red cuesta un `net-info` y un
+    //  `domiflist` por VM encendida, y no toca nada.
+    function _netReconnect(n) {
+        var X = q(root.xmlBin);
+        return "BR=$($V net-info " + q(n) + " 2>/dev/null | sed -n 's/^Bridge: *//p'); " +
+            "if [ -n \"$BR\" ]; then " +
+              "NICS=$($V list --name 2>/dev/null | while read -r d; do [ -n \"$d\" ] && " +
+                "$V domiflist \"$d\" 2>/dev/null | awk -v d=\"$d\" -v n=" + q(n) + " " +
+                "'NR>2 && $2==\"network\" && $3==n {print d \"\\t\" $1 \"\\t\" $5}'; done); " +
+              "P=''; R=$(mktemp -d) || exit 1; " +
+              "while IFS=$'\\t' read -r d tap mac; do [ -z \"$d\" ] && continue; " +
+                "[ \"$(basename \"$(readlink \"/sys/class/net/$tap/master\" 2>/dev/null)\")\" = \"$BR\" ] && continue; " +
+                "if [ -z \"$P\" ]; then P=vexyon-reconnect-$$; " +
+                  "printf \"<network><name>%s</name><bridge stp='off' delay='0'/></network>\\n\" \"$P\" > \"$R/park.xml\"; " +
+                  "$V net-create \"$R/park.xml\" >/dev/null 2>&1 || P=-; fi; " +
+                "[ \"$P\" != - ] && $V dumpxml \"$d\" > \"$R/live.xml\" 2>/dev/null && " +
+                  X + " iface-retarget \"$mac\" network \"$P\" < \"$R/live.xml\" > \"$R/p.xml\" && " +
+                  X + " iface-retarget \"$mac\" network " + q(n) + " < \"$R/live.xml\" > \"$R/b.xml\" && " +
+                  "$V update-device \"$d\" \"$R/p.xml\" --live >/dev/null 2>&1 && " +
+                  "$V update-device \"$d\" \"$R/b.xml\" --live >/dev/null 2>&1; " +
+                "[ \"$(basename \"$(readlink \"/sys/class/net/$tap/master\" 2>/dev/null)\")\" = \"$BR\" ] || " +
+                  "printf '@@WARN %s\\t%s\\n' 'Could not reconnect a running VM adapter to this network:' \"$d $mac\" >&2; " +
+              "done <<< \"$NICS\"; " +
+              "case \"$P\" in ''|-) ;; *) $V net-destroy \"$P\" >/dev/null 2>&1;; esac; " +
+              "rm -rf \"$R\"; " +
+            "fi; ";
+    }
+    //  Lo mismo a mano, con la red YA arrancada: lo ofrece el diagnóstico cuando
+    //  encuentra adaptadores encendidos que no cuelgan de su puente.
+    function netReconnect(n) { root.run("net-reconnect", root._netReconnect(n)); }
+
+    // ---- diagnóstico de redes -------------------------------------------------
+    //  UNA pasada de solo lectura, a petición (botón "Diagnosticar redes" de la
+    //  pestaña de redes). Ni demonio, ni sondeo, ni nada que se quede vigilando:
+    //  un bash que vuelca HECHOS y se acaba, y las conclusiones se sacan aquí.
+    //  Solo lee: virsh, /sys (puentes y el `master` de cada vnetN), `ip -4
+    //  addr`, `systemctl is-active` y, en NixOS, los scripts del cortafuegos,
+    //  que viven en el store y los puede leer cualquiera (así se sabe si ya
+    //  llevan la excepción para libvirt sin pedir root para `iptables -S`).
+    //  Comprueba lo que se ha visto romper:
+    //   * vnetN de VMs encendidas que no cuelgan del puente de su red (red
+    //     reiniciada o rehecha con ellas dentro) -> botón Reenganchar;
+    //   * puente con VMs y sin portadora; IP del anfitrión repetida o subredes
+    //     que se pisan; puentes virbrN / vx-* que no son de ninguna red viva;
+    //   * br_netfilter, y el cortafuegos que corta el tráfico entre VMs: el
+    //     rpfilter estricto de NixOS, la entrada de su cortafuegos nftables
+    //     (DHCP/DNS), su filterForward, y fuera de NixOS la política DROP de
+    //     Docker o ufw frente a las reglas nftables de libvirt.
+    readonly property string _diagScript:
+        "echo @@DNET\n" +
+        "$V net-list --all --name 2>/dev/null | while read -r n; do [ -z \"$n\" ] && continue\n" +
+        "  x=$($V net-dumpxml \"$n\" 2>/dev/null)\n" +
+        "  a=$($V net-info \"$n\" 2>/dev/null | sed -n 's/^Active: *//p')\n" +
+        "  br=$(printf '%s' \"$x\" | sed -n \"s/.*<bridge name='\\([^']*\\)'.*/\\1/p\" | head -1)\n" +
+        "  ip=$(printf '%s' \"$x\" | sed -n \"s/.*<ip address='\\([0-9.]*\\)'.*/\\1/p\" | head -1)\n" +
+        "  msk=$(printf '%s' \"$x\" | sed -n \"s/.*<ip[^>]*netmask='\\([0-9.]*\\)'.*/\\1/p\" | head -1)\n" +
+        "  printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"$n\" \"$a\" \"$br\" \"$ip\" \"$msk\"\n" +
+        "done\n" +
+        "echo @@DIF\n" +
+        "$V list --name 2>/dev/null | while read -r d; do [ -z \"$d\" ] && continue\n" +
+        "  $V domiflist \"$d\" 2>/dev/null | awk 'NR>2 && NF>=5 {print $1, $2, $3, $5}' | while read -r tap t src mac; do\n" +
+        "    printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \"$d\" \"$tap\" \"$t\" \"$src\" \"$mac\" \"$(basename \"$(readlink \"/sys/class/net/$tap/master\" 2>/dev/null)\")\"\n" +
+        "  done\n" +
+        "done\n" +
+        "echo @@DBR\n" +
+        "for b in /sys/class/net/*/bridge; do [ -d \"$b\" ] || continue; b=${b%/bridge}\n" +
+        "  printf '%s\\t%s\\t%s\\n' \"${b##*/}\" \"$(cat \"$b/carrier\" 2>/dev/null || echo 0)\" \"$(ls \"$b/brif\" 2>/dev/null | wc -l)\"\n" +
+        "done\n" +
+        "echo @@DADDR\n" +
+        "ip -4 -o addr show 2>/dev/null | awk '{print $2 \"\\t\" $4}'\n" +
+        "echo @@DSYS\n" +
+        "printf 'brnf\\t%s\\n' \"$(cat /proc/sys/net/bridge/bridge-nf-call-iptables 2>/dev/null || echo absent)\"\n" +
+        "for u in docker ufw firewalld nftables firewall; do printf 'unit\\t%s\\t%s\\n' \"$u\" \"$(systemctl is-active \"$u.service\" 2>/dev/null)\"; done\n" +
+        "be=''; for f in /etc/libvirt/network.conf /var/lib/libvirt/network.conf; do [ -r \"$f\" ] || continue\n" +
+        "  v=$(sed -n 's/^[[:space:]]*firewall_backend[[:space:]]*=[[:space:]]*\"\\([a-z]*\\)\".*/\\1/p' \"$f\" | tail -1); [ -n \"$v\" ] && be=$v; done\n" +
+        "[ -n \"$be\" ] || { command -v nft >/dev/null 2>&1 && be=nftables-default || be=iptables-default; }\n" +
+        "printf 'backend\\t%s\\n' \"$be\"\n" +
+        "for u in firewall nftables; do\n" +
+        "  for p in $(systemctl show -p ExecStart \"$u.service\" 2>/dev/null | grep -o 'path=/nix/store/[^ ;]*' | cut -d= -f2); do\n" +
+        "    case \"$p\" in *firewall-start*) k=nixipt;; *nftables-rules*) k=nixnft;; *) continue;; esac\n" +
+        "    [ -r \"$p\" ] || continue; printf 'fwfile\\t%s\\n' \"$k\"\n" +
+        "    grep -q rpfilter \"$p\" && printf 'fw\\t%s\\trp\\n' \"$k\"\n" +
+        "    grep -E 'virbr(\\*|\\+)' \"$p\" | grep -qE 'rpfilter|fib' && printf 'fw\\t%s\\trpexc\\n' \"$k\"\n" +
+        "    grep -E 'virbr(\\*|\\+)' \"$p\" | grep -qE 'dport|trusted' && printf 'fw\\t%s\\tinexc\\n' \"$k\"\n" +
+        "    grep -q 'chain forward-allow' \"$p\" && printf 'fw\\t%s\\tff\\n' \"$k\"\n" +
+        "    grep -E 'virbr(\\*|\\+)' \"$p\" | grep -vE 'dport|fib|rpfilter|trusted' | grep -q accept && printf 'fw\\t%s\\tffexc\\n' \"$k\"\n" +
+        "  done\n" +
+        "done\n" +
+        "[ -r /etc/nftables.conf ] && for k in 'hook input' 'hook forward' 'flush ruleset' virbr; do grep -q \"$k\" /etc/nftables.conf && printf 'fw\\tetcnft\\t%s\\n' \"$k\"; done\n" +
+        ":\n";
+    function diagnoseNetworks() {
+        if (!root.enabled || netDiagProc.running) return;
+        netDiagProc.running = true;
+    }
+    function _diagAnalyze(text) {
+        var sec = "", nets = {}, nics = [], brs = {}, addrs = [];
+        var sys = { units: {}, fw: {}, fwfile: {} };
+        var ls = String(text).split("\n");
+        for (var i = 0; i < ls.length; i++) {
+            var l = ls[i];
+            if (l.indexOf("@@D") === 0) { sec = l.trim(); continue; }
+            if (l.trim() === "") continue;
+            var f = l.split("\t");
+            if (sec === "@@DNET")
+                nets[f[0]] = { active: f[1] === "yes", bridge: f[2] || "", ip: f[3] || "", netmask: f[4] || "" };
+            else if (sec === "@@DIF")
+                nics.push({ vm: f[0], tap: f[1], type: f[2], source: f[3], mac: f[4], master: f[5] || "" });
+            else if (sec === "@@DBR")
+                brs[f[0]] = { carrier: f[1] === "1", ports: parseInt(f[2], 10) || 0 };
+            else if (sec === "@@DADDR") {
+                var c = String(f[1] || "").split("/");
+                addrs.push({ dev: f[0], ip: c[0], bits: parseInt(c[1], 10) || 32 });
+            } else if (sec === "@@DSYS") {
+                if (f[0] === "unit") sys.units[f[1]] = f[2] === "active";
+                else if (f[0] === "fwfile") sys.fwfile[f[1]] = true;
+                else if (f[0] === "fw") sys.fw[f[1] + ":" + f[2]] = true;
+                else sys[f[0]] = f[1] || "";
+            }
+        }
+        var out = [];
+        function add(level, title, detail, fix, net, settings, cmd) {
+            out.push({ level: level, title: title, detail: detail || "", fix: fix || "",
+                       net: net || "", settings: settings === true, cmd: cmd || "" });
+        }
+        //  ¿se pisan a/abits y b/bbits? Con la máscara más corta caen en la misma subred.
+        function overlap(a, abits, b, bbits) {
+            var x = root._ipNum(a), y = root._ipNum(b);
+            if (x < 0 || y < 0) return false;
+            var bits = Math.min(abits, bbits);
+            var m = bits === 0 ? 0 : ((0xFFFFFFFF << (32 - bits)) >>> 0);
+            return ((x & m) >>> 0) === ((y & m) >>> 0);
+        }
+
+        // 1) adaptadores de VMs encendidas fuera del puente que les toca,
+        //    agrupados por red (y si su puente no tiene portadora, se dice)
+        var lost = {};
+        for (var j = 0; j < nics.length; j++) {
+            var n = nics[j];
+            if (n.type === "network") {
+                var w = nets[n.source];
+                if (!w || !w.active) {
+                    add("bad", I18n.t("A running VM is plugged into a network that is not running"),
+                        n.vm + " · " + n.mac + " → " + n.source,
+                        w ? I18n.t("Start that network: the running VMs on it are plugged back in automatically.")
+                          : I18n.t("That network no longer exists. Change the adapter's network in the VM's Network tab, or create a network with that name again."));
+                } else if (n.master !== w.bridge) {
+                    (lost[n.source] = lost[n.source] || []).push(n.vm + " (" + n.mac + ", " + n.tap + " → "
+                        + (n.master !== "" ? n.master : I18n.t("nothing")) + ")");
+                }
+            } else if (n.type === "bridge" && n.master !== n.source) {
+                add("bad", I18n.t("A running VM's bridged adapter is not on its host bridge"),
+                    n.vm + " · " + n.mac + " · " + n.tap + " → " + (n.master !== "" ? n.master : I18n.t("nothing"))
+                        + " (" + I18n.t("expected") + " " + n.source + ")",
+                    I18n.t("Check that the host bridge still exists, then restart the VM."));
+            }
+        }
+        for (var ln in lost) {
+            var lb = brs[nets[ln].bridge];
+            add("bad", I18n.t("Running VMs are not plugged into the bridge of this network:") + " " + ln,
+                lost[ln].join(" · ") + "  ·  " + nets[ln].bridge + ": "
+                    + (lb && lb.carrier ? I18n.t("carrier") : I18n.t("no carrier")),
+                I18n.t("This happens when a network is stopped or deleted and created again while VMs are running on it. Reconnect plugs the same adapters back in: same MAC, same device inside the guest."),
+                ln);
+        }
+
+        // 2) direcciones del anfitrión: repetidas o subredes que se pisan
+        var names = Object.keys(nets);
+        for (var a = 0; a < names.length; a++) {
+            var na = nets[names[a]], abits = parseInt(root.maskBits(na.netmask), 10);
+            if (na.ip === "" || isNaN(abits)) continue;
+            for (var k = 0; k < addrs.length; k++) {
+                var ad = addrs[k];
+                if (ad.dev === na.bridge || ad.dev === "lo") continue;
+                if (ad.ip === na.ip)
+                    add("bad", I18n.t("The host address of a network is also used by another interface"),
+                        names[a] + " · " + na.ip + " · " + ad.dev,
+                        I18n.t("Two interfaces with the same address break routing to the VMs. Give one of them another address."));
+                else if (overlap(na.ip, abits, ad.ip, ad.bits))
+                    add("warn", I18n.t("A network's subnet overlaps an address range already on this computer"),
+                        names[a] + " (" + na.ip + "/" + abits + ") · " + ad.dev + " (" + ad.ip + "/" + ad.bits + ")",
+                        I18n.t("libvirt refuses to start a network whose subnet is already routed elsewhere. Use a different subnet for it."));
+            }
+            for (var b = a + 1; b < names.length; b++) {
+                var nb = nets[names[b]], bbits = parseInt(root.maskBits(nb.netmask), 10);
+                if (nb.ip === "" || isNaN(bbits)) continue;
+                if (overlap(na.ip, abits, nb.ip, bbits))
+                    add("warn", I18n.t("Two libvirt networks use overlapping subnets"),
+                        names[a] + " (" + na.ip + "/" + abits + ") · " + names[b] + " (" + nb.ip + "/" + bbits + ")",
+                        I18n.t("Only one of them can be running at a time. Give one of them another subnet."));
+            }
+        }
+
+        // 3) br_netfilter y el cortafuegos
+        var brnf = sys.brnf === "1";
+        if (brnf)
+            add("info", I18n.t("br_netfilter is active: traffic between VMs on the same bridge also passes through the host firewall"),
+                "net.bridge.bridge-nf-call-iptables = 1",
+                I18n.t("Docker, Incus and Kubernetes load it. It is why a firewall rule meant for routed traffic can also cut VM-to-VM traffic."));
+        if (root.platform === "nixos") {
+            if (sys.fwfile.nixipt && sys.fw["nixipt:rp"] && !sys.fw["nixipt:rpexc"])
+                add(brnf ? "bad" : "info",
+                    brnf ? I18n.t("NixOS's reverse-path filter drops traffic between VMs")
+                         : I18n.t("NixOS's reverse-path filter has no exception for libvirt bridges"),
+                    brnf ? I18n.t("Internal networks (the host has no route to them) and a router VM's clients are cut off.")
+                         : I18n.t("Fine while br_netfilter is not loaded. Once Docker, Incus or Kubernetes load it, internal networks and router VMs stop working."),
+                    I18n.t("The exception is one line in configuration.nix — see Settings → Virtualization → Firewall."), "", true);
+            if (sys.fwfile.nixnft) {
+                if (!sys.fw["nixnft:inexc"])
+                    add("bad", I18n.t("The NixOS nftables firewall drops DHCP and DNS from VMs"),
+                        I18n.t("VMs on libvirt networks get no address. libvirt's own nftables rules cannot accept what another table drops."),
+                        I18n.t("See Settings → Virtualization → Firewall."), "", true);
+                if (sys.fw["nixnft:rp"] && !sys.fw["nixnft:rpexc"] && brnf)
+                    add("bad", I18n.t("NixOS's reverse-path filter drops traffic between VMs"),
+                        I18n.t("Internal networks (the host has no route to them) and a router VM's clients are cut off."),
+                        I18n.t("See Settings → Virtualization → Firewall."), "", true);
+                if (sys.fw["nixnft:ff"] && !sys.fw["nixnft:ffexc"])
+                    add("bad", I18n.t("networking.firewall.filterForward drops the VMs' forwarded traffic"),
+                        I18n.t("NAT to the internet, and with br_netfilter also traffic between VMs, is dropped."),
+                        I18n.t("See Settings → Virtualization → Firewall."), "", true);
+            }
+        } else {
+            var who = [];
+            if (sys.units.docker) who.push("Docker");
+            if (sys.units.ufw) who.push("ufw");
+            if (who.length > 0 && String(sys.backend || "").indexOf("nftables") === 0)
+                add("bad", I18n.t("libvirt's nftables rules cannot override the DROP policy set by") + " " + who.join(", "),
+                    I18n.t("VMs lose DHCP (ufw) and all forwarded traffic: the internet and, with br_netfilter, each other."),
+                    I18n.t("Make libvirt write its rules into the same iptables tables: firewall_backend = \"iptables\" in /etc/libvirt/network.conf, then restart libvirtd."),
+                    "", root.platform === "arch");
+            if (sys.units.nftables && (sys.fw["etcnft:hook input"] || sys.fw["etcnft:hook forward"])
+                    && !sys.fw["etcnft:virbr"])
+                add("warn", I18n.t("nftables.service filters traffic and has no rule for the libvirt bridges"),
+                    I18n.t("If its input or forward chain drops by default, VMs get no address and cannot reach anything."),
+                    I18n.t("Allow the libvirt bridges (virbr*) in /etc/nftables.conf: see Settings → Virtualization → Firewall."),
+                    "", root.platform === "arch");
+            if (sys.units.nftables && sys.fw["etcnft:flush ruleset"])
+                add("info", I18n.t("/etc/nftables.conf starts with flush ruleset"),
+                    I18n.t("Reloading nftables.service then also deletes the rules of libvirt (and Docker) until they are restarted."),
+                    I18n.t("After reloading it, restart libvirtd."));
+            if (sys.units.firewalld)
+                add("info", I18n.t("firewalld is active"), "",
+                    I18n.t("libvirt puts its bridges in firewalld's libvirt zone, which allows DHCP, DNS and forwarding. Nothing to change."));
+        }
+
+        // 4) puentes huérfanos: con nombre de libvirt (virbrN) o vx-*, y sin
+        //    ninguna red ARRANCADA que sea su dueña
+        var owned = {};
+        for (var o in nets) if (nets[o].active && nets[o].bridge !== "") owned[nets[o].bridge] = true;
+        for (var br in brs)
+            if ((/^virbr[0-9]+$/.test(br) || br.indexOf("vx-") === 0) && !owned[br])
+                add("warn", I18n.t("Orphaned bridge: no running libvirt network owns it"),
+                    br + " · " + brs[br].ports + " " + I18n.t("ports"),
+                    I18n.t("Left over from a network that was not shut down cleanly. If nothing else uses it, remove it:"),
+                    "", false, "sudo ip link delete " + br);
+        return out;
     }
     function netAutostart(n, on) {
         root.run("net-autostart", "$V net-autostart " + (on ? "" : "--disable ") + q(n));
@@ -1525,8 +1981,15 @@ Singleton {
               "ipa=$(printf '%s' \"$x\" | sed -n \"s/.*<ip address='\\([0-9.]*\\)'.*/\\1/p\" | head -1); " +
               "msk=$(printf '%s' \"$x\" | sed -n \"s/.*<ip[^>]*netmask='\\([0-9.]*\\)'.*/\\1/p\" | head -1); " +
               "dh=no; printf '%s' \"$x\" | grep -q '<range ' && dh=yes; " +
-              "printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' " +
-                "\"$a\" \"$b\" \"$c\" \"$d\" \"$fw\" \"$ipa\" \"$msk\" \"$dh\"; done; " +
+              "br=$(printf '%s' \"$x\" | sed -n \"s/.*<bridge name='\\([^']*\\)'.*/\\1/p\" | head -1); " +
+              "printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' " +
+                "\"$a\" \"$b\" \"$c\" \"$d\" \"$fw\" \"$ipa\" \"$msk\" \"$dh\" \"$br\"; done; " +
+            // Adaptadores de las VMs ENCENDIDAS (vnetN, tipo, red/puente, MAC):
+            // un `domiflist` por VM viva, las apagadas no cuestan nada.
+            "echo '@@IFS'; " +
+            "$V list --name 2>/dev/null | while read -r n; do [ -z \"$n\" ] && continue; " +
+              "$V domiflist \"$n\" 2>/dev/null | awk -v d=\"$n\" " +
+              "'NR>2 && NF>=5 {print d \"\\t\" $1 \"\\t\" $2 \"\\t\" $3 \"\\t\" $5}'; done; " +
             "echo '@@POOL'; $V pool-info default 2>/dev/null | sed -n 's/^State: *//p'"]
         stdout: StdioCollector {
             onStreamFinished: {
@@ -1540,11 +2003,11 @@ Singleton {
     }
 
     function parseState(text) {
-        var sec = "", vms = [], nets = [], pool = "";
+        var sec = "", vms = [], nets = [], ifs = [], pool = "";
         var lines = text.split("\n");
         for (var i = 0; i < lines.length; i++) {
             var l = lines[i];
-            if (l === "@@VMS" || l === "@@NETS" || l === "@@POOL") { sec = l; continue; }
+            if (l === "@@VMS" || l === "@@NETS" || l === "@@IFS" || l === "@@POOL") { sec = l; continue; }
             if (l.trim() === "") continue;
             var f = l.split("\t");
             if (sec === "@@VMS" && f.length >= 7) {
@@ -1565,7 +2028,10 @@ Singleton {
                 var mode = fw !== "" ? fw : (ipa !== "" ? "hostonly" : "internal");
                 nets.push({ name: f[0], state: f[1], autostart: f[2] === "yes",
                             persistent: f[3] === "yes", mode: mode,
-                            ip: ipa, netmask: f[6] || "", dhcp: (f[7] || "") === "yes" });
+                            ip: ipa, netmask: f[6] || "", dhcp: (f[7] || "") === "yes",
+                            bridge: f[8] || "" });
+            } else if (sec === "@@IFS" && f.length >= 5) {
+                ifs.push({ vm: f[0], tap: f[1], type: f[2], source: f[3], mac: f[4] });
             } else if (sec === "@@POOL") {
                 pool = l.trim();
             }
@@ -1573,6 +2039,7 @@ Singleton {
         vms.sort(function(a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0); });
         root.vms = vms;
         root.networks = nets;
+        root.liveNics = ifs;
         root.poolState = pool;
     }
 
@@ -1602,7 +2069,10 @@ Singleton {
                         if (ls[i].indexOf("@@WARN ") === 0) warns.push(ls[i].slice(7));
                         else if (ls[i].trim() !== "") errs.push(ls[i]);
                     }
-                    if (warns.length > 0) root.lastNote = warns.join(" ");
+                    //  Una línea por aviso. "clave\tdetalle": la clave es una
+                    //  frase fija en inglés (la traduce noteText) y el detalle,
+                    //  lo concreto (VM, MAC, puente) que no se traduce.
+                    if (warns.length > 0) root.lastNote = warns.join("\n");
                     if (errs.length > 0) root.lastError = root.humanizeError(errs.join("\n"));
                 }
             }
@@ -1746,7 +2216,7 @@ Singleton {
                     if (ls[i].indexOf("@@WARN ") === 0) warns.push(ls[i].slice(7));
                     else if (ls[i].trim() !== "") errs.push(ls[i]);
                 }
-                if (warns.length > 0) root.lastNote = warns.join(" ");
+                if (warns.length > 0) root.lastNote = warns.join("\n");   // ver noteText
                 if (errs.length > 0) root.lastError = errs.join("\n");
             }
         }
@@ -1803,6 +2273,19 @@ Singleton {
                 for (var i = 0; i < ls.length; i++)
                     if (ls[i].trim() !== "") out.push(ls[i].trim());
                 root.hostBridges = out;
+            }
+        }
+    }
+
+    // Diagnóstico de redes: solo cuando se pulsa el botón (diagnoseNetworks).
+    Process {
+        id: netDiagProc
+        command: ["bash", "-c", root.sh + root._diagScript]
+        stdout: StdioCollector {
+            onStreamFinished: {
+                try { root.netDiag = root._diagAnalyze(this.text); }
+                catch (e) { console.warn("[Vm] network diagnosis failed:", e); root.netDiag = []; }
+                root.netDiagRan = true;
             }
         }
     }

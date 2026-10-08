@@ -3157,6 +3157,73 @@ FloatingWindow {
                                 code: "virtualisation.libvirtd.qemu.vhostUserPackages = [ pkgs.virtiofsd ];"
                             }
 
+                            //  Cortafuegos: SOLO si hace falta (el diagnóstico de redes del
+                            //  gestor de VMs dice si aplica). Medido con el cortafuegos real
+                            //  que genera nixpkgs, libvirt 12.2 y el Docker real — ver la
+                            //  sesión de redes en PROJECT_STATE.md. Nada de apagar el
+                            //  cortafuegos ni de bridge-nf-call-iptables = 0: son
+                            //  excepciones acotadas a los puentes de libvirt (virbr*).
+                            PartLabel {
+                                tag: I18n.t("FIREWALL")
+                                tone: Theme.peach
+                                title: I18n.t("Only if VMs cannot reach each other, or get no address")
+                                body: I18n.t("Two parts of the NixOS firewall can cut libvirt traffic. Once br_netfilter is loaded (Docker, Incus and Kubernetes load it), the strict reverse-path filter also checks frames passing between VMs, and internal networks and a router VM's clients stop working. With networking.nftables.enable, the firewall also drops the DHCP and DNS requests VMs send to libvirt, because libvirt's own nftables rules cannot accept what another table drops. Diagnose networks, in the VM manager's Host networks tab, tells you which one applies.")
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: I18n.t("With the default (iptables) firewall, add this line inside networking.firewall.extraCommands — create the attribute if you do not have it yet:")
+                                color: Theme.text
+                                wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 2
+                            }
+                            CodeBlock {
+                                tone: "merge"
+                                code: "networking.firewall.extraCommands = ''\n"
+                                    + "  ip46tables -t mangle -I nixos-fw-rpfilter -i virbr+ -m addrtype ! --dst-type LOCAL -j RETURN\n"
+                                    + "'';"
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: I18n.t("With networking.nftables.enable = true, add these instead:")
+                                color: Theme.text
+                                wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 2
+                            }
+                            CodeBlock {
+                                tone: "merge"
+                                code: "networking.firewall.extraReversePathFilterRules = ''\n"
+                                    + "  iifname \"virbr*\" fib daddr type != local accept\n"
+                                    + "'';\n"
+                                    + "networking.firewall.extraInputRules = ''\n"
+                                    + "  iifname \"virbr*\" udp dport { 53, 67 } accept\n"
+                                    + "  iifname \"virbr*\" tcp dport 53 accept\n"
+                                    + "'';"
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: I18n.t("And only if you also set networking.firewall.filterForward = true:")
+                                color: Theme.text
+                                wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 2
+                            }
+                            CodeBlock {
+                                tone: "merge"
+                                code: "networking.firewall.extraForwardRules = ''\n"
+                                    + "  iifname \"virbr*\" accept\n"
+                                    + "'';"
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: I18n.t("What this opens, and nothing more: frames that arrive through a libvirt bridge (virbr*) and are not addressed to this computer skip the reverse-path check, VMs reach libvirt's DHCP and DNS, and VMs may forward. Traffic to this computer is still checked, the rest of the firewall is untouched, and libvirt's own rules still decide what each network may reach — an internal network still cannot get out.")
+                                color: Theme.subtext0
+                                wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 3
+                            }
+
                             PartLabel {
                                 tag: I18n.t("THEN")
                                 tone: Theme.blue
@@ -3224,6 +3291,49 @@ FloatingWindow {
                             Text {
                                 Layout.fillWidth: true
                                 text: I18n.t("Group membership only takes effect after you log out and back in.")
+                                color: Theme.subtext0
+                                wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 3
+                            }
+
+                            //  Cortafuegos en Arch: NO es el de NixOS. No hay rpfilter de
+                            //  netfilter por defecto (systemd pone rp_filter=2 en el kernel,
+                            //  que no mira las tramas puenteadas); lo que corta es la
+                            //  política DROP de Docker o ufw en las tablas de iptables
+                            //  frente a las reglas nftables de libvirt, o un
+                            //  nftables.service propio. Medido en laboratorio con el Docker
+                            //  real — ver PROJECT_STATE.md.
+                            PartLabel {
+                                tag: I18n.t("FIREWALL")
+                                tone: Theme.peach
+                                title: I18n.t("Only if you use Docker or ufw")
+                                body: I18n.t("Docker and ufw set a DROP policy in the iptables tables. libvirt writes its own rules with nftables, into a separate table, and an accept there cannot undo a drop in another table: VMs lose the internet, each other (once br_netfilter is loaded), and with ufw also DHCP. Switching libvirt to its iptables backend puts its rules in the same tables, ahead of theirs. Diagnose networks, in the VM manager's Host networks tab, tells you if this applies.")
+                            }
+                            CodeBlock {
+                                tone: "add"
+                                code: "sudo sed -i '/^[[:space:]]*firewall_backend[[:space:]]*=/d' /etc/libvirt/network.conf\n"
+                                    + "echo 'firewall_backend = \"iptables\"' | sudo tee -a /etc/libvirt/network.conf\n"
+                                    + "sudo systemctl restart libvirtd"
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: I18n.t("Only if you enabled nftables.service and its /etc/nftables.conf drops by default: add the first two lines inside its input chain and the last two inside its forward chain, then restart nftables and libvirtd.")
+                                color: Theme.text
+                                wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 2
+                            }
+                            CodeBlock {
+                                tone: "merge"
+                                code: "iifname \"virbr*\" udp dport { 53, 67 } accept\n"
+                                    + "iifname \"virbr*\" tcp dport 53 accept\n"
+                                    + "iifname \"virbr*\" accept\n"
+                                    + "oifname \"virbr*\" ct state established,related accept"
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: I18n.t("firewalld needs nothing: libvirt puts its networks in firewalld's libvirt zone, which already allows DHCP, DNS and forwarding.")
                                 color: Theme.subtext0
                                 wrapMode: Text.Wrap
                                 font.family: Theme.fontFamily

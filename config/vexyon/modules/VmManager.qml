@@ -72,8 +72,63 @@ FloatingWindow {
     //  [{ key, label, value, numeric, placeholder }] y `act` recibe un objeto
     //  { key: valorEscrito }.
     property var prompt: null
-    function ask2(title, note, fields, label, act) {
-        vm.prompt = { title: title, note: note, fields: fields, label: label, act: act };
+    //  `preview` (opcional): función(valores) -> { text, warn, error }, que se
+    //  recalcula con cada cambio y se enseña debajo de los campos; con `error`
+    //  el botón de aceptar se apaga. Un campo con `showIf(valores)` solo se
+    //  enseña cuando devuelve true, y oculto se entrega vacío.
+    function ask2(title, note, fields, label, act, preview) {
+        vm.prompt = { title: title, note: note, fields: fields, label: label, act: act,
+                      preview: preview || null };
+    }
+    //  Sube con cada cambio de cualquier campo del diálogo: es lo que hace que
+    //  `showIf` y la vista previa se recalculen.
+    property int promptRev: 0
+    function promptVals() {
+        var vals = {}, f = vm.prompt ? vm.prompt.fields : [];
+        for (var i = 0; i < f.length; i++) {
+            var it = promptFields.itemAt(i);
+            vals[f[i].key] = it ? String(it.text).trim() : "";
+        }
+        return vals;
+    }
+    //  Vista previa de "Crear red": qué dirección se queda el anfitrión y qué
+    //  reparte el DHCP, ANTES de crear nada. Es el mismo Vm.netPlan() que usa
+    //  createNetwork(), así que lo que se ve es exactamente lo que se crea.
+    function netPreview(v) {
+        if (v.mode === "internal")
+            return { text: I18n.t("No host address and no DHCP: the host is not on this network, only the VMs are."),
+                     warn: "", error: "" };
+        var p = Vm.netPlan(v.mode, v.subnet, v.host, v.dhcp === "yes");
+        if (p.error !== "") return { text: "", warn: "", error: p.error };
+        var t = I18n.t("Host address") + ": " + p.host
+              + (v.host === "" ? " (" + I18n.t("automatic") + ")" : "")
+              + "  ·  " + p.cidr + "  ·  DHCP: "
+              + (p.dhcp ? p.ranges.map(function(r) { return r.start + " – " + r.end; }).join(", ")
+                        : I18n.t("off"));
+        if (v.mode === "nat") t += "\n" + I18n.t("The host is the VMs' gateway to the internet at this address.");
+        return { text: t, warn: p.warnings.join("\n"), error: "" };
+    }
+    //  "Cambiar de red" de UN adaptador: elige red de libvirt o puente del
+    //  anfitrión y llama a Vm.setNicSource, que conserva el adaptador (misma
+    //  MAC, mismo dispositivo en el invitado). Ver Vm.setNicSource.
+    function askNicSource(nic) {
+        var ch = [];
+        for (var i = 0; i < Vm.networks.length; i++)
+            ch.push({ key: "network:" + Vm.networks[i].name, label: Vm.networks[i].name,
+                      note: vm.netModeLabel(Vm.networks[i].mode) });
+        for (var j = 0; j < Vm.userBridges.length; j++)
+            ch.push({ key: "bridge:" + Vm.userBridges[j], label: Vm.userBridges[j],
+                      note: I18n.t("Host bridge: the VM sits directly on the physical network behind it.") });
+        var cur = nic.type + ":" + nic.source;
+        vm.ask2(I18n.t("Change the network of this adapter"),
+            I18n.t("Same adapter, same MAC address: the guest keeps its network card and only the network behind it changes. On a running VM it is applied at once."),
+            [ { key: "to", label: I18n.t("Connect it to"), value: cur, choices: ch } ],
+            I18n.t("Change"),
+            function(v) {
+                var k = v.to.indexOf(":");
+                if (k < 0 || v.to === cur) return;
+                Vm.setNicSource(vm.selected, nic.mac, v.to.slice(0, k), v.to.slice(k + 1));
+            });
     }
     //  Nombre legible del modo de una red. `hostonly`/`internal` no son
     //  palabras de libvirt: las deduce Vm mirando si hay <forward> y si hay
@@ -106,16 +161,6 @@ FloatingWindow {
         case "open":     return I18n.t("Open");
         }
         return m;
-    }
-    //  255.255.255.0 -> 24. Solo para enseñarlo compacto junto a la dirección.
-    function maskBits(m) {
-        var p = String(m || "").split("."), n = 0;
-        if (p.length !== 4) return "";
-        for (var i = 0; i < 4; i++) {
-            var b = parseInt(p[i], 10) || 0;
-            while (b) { n += b & 1; b >>>= 1; }
-        }
-        return n;
     }
 
     function fmtBytes(b) {
@@ -214,6 +259,11 @@ FloatingWindow {
             // que onRefreshed elija la primera y no se quede apuntando a un
             // nombre muerto.
             if (ok && (action === "rename")) { vm.selected = ""; vm.showDetail = false; }
+            //  Con un diagnóstico de redes a la vista, se rehace tras cada acción
+            //  de red o de adaptador para no enseñar algo ya arreglado. Por
+            //  evento, nunca con temporizador.
+            if (Vm.netDiagRan && (action.indexOf("net-") === 0 || action.indexOf("nic-") === 0))
+                Vm.diagnoseNetworks();
         }
     }
 
@@ -698,7 +748,7 @@ FloatingWindow {
                     Text {
                         id: noteTxt
                         Layout.fillWidth: true
-                        text: I18n.t(Vm.lastNote); color: Theme.yellow
+                        text: Vm.noteText(Vm.lastNote); color: Theme.yellow
                         font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
                         wrapMode: Text.Wrap
                     }
@@ -1655,12 +1705,22 @@ FloatingWindow {
                                                         enabled: !Vm.busy && vm.running
                                                         onClicked: Vm.setLink(vm.selected, false)
                                                     }
+                                                    //  Cambiar de red SIN cambiar de adaptador: misma
+                                                    //  MAC, mismo dispositivo en el invitado. Quitar +
+                                                    //  añadir es OTRA tarjeta (MAC nueva). Ver
+                                                    //  Vm.setNicSource.
+                                                    ActBtn {
+                                                        glyph: Icons.ethernet; label: I18n.t("Change network")
+                                                        tint: Theme.teal
+                                                        enabled: !Vm.busy
+                                                        onClicked: vm.askNicSource(modelData)
+                                                    }
                                                     ActBtn {
                                                         glyph: Icons.trash; label: I18n.t("Remove")
                                                         danger: true; tint: Theme.red
                                                         enabled: !Vm.busy
                                                         onClicked: vm.ask(I18n.t("Remove this network adapter?"),
-                                                            I18n.t("The VM loses this network interface."),
+                                                            I18n.t("The VM loses this network interface. To move it to another network instead, use Change network: that keeps the same adapter and MAC address."),
                                                             I18n.t("Remove"), true,
                                                             function() { Vm.removeNic(vm.selected, modelData.mac); })
                                                     }
@@ -1669,6 +1729,9 @@ FloatingWindow {
                                         }
                                     }
                                     Sec { text: I18n.t("ADD AN ADAPTER") }
+                                    Note {
+                                        text: I18n.t("An added adapter is an extra network card in the guest, with a new MAC address. To move an existing adapter to another network, use Change network on it instead.")
+                                    }
                                     Text {
                                         Layout.fillWidth: true
                                         text: I18n.t("Card model for the new adapter"); color: Theme.subtext0
@@ -1688,12 +1751,12 @@ FloatingWindow {
                                         text: I18n.t("A bridged adapter puts the VM directly on your physical network, with its own address from your router. It needs a bridge that already exists on this computer — the shell does not create one, because that reconfigures host networking.")
                                     }
                                     Note {
-                                        visible: Vm.hostBridges.length === 0 && Vm.platform === "nixos"
+                                        visible: Vm.userBridges.length === 0 && Vm.platform === "nixos"
                                         tone: "warn"
                                         text: I18n.t("No bridge found. On NixOS create one with, for example:") + "  networking.bridges.br0.interfaces = [ \"eth0\" ];"
                                     }
                                     Note {
-                                        visible: Vm.hostBridges.length === 0 && Vm.platform === "arch"
+                                        visible: Vm.userBridges.length === 0 && Vm.platform === "arch"
                                         tone: "warn"
                                         text: I18n.t("No bridge found. On Arch create one with your network manager, for example:") + "  nmcli con add type bridge ifname br0"
                                     }
@@ -1701,7 +1764,7 @@ FloatingWindow {
                                         Layout.fillWidth: true
                                         spacing: 6
                                         Repeater {
-                                            model: Vm.hostBridges
+                                            model: Vm.userBridges
                                             delegate: ActBtn {
                                                 required property var modelData
                                                 glyph: Icons.plus
@@ -2180,12 +2243,19 @@ FloatingWindow {
                                                       { key: "nat", label: I18n.t("NAT (out to the internet)"),
                                                         note: I18n.t("VMs reach the outside world through this computer, and each other. Same idea as `default`.") },
                                                       { key: "hostonly", label: I18n.t("Host-only"),
-                                                        note: I18n.t("VMs reach each other and this computer, but have no route out.") },
+                                                        note: I18n.t("VMs reach each other and this computer, but have no route out. By default the host takes the LAST address, so .1 stays free for a router VM.") },
                                                       { key: "internal", label: I18n.t("Internal"),
                                                         note: I18n.t("VMs reach only each other. Not even this computer is on the network, so there is no address range and no DHCP.") } ] },
-                                                  { key: "subnet", label: I18n.t("Address range"), value: "192.168.100.0/24",
-                                                    placeholder: "192.168.100.0/24" },
+                                                  //  Red y dirección del anfitrión, por separado (ver
+                                                  //  Vm.netPlan). En Internal no hay ni una ni otra.
+                                                  { key: "subnet", label: I18n.t("Network (address/prefix)"), value: "192.168.100.0/24",
+                                                    placeholder: "192.168.100.0/24",
+                                                    showIf: function(v) { return v.mode !== "internal"; } },
+                                                  { key: "host", label: I18n.t("Host address on this network (empty = automatic)"), value: "",
+                                                    placeholder: I18n.t("automatic"),
+                                                    showIf: function(v) { return v.mode !== "internal"; } },
                                                   { key: "dhcp", label: I18n.t("Hand out addresses (DHCP)"), value: "yes",
+                                                    showIf: function(v) { return v.mode !== "internal"; },
                                                     choices: [
                                                       { key: "yes", label: I18n.t("Yes"),
                                                         note: I18n.t("libvirt hands out addresses on this network.") },
@@ -2194,8 +2264,95 @@ FloatingWindow {
                                                 I18n.t("Create"),
                                                 function(v) {
                                                     Vm.createNetwork({ name: v.name, mode: v.mode, subnet: v.subnet,
-                                                                       dhcp: v.dhcp === "yes", autostart: true });
-                                                })
+                                                                       hostIp: v.host, dhcp: v.dhcp === "yes", autostart: true });
+                                                },
+                                                vm.netPreview)
+                                        }
+                                        //  Diagnóstico SOLO a petición: una pasada de lectura
+                                        //  y se acaba (ver Vm.diagnoseNetworks). Sin sondeo.
+                                        ActBtn {
+                                            glyph: Icons.search; label: I18n.t("Diagnose networks")
+                                            enabled: !Vm.busy && !Vm.netDiagBusy
+                                            onClicked: Vm.diagnoseNetworks()
+                                        }
+                                    }
+                                    ColumnLayout {
+                                        Layout.fillWidth: true
+                                        visible: Vm.netDiagRan || Vm.netDiagBusy
+                                        spacing: 6
+                                        Note {
+                                            visible: Vm.netDiagBusy
+                                            text: I18n.t("Checking the networks…")
+                                        }
+                                        Note {
+                                            visible: !Vm.netDiagBusy && Vm.netDiag.filter(function(d) { return d.level !== "info"; }).length === 0
+                                            text: I18n.t("No problems found: every running VM adapter is on its network's bridge, no address conflicts, nothing in the firewall known to cut VM traffic.")
+                                        }
+                                        Repeater {
+                                            model: Vm.netDiagBusy ? [] : Vm.netDiag
+                                            delegate: Rectangle {
+                                                required property var modelData
+                                                Layout.fillWidth: true
+                                                implicitHeight: dgCol.implicitHeight + 14
+                                                radius: Theme.radius
+                                                color: Theme.surface0
+                                                border.width: 1
+                                                border.color: modelData.level === "bad" ? Theme.red
+                                                            : modelData.level === "warn" ? Theme.yellow : Theme.overlay0
+                                                ColumnLayout {
+                                                    id: dgCol
+                                                    anchors.left: parent.left; anchors.right: parent.right
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                    anchors.leftMargin: 12; anchors.rightMargin: 12
+                                                    spacing: 4
+                                                    Text {
+                                                        Layout.fillWidth: true
+                                                        text: modelData.title
+                                                        color: modelData.level === "bad" ? Theme.red
+                                                             : modelData.level === "warn" ? Theme.yellow : Theme.text
+                                                        wrapMode: Text.Wrap; font.bold: true
+                                                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
+                                                    }
+                                                    Text {
+                                                        Layout.fillWidth: true
+                                                        visible: text !== ""
+                                                        text: modelData.detail
+                                                        color: Theme.subtext1; wrapMode: Text.Wrap
+                                                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
+                                                    }
+                                                    Text {
+                                                        Layout.fillWidth: true
+                                                        visible: text !== ""
+                                                        text: modelData.fix
+                                                        color: Theme.subtext0; wrapMode: Text.Wrap
+                                                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
+                                                    }
+                                                    Text {
+                                                        Layout.fillWidth: true
+                                                        visible: modelData.cmd !== ""
+                                                        text: modelData.cmd
+                                                        color: Theme.text; wrapMode: Text.WrapAnywhere
+                                                        font.family: "monospace"; font.pixelSize: Theme.fontSize - 3
+                                                    }
+                                                    Flow {
+                                                        Layout.fillWidth: true
+                                                        visible: modelData.net !== "" || modelData.settings
+                                                        spacing: 6
+                                                        ActBtn {
+                                                            visible: modelData.net !== ""
+                                                            glyph: Icons.refresh; label: I18n.t("Reconnect")
+                                                            tint: Theme.green
+                                                            enabled: !Vm.busy
+                                                            onClicked: Vm.netReconnect(modelData.net)
+                                                        }
+                                                        ActBtn {
+                                                            visible: modelData.settings
+                                                            glyph: Icons.gear; label: I18n.t("Open Settings → Virtualization")
+                                                            onClicked: { Panels.close("vmManager"); Panels.openSettingsAt("virtualization"); }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     Repeater {
@@ -2238,9 +2395,22 @@ FloatingWindow {
                                                 Text {
                                                     Layout.fillWidth: true
                                                     text: vm.netModeLabel(modelData.mode)
-                                                          + (modelData.ip !== "" ? "  ·  " + modelData.ip + "/" + vm.maskBits(modelData.netmask) : "")
+                                                          + (modelData.ip !== "" ? "  ·  " + modelData.ip + "/" + Vm.maskBits(modelData.netmask) : "")
                                                           + "  ·  " + (modelData.dhcp ? I18n.t("DHCP on") : I18n.t("DHCP off"))
+                                                          //  el puente del anfitrión (virbrN): lo que sale en
+                                                          //  `ip link` y en el diagnóstico
+                                                          + (modelData.bridge !== "" ? "  ·  " + modelData.bridge : "")
                                                     color: Theme.subtext0; wrapMode: Text.Wrap
+                                                    font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
+                                                }
+                                                //  Qué VMs ENCENDIDAS cuelgan de ella ahora mismo: es
+                                                //  lo que se pierde al pararla o borrarla.
+                                                Text {
+                                                    Layout.fillWidth: true
+                                                    readonly property var users: Vm.vmsOnNet(modelData.name)
+                                                    visible: users.length > 0
+                                                    text: I18n.t("In use by running VMs:") + " " + users.join(", ")
+                                                    color: Theme.subtext1; wrapMode: Text.Wrap
                                                     font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
                                                 }
                                                 Flow {
@@ -2252,11 +2422,21 @@ FloatingWindow {
                                                         enabled: !Vm.busy && modelData.state !== "active"
                                                         onClicked: Vm.netStart(modelData.name)
                                                     }
+                                                    //  Con VMs encendidas dentro se pregunta antes y se
+                                                    //  dice cuáles: se quedan sin red hasta que vuelva a
+                                                    //  arrancar (y Arrancar las reengancha).
                                                     ActBtn {
                                                         glyph: Icons.power; label: I18n.t("Stop")
                                                         tint: Theme.peach
                                                         enabled: !Vm.busy && modelData.state === "active"
-                                                        onClicked: Vm.netStop(modelData.name)
+                                                        onClicked: {
+                                                            var n = modelData.name, u = Vm.vmsOnNet(n);
+                                                            if (u.length === 0) { Vm.netStop(n); return; }
+                                                            vm.ask(I18n.t("Stop this network?"),
+                                                                I18n.t("These running VMs lose this connection until the network is started again — starting it from here plugs them back in:") + " " + u.join(", "),
+                                                                I18n.t("Stop"), true,
+                                                                function() { Vm.netStop(n); });
+                                                        }
                                                     }
                                                     ActBtn {
                                                         glyph: modelData.autostart ? Icons.check : Icons.close
@@ -2277,10 +2457,15 @@ FloatingWindow {
                                                         glyph: Icons.trash; label: I18n.t("Delete")
                                                         danger: true; tint: Theme.red
                                                         enabled: !Vm.busy && modelData.name !== Vm.protectedNet
-                                                        onClicked: vm.ask(I18n.t("Delete this network?"),
-                                                            I18n.t("The network is stopped and its definition removed. Any VM with an adapter on it loses that connection until you point the adapter somewhere else."),
-                                                            I18n.t("Delete"), true,
-                                                            function() { Vm.netDelete(modelData.name); })
+                                                        onClicked: {
+                                                            var n = modelData.name, u = Vm.vmsOnNet(n);
+                                                            vm.ask(I18n.t("Delete this network?"),
+                                                                I18n.t("The network is stopped and its definition removed. Any VM with an adapter on it loses that connection until you point the adapter somewhere else.")
+                                                                + (u.length === 0 ? ""
+                                                                   : "\n\n" + I18n.t("These running VMs keep their adapter (same MAC), but it will be connected to nothing until you change its network or create a network with this name again:") + " " + u.join(", ")),
+                                                                I18n.t("Delete"), true,
+                                                                function() { Vm.netDelete(n); });
+                                                        }
                                                     }
                                                     Text {
                                                         visible: modelData.name === Vm.protectedNet
@@ -2556,6 +2741,11 @@ FloatingWindow {
                                 required property int index
                                 property string text: ""        // lo que lee Aceptar
                                 Layout.fillWidth: true
+                                visible: {
+                                    vm.promptRev;
+                                    return !pfLoader.modelData.showIf || pfLoader.modelData.showIf(vm.promptVals());
+                                }
+                                onTextChanged: vm.promptRev++
                                 sourceComponent: (modelData.choices !== undefined
                                                   && modelData.choices !== null) ? choiceField : textField
 
@@ -2603,6 +2793,41 @@ FloatingWindow {
                             }
                         }
 
+                        //  Vista previa opcional (ver ask2): lo que va a pasar con
+                        //  los valores de AHORA, p. ej. la dirección efectiva del
+                        //  anfitrión de una red nueva antes de crearla.
+                        ColumnLayout {
+                            id: promptPreview
+                            readonly property var r: {
+                                vm.promptRev;
+                                return (vm.prompt && vm.prompt.preview) ? vm.prompt.preview(vm.promptVals()) : null;
+                            }
+                            Layout.fillWidth: true
+                            visible: r !== null
+                            spacing: 4
+                            Text {
+                                Layout.fillWidth: true
+                                visible: text !== ""
+                                text: promptPreview.r ? (promptPreview.r.text || "") : ""
+                                color: Theme.subtext1; wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                visible: text !== ""
+                                text: promptPreview.r ? (promptPreview.r.warn || "") : ""
+                                color: Theme.yellow; wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                visible: text !== ""
+                                text: promptPreview.r ? (promptPreview.r.error || "") : ""
+                                color: Theme.red; wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
+                            }
+                        }
+
                         Flow {
                             Layout.fillWidth: true
                             Layout.topMargin: 4
@@ -2612,12 +2837,12 @@ FloatingWindow {
                                 glyph: Icons.check
                                 label: vm.prompt ? vm.prompt.label : ""
                                 tint: Theme.accent
-                                enabled: !Vm.busy
+                                enabled: !Vm.busy && !(promptPreview.r && promptPreview.r.error)
                                 onClicked: {
                                     var vals = {}, f = vm.prompt ? vm.prompt.fields : [];
                                     for (var i = 0; i < f.length; i++) {
                                         var it = promptFields.itemAt(i);
-                                        vals[f[i].key] = it ? String(it.text).trim() : "";
+                                        vals[f[i].key] = it && it.visible ? String(it.text).trim() : "";
                                     }
                                     var a = vm.prompt ? vm.prompt.act : null;
                                     vm.prompt = null;
