@@ -39,7 +39,6 @@ Singleton {
         if (!(v > lowGain)) return 0;
         return v >= knee ? v : knee * Math.log(v / lowGain);
     }
-    function nodeVolume(n) { return n && n.audio ? fromNode(n.audio.volume) : 0; }
     // Only a node at exactly 0 reads 0%.
     function nodePercent(n) {
         if (!n || !n.audio || !(n.audio.volume > 0)) return 0;

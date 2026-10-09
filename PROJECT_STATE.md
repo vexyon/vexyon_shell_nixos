@@ -20,6 +20,105 @@ VEXYON OUT-OF-THE-BOX POLICY Every Vexyon feature must ship together with all re
 
 PERMANENT POLICY: If Vexyon's installation changes, its GitHub README.md MUST be updated in the same development task. No exceptions.
 
+## Session: resource audit — RAM, CPU, disk; dead code (both repositories)
+
+### Why
+
+The owner asked for an audit of the whole shell on both repositories: use as
+little RAM, CPU and disk as possible and remove code that does nothing,
+without losing any feature ("si algo funciona tiene que seguir funcionando").
+
+### Method
+
+Lab: Quickshell 0.3.0 under headless sway (Mesa llvmpipe), a fresh `$HOME`
+with the default `shell.json` (onboarding off). After 25 s of settling,
+120 s idle: CPU ticks of the shell process, PSS/RSS from `smaps_rollup`, and
+every `execve` of the shell and its children (`strace -f`). Then the same with
+every monitor pill on the bar and fake sysfs/tools (backlight, hwmon, Caps
+Lock LED, `brightnessctl`, `nmcli`) to exercise each changed path.
+
+Static audit of every `Timer`, every `Process` with `running: true`, every
+resident process (the bridge), every singleton created at startup and every
+eager window. The baseline showed all 720 process starts in 120 s came from
+`SystemStats` (a bash pipeline every 2 s: cat ×5, tail, grep, dirname, df
+per tick).
+
+### What changed
+
+| file | change |
+|---|---|
+| `services/SystemStats.qml` | CPU, memory and network from `/proc/stat`, `/proc/meminfo`, `/proc/net/dev` read with `FileView` inside the shell (no process). Disk (`df -P /`) and temperatures only while something shows them: new refcounts `diskWatchers` / `tempWatchers` beside `watchers`. hwmon sensors are listed once when the first temperature consumer appears, then read in-process; same name classification (coretemp/k10temp/zenpower/cpu, amdgpu/i915/intel, nvidia). Same 2 s cadence, same deltas. |
+| `modules/WidgetView.qml` | `MonPill.needs` ("disk"/"temp") registers the extra refcounts; the network pill registers `Network.watchers`; the VPN pill does one `nmcli -t -f TYPE,ACTIVE connection show` + `ip -brief link show type wireguard` pass (3 processes per 6 s tick instead of up to 7), same up/down/none result. |
+| `modules/SystemMonitorPanel.qml` | registers all three `SystemStats` refcounts while open; process list runs `ps` directly (1 process per 2.5 s tick instead of 3), first 12 rows cut in JS. |
+| `services/Brightness.qml` | `brightnessctl -m` once (device, class, max); the level is then read from `/sys/class/<class>/<device>/brightness` every 3 s in-process. Was bash + brightnessctl + awk + tr every 3 s (~80 processes/min) on every laptop, since `Osd.qml` creates the singleton at startup. Writes still go through `brightnessctl`. |
+| `services/Network.qml` | the 5 s `nmcli` poll runs only while `watchers > 0` (network pill, Quick Settings, network panel, Settings network page all register). Before it was `running: true`: one open of the network panel kept it alive all session. |
+| `services/KeyboardState.qml` | layout: no 4 s poll; refresh on Hyprland `activelayout` / `configreloaded` events and when a consumer appears. Caps Lock: the LED file is found once per consumer and read in-process every 500 ms; if it vanishes (keyboard unplugged, new `inputN` on replug) it is looked up again every ~10 s, as the old glob did on each tick. |
+| `modules/Settings.qml` | the page `Loader` is `active: win.everShown`: no page is built at login; after the first open it stays alive while closed, exactly as before (destroying it on close would kill its running processes — tested: destroying a `Process` kills its child, e.g. a Wi-Fi `nmcli … connect`). |
+| `modules/QuickSettingsPanel.qml`, `modules/NetworkPanel.qml` | register `Network.watchers` while open. |
+| `modules/CalendarPanel.qml` | removed a looping "drift" animation that never had an effect: its `Translate { y: parent.drift }` reads `parent`, which a `Translate` does not have (runtime warning "Unable to assign [undefined] to double"); it ran every frame while the panel was open. The horizontal parallax `Translate` stays; the panel looks exactly as before. |
+| `bridge/vexyon-bridge.py` (both repos, same edit; the files differ elsewhere for platform reasons) | waits on inotify (libc via ctypes, stdlib only; no `ctypes.util`, which spawns processes) on `~/.config/vexyon` for `IN_CLOSE_WRITE`/`IN_MOVED_TO`/`IN_CREATE`, instead of `stat` every 0.5 s (~170 000 wake-ups a day). The directory is watched, not the file, so atomic writes (tmp + rename) are seen. Other files in the directory are filtered by the existing mtime/content check. If the directory is moved or deleted (`IN_MOVE_SELF`/`IN_IGNORED`), or inotify is unavailable, it falls back to the old 0.5 s poll. |
+| `services/I18n.qml` | removed 12 keys no code uses (stale VM sentences, "Rebuild", "Networks", "Network link", "Videos"); added the 3 that were missing (`Bridged`, `Yes`, `No`). |
+| `services/Audio.qml`, `services/Vm.qml` | removed unused `nodeVolume`, `reboot_`, `setUsbRedir`. |
+| `config/vexyon/bridge/__pycache__/*.pyc` | were committed by mistake: removed; new `.gitignore` (`__pycache__/`, `*.pyc`). |
+| `assets/screenshots/*.png` → `*.webp`, `README.md` | README screenshots 19 MB → 1.3 MB (WebP q92, same 2561×1441; mean per-channel difference ~1/255, not visible). Not installed by either installer (`nix/package.nix` already filtered `assets`), but a NixOS flake input is the whole source tree, downloaded and kept in the store on every update. Git history keeps the old PNGs (history is never rewritten). |
+
+All shared files are byte-identical in both repositories (AGENTS.md loop:
+only the allowed platform files differ).
+
+### Measured (lab)
+
+| | before | after |
+|---|---|---|
+| default bar, 120 s idle: processes started | 720 | **0** |
+| default bar, 120 s idle: shell CPU time | 6.12 s (612 ticks) | **0.31 s** (31 ticks) |
+| default bar: PSS | 219 MB | 222 MB (no change; noise between runs is ±40 MB under llvmpipe) |
+| all monitor pills + network/VPN/Caps/brightness, 30 s steady state: processes | 537 (cat 184, bash 102, head 66, grep 45, …) | **54** (nmcli 17, df 15, bash 6, awk 6, sh 5, cat 5) |
+| bridge idle | `stat` every 0.5 s | blocked in `read()`, 0 wake-ups |
+
+RAM: the windows built at startup (Launcher, Settings, wallpaper picker, power
+menu, tray menu, screenshot overlay, monitor-revert dialog) were measured one
+by one (shell.qml line removed) three times each: no difference above the
+run-to-run noise (153–234 MB for the same tree). Hidden layer-shell windows
+have no surface or buffers; only their QML objects exist. They were left
+eager, because building them on first open would add latency to the first
+Super+Space, power menu, screenshot, etc. Only the Settings page (26 theme
+cards) was deferred, since it costs nothing to open later.
+
+### How it was verified
+
+- Lab functional run with fake sysfs and tools, values checked with probes
+  added only to the lab copy: CPU/RAM pills update every 2 s; disk 76 %;
+  CPU/GPU temperature 45/52 °C and 61 °C after changing the sensor;
+  brightness 50 % → 80 % after writing the sysfs file (OSD path); Caps Lock
+  on/off, then LED moved to another `inputN` (replug) and found again; VPN
+  pill grey → green; system monitor (cells + process list), Quick Settings,
+  network panel, Settings (first open, reopen, opened directly at Network and
+  at Modules), launcher, calendar and the other panels, lock/unlock. No QML
+  warnings other than the lab's missing Hyprland/swww/D-Bus.
+- Bridge: in-place write, atomic write, unrelated file, `touch` with same
+  content (no regeneration), directory moved away and recreated (falls back
+  to polling and still regenerates); `strace` shows no syscalls while idle.
+  The packaged NixOS bridge (`nix build`) also starts in inotify mode and
+  regenerates on an atomic write.
+- `nix build .#packages.x86_64-linux.default` (nixpkgs nixos-26.05) and a full
+  NixOS evaluation of `nix/module.nix` (toplevel drvPath). pyflakes and
+  `py_compile` on both bridges.
+- `nmcli -t -f TYPE,ACTIVE connection show` field names checked against the
+  nmcli binary; the parser tested on no-VPN, VPN down, WireGuard up, and no
+  NetworkManager (wg-quick only) outputs.
+
+### Not verified
+
+- Real hardware: no real backlight, hwmon, Caps Lock LED, AMD dGPU runtime
+  power state or NetworkManager VPN in the lab (all faked); not run under
+  Hyprland (the layout-event path needs Hyprland: `activelayout` and
+  `configreloaded` are standard Hyprland socket2 events, but not observed
+  here).
+- Not run on Arch/CachyOS (no installer change; the bridge uses only glibc's
+  `inotify_init1`/`inotify_add_watch`).
+- GitHub rendering of the WebP screenshots (GitHub supports WebP in README
+  images; not checked after the push).
+
 ## Session: File Manager — system clipboard between windows, XDG user folders, folder icons, sidebar bookmarks
 
 ### Why

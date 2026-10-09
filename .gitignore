@@ -1,0 +1,3 @@
+# Compiled Python (the bridge and helpers are run from source)
+__pycache__/
+*.pyc

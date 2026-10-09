@@ -186,16 +186,11 @@ AnchoredPanel {
                 opacity: (0.04 + 0.01 * Math.sin(cp.orbit * 4)) * body.weatherContentOpacity * body.introContent
                 z: 0
                 Behavior on color { ColorAnimation { duration: 1500 } }
-                property real drift: 0
-                SequentialAnimation on drift {
-                    loops: Animation.Infinite; running: cp.shown
-                    NumberAnimation { to: -20; duration: 6000; easing.type: Easing.InOutSine }
-                    NumberAnimation { to: 0; duration: 6000; easing.type: Easing.InOutSine }
-                }
-                transform: [
-                    Translate { y: parent.drift },
-                    Translate { x: body.weatherContentOffset * 2 }
-                ]
+                // (Aquí había una "deriva" vertical animada en bucle, pero su
+                // Translate leía `parent.drift` y un Translate no tiene parent:
+                // nunca movió nada y la animación gastaba CPU con el panel
+                // abierto. Fuera; el glifo se ve igual que siempre.)
+                transform: Translate { x: body.weatherContentOffset * 2 }
             }
 
             // =================================================================

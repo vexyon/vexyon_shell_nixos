@@ -35,20 +35,44 @@ Singleton {
             }
         }
     }
-    // re-query on Hyprland layout-change events + a slow safety poll
+    // Re-query on Hyprland's own events (no poll): `activelayout` on every
+    // switch, `configreloaded` when Settings rewrites the keyboard config, and
+    // whenever a consumer appears. The old 4 s "safety poll" (bash + hyprctl +
+    // jq + head) repeated what these events already say.
     Connections {
         target: Hyprland
-        function onRawEvent(e) { if (e.name === "activelayout") kbLister.running = true; }
+        function onRawEvent(e) {
+            if (root.watchers > 0 && (e.name === "activelayout" || e.name === "configreloaded"))
+                kbLister.running = true;
+        }
     }
-    Timer { interval: 4000; running: root.watchers > 0; repeat: true; triggeredOnStart: true; onTriggered: kbLister.running = true }
+    onWatchersChanged: if (watchers > 0) { kbLister.running = true; capsFind.running = true; }
 
     // ---- caps lock via /sys LED ----
+    //  The LED file is looked up when a consumer appears (its inputN number
+    //  depends on the keyboard), then read inside the shell every 500 ms — before, every
+    //  read was bash + cat + head: 6 processes a second while the lock screen
+    //  or a caps/keyboard widget was showing.
     Process {
-        id: capsReader
-        command: ["bash", "-c", "cat /sys/class/leds/*capslock*/brightness 2>/dev/null | head -1"]
-        stdout: StdioCollector { onStreamFinished: root.capsOn = (this.text.trim() === "1"); }
+        id: capsFind
+        command: ["bash", "-c", "for f in /sys/class/leds/*capslock*/brightness; do [ -e \"$f\" ] && echo \"$f\" && break; done"]
+        stdout: StdioCollector { onStreamFinished: capsFv.path = this.text.trim() }
     }
-    Timer { interval: 500; running: root.watchers > 0; repeat: true; triggeredOnStart: true; onTriggered: capsReader.running = true }
+    FileView { id: capsFv; blockLoading: true; printErrors: false }
+    property int _capsMiss: 0
+    Timer {
+        interval: 500; running: root.watchers > 0; repeat: true; triggeredOnStart: true
+        onTriggered: {
+            var t = "";
+            if (capsFv.path !== "") { capsFv.reload(); t = capsFv.text().trim(); }
+            if (t !== "") { root._capsMiss = 0; root.capsOn = (t === "1"); return; }
+            // Sin LED, o el teclado se desenchufó y al volver su inputN es
+            // otro (el fichero ya no existe → texto vacío): se busca de nuevo
+            // cada ~10 s, no en cada tick, como hacía el glob de antes.
+            root.capsOn = false;
+            if (root._capsMiss++ % 20 === 0 && !capsFind.running) capsFind.running = true;
+        }
+    }
 
     // switch to next configured layout
     // switchxkblayout NO existe como dispatcher Lua: bajo el root Lua la cadena

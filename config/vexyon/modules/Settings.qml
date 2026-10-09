@@ -156,8 +156,14 @@ FloatingWindow {
         command: ["uname", "-n"]
         stdout: StdioCollector { onStreamFinished: win.host = this.text.trim() }
     }
+    // La página no se construye hasta la PRIMERA apertura: antes la de Tema
+    // (26 tarjetas de paleta) nacía al iniciar sesión aunque Ajustes no se
+    // abriera nunca. Después se queda viva con la ventana cerrada, como
+    // siempre: destruirla al cerrar mataría sus procesos en curso (un
+    // `nmcli … connect` de la página de Red, p. ej.).
+    property bool everShown: false
     onVisibleChanged: {
-        if (visible) { hostProc.running = true; monNames.running = true; }
+        if (visible) { everShown = true; hostProc.running = true; monNames.running = true; }
         // Cierre EXTERNO (Super+Q/killactive): el compositor cierra el toplevel
         // y Qt escribe visible=false por debajo del binding, sin pasar por
         // Panels. Sin este resync, Panels.settings queda en true y volver a
@@ -1189,6 +1195,7 @@ FloatingWindow {
                     Loader {
                         Layout.fillWidth: true
                         Layout.fillHeight: true
+                        active: win.everShown
                         sourceComponent: win.current === "theme" ? cmpTheme
                                        : win.current === "store" ? cmpStore
                                        : win.current === "typography" ? cmpType
@@ -2150,7 +2157,12 @@ FloatingWindow {
                         color: Theme.surface0
                         RowLayout {
                             anchors.fill: parent; anchors.leftMargin: 14; anchors.rightMargin: 12; spacing: 10
-                            Text { text: Icons.ethernet; color: Network.kind === "ethernet" ? Theme.accent : Theme.subtext0; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize + 2; Layout.preferredWidth: 20 }
+                            Text {
+                                text: Icons.ethernet; color: Network.kind === "ethernet" ? Theme.accent : Theme.subtext0
+                                font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize + 2; Layout.preferredWidth: 20
+                                Component.onCompleted: Network.watchers++
+                                Component.onDestruction: Network.watchers--
+                            }
                             Text { text: "Ethernet"; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize }
                             Item { Layout.fillWidth: true }
                             Text {

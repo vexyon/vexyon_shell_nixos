@@ -37,6 +37,9 @@ AnchoredPanel {
             id: body
             width: qs.panelWidth - qs.contentMargin * 2
             spacing: 12
+            // el tile de red enseña Network mientras el panel está abierto
+            Component.onCompleted: Network.watchers++
+            Component.onDestruction: Network.watchers--
             // fases de la intro escalonada (las empuja AnchoredPanel)
             property real introHeader: 1
             property real introContent: 1

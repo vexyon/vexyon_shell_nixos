@@ -598,6 +598,8 @@ Item {
 
     Component { id: cNetwork
         Glyph {
+            Component.onCompleted: Network.watchers++
+            Component.onDestruction: Network.watchers--
             icon: Network.kind === "wifi" ? Icons.wifi : Network.kind === "ethernet" ? Icons.ethernet : Icons.noNetwork
             iconColor: Network.kind === "disconnected" ? Theme.overlay2 : Theme.accentFg
         }
@@ -688,10 +690,21 @@ Item {
     // monitor widgets: pasivos — el fondo de la pastilla abre sysMonitor.
     // Cada instancia refcuenta en SystemStats: sin ninguna, el poll de 2s
     // no corre (nada lo muestra).
+    //  `needs`: "disk" / "temp" piden además lo caro de leer (df, hwmon), que
+    //  SystemStats solo lee mientras alguien lo enseña.
     component MonPill: Pill {
         property bool selfHide: false
-        Component.onCompleted: SystemStats.watchers++
-        Component.onDestruction: SystemStats.watchers--
+        property string needs: ""
+        Component.onCompleted: {
+            SystemStats.watchers++;
+            if (needs === "disk") SystemStats.diskWatchers++;
+            else if (needs === "temp") SystemStats.tempWatchers++;
+        }
+        Component.onDestruction: {
+            SystemStats.watchers--;
+            if (needs === "disk") SystemStats.diskWatchers--;
+            else if (needs === "temp") SystemStats.tempWatchers--;
+        }
     }
     // ---- máquinas virtuales -------------------------------------------------
     //  La pastilla SOLO existe mientras hay al menos una VM encendida. Sin
@@ -791,15 +804,15 @@ Item {
         MonPill { glyph: Icons.server; glyphColor: Theme.accent2Fg; label: SystemStats.memPercent + "%" }
     }
     Component { id: cDisk
-        MonPill { glyph: Icons.drive; glyphColor: Theme.accentFg; label: SystemStats.diskPercent + "%" }
+        MonPill { needs: "disk"; glyph: Icons.drive; glyphColor: Theme.accentFg; label: SystemStats.diskPercent + "%" }
     }
     Component { id: cCpuTemp
-        MonPill { selfHide: SystemStats.cpuTemp <= 0; glyph: Icons.thermometer
+        MonPill { needs: "temp"; selfHide: SystemStats.cpuTemp <= 0; glyph: Icons.thermometer
                glyphColor: SystemStats.cpuTemp >= 80 ? Theme.red : Theme.accent2Fg
                label: SystemStats.cpuTemp + "°" }
     }
     Component { id: cGpuTemp
-        MonPill { selfHide: SystemStats.gpuTemp <= 0; glyph: Icons.thermometer
+        MonPill { needs: "temp"; selfHide: SystemStats.gpuTemp <= 0; glyph: Icons.thermometer
                glyphColor: SystemStats.gpuTemp >= 85 ? Theme.red : Theme.accentFg
                label: SystemStats.gpuTemp + "°" }
     }
@@ -926,15 +939,28 @@ Item {
             Timer { interval: 6000; running: true; repeat: true; triggeredOnStart: true; onTriggered: vpnProc.running = true }
             Process {
                 id: vpnProc
-                command: ["bash", "-c",
-                    "nmcli -t -f TYPE,STATE connection show --active 2>/dev/null | grep -qE '^(vpn|wireguard):' && echo up && exit; " +
-                    "ip -brief link show type wireguard 2>/dev/null | grep -q . && echo up && exit; " +
-                    "nmcli -t -f TYPE connection show 2>/dev/null | grep -qE '^(vpn|wireguard)$' && echo down || echo none"]
+                // Una sola pasada: todas las conexiones con su ACTIVE (yes/no)
+                // y, tras el separador, las interfaces WireGuard fuera de
+                // NetworkManager (wg-quick). 3 procesos por tick; antes, con
+                // las tuberías de grep, eran hasta 7.
+                command: ["sh", "-c",
+                    "nmcli -t -f TYPE,ACTIVE connection show 2>/dev/null; echo --; " +
+                    "ip -brief link show type wireguard 2>/dev/null"]
                 stdout: StdioCollector {
                     onStreamFinished: {
-                        var s = this.text.trim();
-                        vpnw.connected = (s === "up");
-                        vpnw.detected = (s !== "none");
+                        var lines = this.text.split("\n");
+                        var sep = lines.indexOf("--");
+                        var rows = sep < 0 ? lines : lines.slice(0, sep);
+                        var up = sep >= 0 && lines.slice(sep + 1).join("").trim() !== "";
+                        var any = up;
+                        for (var i = 0; i < rows.length; i++) {
+                            var f = rows[i].split(":");
+                            if (f[0] !== "vpn" && f[0] !== "wireguard") continue;
+                            any = true;
+                            if (f[1] === "yes") up = true;
+                        }
+                        vpnw.connected = up;
+                        vpnw.detected = any;
                     }
                 }
             }

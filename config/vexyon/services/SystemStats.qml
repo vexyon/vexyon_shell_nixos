@@ -39,44 +39,112 @@ Singleton {
     // Refcount de consumidores (pastillas monitor de la barra y panel
     // sysMonitor — el panel solo se abre desde una pastilla, así que con
     // barras sin widgets de monitor el dato no lo muestra NADIE y el poll
-    // no corre). Con widgets en barra (default) es idéntico a antes. Los
-    // deltas (_prevCpu/_prevNet) viven en el singleton: re-abrir no pierde
-    // el estado y el primer valor tras re-registrar sale como siempre.
+    // no corre). Los deltas (_prevCpu/_prevNet) viven en el singleton:
+    // re-abrir no pierde el estado y el primer valor tras re-registrar sale
+    // como siempre.
     property int watchers: 0
+    // Aparte, lo que cuesta más que leer /proc y solo hace falta si alguien lo
+    // ENSEÑA: el disco (`df`: el uso de un sistema de ficheros no está en
+    // ningún fichero de /proc) y las temperaturas (leer el hwmon de una dGPU
+    // AMD en reposo la DESPIERTA — en un portátil híbrido eso es batería).
+    // Pastillas de disco/temperatura y el panel suben estos además de
+    // `watchers`; las de CPU/RAM/red no.
+    property int diskWatchers: 0
+    property int tempWatchers: 0
+
+    // CPU, memoria y red: /proc leído DENTRO del proceso (FileView), sin
+    // lanzar nada. Antes era un bash con cat/grep/tail/df/dirname cada 2 s
+    // (~8 procesos por segundo con la barra por defecto).
+    FileView { id: statFv; path: "/proc/stat"; blockLoading: true; printErrors: false }
+    FileView { id: memFv; path: "/proc/meminfo"; blockLoading: true; printErrors: false }
+    FileView { id: netFv; path: "/proc/net/dev"; blockLoading: true; printErrors: false }
 
     Timer {
         interval: 2000; running: root.watchers > 0; repeat: true; triggeredOnStart: true
-        onTriggered: poller.running = true
+        onTriggered: root.tick()
     }
 
+    // ---- disco: `df` solo con consumidores de disco --------------------------
     Process {
-        id: poller
+        id: dfProc
+        command: ["df", "-P", "/"]
+        stdout: StdioCollector {
+            onStreamFinished: {
+                var l = this.text.trim().split("\n");
+                var f = (l[l.length - 1] || "").trim().split(/\s+/);
+                if (f.length >= 5) root.diskPercent = parseInt(f[4]) || 0;
+            }
+        }
+    }
+
+    // ---- temperaturas: los hwmon se buscan UNA vez (al aparecer el primer
+    // consumidor) y luego se leen en el propio proceso ------------------------
+    property var _tempFiles: []          // [{ name, path }]
+    onTempWatchersChanged: if (tempWatchers > 0) hwmonScan.running = true
+    Process {
+        id: hwmonScan
         command: ["bash", "-c",
-            "echo CPU; cat /proc/stat | grep '^cpu '; " +
-            "echo MEM; cat /proc/meminfo | grep -E '^(MemTotal|MemAvailable):'; " +
-            "echo DISK; df -P / | tail -1; " +
-            "echo NET; cat /proc/net/dev | tail -n +3; " +
-            "echo CPUTEMP; for f in /sys/class/hwmon/hwmon*/temp1_input; do " +
-              "n=$(cat $(dirname $f)/name 2>/dev/null); " +
-              "echo \"$n $(cat $f 2>/dev/null)\"; done"]
-        stdout: StdioCollector { onStreamFinished: root.parse(this.text) }
+            "for f in /sys/class/hwmon/hwmon*/temp1_input; do [ -e \"$f\" ] || continue; " +
+            "printf '%s\\t%s\\n' \"$(cat \"${f%/*}/name\" 2>/dev/null)\" \"$f\"; done"]
+        stdout: StdioCollector {
+            onStreamFinished: {
+                var out = [], lines = this.text.split("\n");
+                for (var i = 0; i < lines.length; i++) {
+                    var t = lines[i].indexOf("\t");
+                    if (t > 0) out.push({ name: lines[i].substring(0, t).toLowerCase(), path: lines[i].substring(t + 1) });
+                }
+                root._tempFiles = out;
+                root.readTemps();
+            }
+        }
+    }
+    Instantiator {
+        id: tempViews
+        model: root._tempFiles
+        delegate: FileView {
+            required property var modelData
+            path: modelData.path
+            blockLoading: true
+            printErrors: false
+        }
     }
 
-    function _sec(t, name, next) {
-        var a = t.indexOf(name + "\n");
-        if (a < 0) return "";
-        a += name.length + 1;
-        var b = next ? t.indexOf(next + "\n", a) : t.length;
-        return t.substring(a, b < 0 ? t.length : b);
+    function tick() {
+        statFv.reload(); memFv.reload(); netFv.reload();
+        root.parse(statFv.text(), memFv.text(), netFv.text());
+        if (root.diskWatchers > 0 && !dfProc.running) dfProc.running = true;
+        if (root.tempWatchers > 0) root.readTemps();
     }
 
-    function parse(t) {
+    function readTemps() {
+        var cpuT = 0, gpuT = 0, nvT = 0;
+        for (var k = 0; k < tempViews.count; k++) {
+            var fv = tempViews.objectAt(k);
+            if (!fv) continue;
+            fv.reload();
+            var nm = root._tempFiles[k].name;
+            var val = Math.round((parseInt(fv.text()) || 0) / 1000);
+            if (val <= 0) continue;
+            if (nm.indexOf("coretemp") !== -1 || nm.indexOf("k10temp") !== -1 || nm.indexOf("zenpower") !== -1 || nm.indexOf("cpu") !== -1) {
+                if (cpuT === 0) cpuT = val;
+            } else if (nm.indexOf("amdgpu") !== -1 || nm.indexOf("i915") !== -1 || nm.indexOf("intel") !== -1) {
+                if (gpuT === 0) gpuT = val;
+            } else if (nm.indexOf("nvidia") !== -1) {
+                if (nvT === 0) nvT = val;
+            }
+        }
+        root.cpuTemp = cpuT;
+        root.gpuTemp = gpuT;
+        root.nvidiaTemp = nvT;
+    }
+
+    function parse(stat, mem, netdev) {
         var nowT = Date.now() / 1000;
         var dt = root._prevT > 0 ? Math.max(0.001, nowT - root._prevT) : 2.0;
         root._prevT = nowT;
 
         // ---- CPU ----
-        var cpuLine = root._sec(t, "CPU", "MEM").trim();
+        var cpuLine = (stat.split("\n")[0] || "").trim();
         var f = cpuLine.split(/\s+/);           // cpu user nice system idle iowait irq softirq steal
         if (f.length >= 5 && f[0] === "cpu") {
             var idle = parseInt(f[4]) + (parseInt(f[5]) || 0);   // idle + iowait
@@ -97,7 +165,6 @@ Singleton {
         }
 
         // ---- MEM ----
-        var mem = root._sec(t, "MEM", "DISK");
         var mt = mem.match(/MemTotal:\s+(\d+)/);
         var ma = mem.match(/MemAvailable:\s+(\d+)/);
         if (mt && ma) {
@@ -107,12 +174,8 @@ Singleton {
             root.memPercent = Math.round(100 * (totalKb - availKb) / totalKb);
         }
 
-        // ---- DISK ----
-        var disk = root._sec(t, "DISK", "NET").trim().split(/\s+/);
-        if (disk.length >= 5) root.diskPercent = parseInt(disk[4]) || 0;
-
         // ---- NET (sum all non-loopback interfaces) ----
-        var netLines = root._sec(t, "NET", "CPUTEMP").split("\n");
+        var netLines = netdev.split("\n").slice(2);   // 2 header lines
         var rx = 0, tx = 0;
         for (var n = 0; n < netLines.length; n++) {
             var l = netLines[n].trim();
@@ -126,27 +189,6 @@ Singleton {
             root.netUpKbs = Math.max(0, (tx - root._prevNet.tx) / dt / 1024);
         }
         root._prevNet = { rx: rx, tx: tx };
-
-        // ---- TEMPS ----
-        var temps = root._sec(t, "CPUTEMP", null).split("\n");
-        var cpuT = 0, gpuT = 0, nvT = 0;
-        for (var k = 0; k < temps.length; k++) {
-            var tl = temps[k].trim(); if (tl === "") continue;
-            var sp = tl.lastIndexOf(" ");
-            var nm = tl.substring(0, sp).trim().toLowerCase();
-            var val = Math.round((parseInt(tl.substring(sp + 1)) || 0) / 1000);
-            if (val <= 0) continue;
-            if (nm.indexOf("coretemp") !== -1 || nm.indexOf("k10temp") !== -1 || nm.indexOf("zenpower") !== -1 || nm.indexOf("cpu") !== -1) {
-                if (cpuT === 0) cpuT = val;
-            } else if (nm.indexOf("amdgpu") !== -1 || nm.indexOf("i915") !== -1 || nm.indexOf("intel") !== -1) {
-                if (gpuT === 0) gpuT = val;
-            } else if (nm.indexOf("nvidia") !== -1) {
-                if (nvT === 0) nvT = val;
-            }
-        }
-        root.cpuTemp = cpuT;
-        root.gpuTemp = gpuT;
-        root.nvidiaTemp = nvT;
     }
 
     // pretty KB/s -> string

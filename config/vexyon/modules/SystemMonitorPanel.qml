@@ -35,10 +35,12 @@ AnchoredPanel {
     Timer { id: poll; interval: 2500; repeat: true; onTriggered: psProc.running = true }
     Process {
         id: psProc
-        command: ["bash", "-c", "ps -eo pid,pcpu,pmem,comm --sort=-pcpu --no-headers 2>/dev/null | head -12"]
+        // ps a secas (sin bash ni head): 1 proceso por tick en vez de 3; las
+        // 12 primeras líneas se cortan aquí.
+        command: ["ps", "-eo", "pid,pcpu,pmem,comm", "--sort=-pcpu", "--no-headers"]
         stdout: StdioCollector {
             onStreamFinished: {
-                var lines = this.text.trim().split("\n");
+                var lines = this.text.trim().split("\n").slice(0, 12);
                 var out = [];
                 for (var i = 0; i < lines.length; i++) {
                     var p = lines[i].trim().split(/\s+/);
@@ -62,9 +64,10 @@ AnchoredPanel {
             property real introContent: 1
 
             // el panel muestra SystemStats mientras está abierto — refcount
-            // propio por si algún día se abre sin pastillas monitor en la barra
-            Component.onCompleted: SystemStats.watchers++
-            Component.onDestruction: SystemStats.watchers--
+            // propio por si algún día se abre sin pastillas monitor en la barra.
+            // Enseña disco y temperatura: pide también esas lecturas.
+            Component.onCompleted: { SystemStats.watchers++; SystemStats.diskWatchers++; SystemStats.tempWatchers++; }
+            Component.onDestruction: { SystemStats.watchers--; SystemStats.diskWatchers--; SystemStats.tempWatchers--; }
 
             // fase de onda compartida por todas las celdas (ilyamiro globalWavePhase)
             property real wavePhase: 0.0

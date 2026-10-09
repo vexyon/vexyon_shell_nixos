@@ -42,6 +42,45 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
   makes "name (copy)"; a folder is never copied into itself; errors (missing
   source, read-only destination, permissions) are shown on the card.
 
+### Changed
+
+- **Much lower idle cost, same features.** With the default bar the shell
+  used to start about 6 processes a second (a bash pipeline every 2 s for the
+  CPU/RAM pills); it now starts none: CPU, memory and network are read from
+  `/proc` inside the shell. Measured in the lab (same machine, 120 s idle,
+  default config): processes started 720 → 0, shell CPU time 6.12 s → 0.31 s.
+  With every monitor pill on the bar (disk, temperatures, network, VPN, Caps
+  Lock, brightness): 537 → 54 processes in 30 s. Refresh rates are unchanged.
+  - Disk usage (`df`) and temperatures are read only while a disk or
+    temperature pill, or the system monitor, shows them. Temperatures no
+    longer wake an idle AMD dGPU when nothing displays them.
+  - Brightness: `brightnessctl` runs once to find the backlight; the level is
+    then read from sysfs every 3 s (it used to cost ~80 processes a minute on
+    every laptop). Changes made outside the shell still show the OSD.
+  - Network state (`nmcli` every 5 s) is polled only while the network pill,
+    Quick Settings, the network panel or the Settings network page is open;
+    before, it kept polling all session once anything had looked at it.
+  - Keyboard layout follows Hyprland's own events instead of a 4 s poll; the
+    Caps Lock LED is read inside the shell (and found again if the keyboard
+    is unplugged and plugged back).
+  - The VPN pill, the system monitor's process list: fewer processes per
+    refresh (no `bash`/`grep`/`head` around the real command).
+  - The bridge (`vexyon-bridge`) waits for changes to `shell.json` with
+    inotify instead of checking it twice a second; it falls back to the old
+    check if inotify is not available.
+  - Settings builds its page on first open instead of at login.
+- **README screenshots are WebP** (1.3 MB instead of 19 MB). On NixOS the
+  flake source is downloaded and stored with every update, so this is what it
+  saves on disk and download each time.
+
+### Removed
+
+- Dead code: 12 unused translations, three unused functions (`Audio.nodeVolume`,
+  `Vm.reboot_`, `Vm.setUsbRedir`), compiled Python caches that were committed
+  by mistake (`.gitignore` added), and a calendar-panel animation that never
+  moved anything (it read `parent` inside a `Translate`, which has none) but
+  kept running while the panel was open.
+
 ## [3.0.0] — 2026-10-08
 
 ### Added

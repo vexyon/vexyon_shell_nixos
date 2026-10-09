@@ -31,6 +31,7 @@ AnchoredPanel {
             id: body
             width: np.panelWidth - np.contentMargin * 2
             implicitHeight: col.implicitHeight
+            Component.onDestruction: Network.watchers--
 
             property real introHeader: 1
             property real introContent: 1
@@ -62,6 +63,7 @@ AnchoredPanel {
 
             // refresco al abrir (y al cambiar de pestaña wifi)
             Component.onCompleted: {
+                Network.watchers++;
                 Network.refreshSaved();
                 Network.refreshInfo();
                 if (body.wifiPresent) Network.refreshWifi();

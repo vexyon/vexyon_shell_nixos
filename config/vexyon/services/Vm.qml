@@ -483,7 +483,6 @@ Singleton {
     function suspend(name)    { root.run("suspend",  "$V suspend "  + q(name)); }
     function resume(name)     { root.run("resume",   "$V resume "   + q(name)); }
     function reset_(name)     { root.run("reset",    "$V reset "    + q(name)); }
-    function reboot_(name)    { root.run("reboot",   "$V reboot "   + q(name)); }
 
     // Borrar = apagar a lo bruto si sigue viva, quitar snapshots y el estado
     // guardado (si no, `undefine` se niega), y borrar el disco solo si se pide.
@@ -985,7 +984,6 @@ Singleton {
     }
     function setSpiceAgent(name, on) { root.run("spice-agent", root.editXml(name, "spice-agent " + (on ? "on" : "off"))); }
     function setClipboard(name, on) { root.run("clipboard", root.editXml(name, "clipboard " + (on ? "on" : "off"))); }
-    function setUsbRedir(name, n) { root.run("usbredir", root.editXml(name, "usbredir " + n)); }
     function setDescription(name, text) { root.run("desc", root.editXml(name, "desc " + q(text))); }
     function addSharedFolder(name, rawPath, tag) {
         var path = root.expandPath(rawPath);

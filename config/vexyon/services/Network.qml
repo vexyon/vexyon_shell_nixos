@@ -313,7 +313,13 @@ Singleton {
         root.parse(dev + "\n###\n" + wifi);
     }
 
-    Timer { interval: 5000; running: true; repeat: true; onTriggered: query.running = true }
+    // Refcount de lo que ENSEÑA el estado de la red (widget de red de la
+    // barra, ajustes rápidos, panel de red, página de red de Ajustes). Sin
+    // ninguno, nmcli no se lanza cada 5 s: antes, abrir el panel de red UNA
+    // vez dejaba este sondeo vivo el resto de la sesión. Al aparecer un
+    // consumidor se relee al momento (triggeredOnStart).
+    property int watchers: 0
+    Timer { interval: 5000; running: root.watchers > 0; repeat: true; triggeredOnStart: true; onTriggered: query.running = true }
 
     function parse(txt) {
         var parts = txt.split("###");

@@ -10,7 +10,8 @@ Responsibilities:
   * Generate ~/.config/hypr/vexyon-settings.lua  (gaps / border / rounding from layout tokens)
   * Generate ~/.config/hypr/vexyon-monitors.lua  (active display profile)
   * Trigger `hyprctl reload` so changes apply live, zero restart
-  * Watch shell.json (mtime poll, dependency-free) and regenerate on change
+  * Watch shell.json (inotify via libc, stdlib only; mtime poll as fallback)
+    and regenerate on change
 
 All writes are atomic (temp file + os.replace) so a crash mid-write never corrupts config.
 
@@ -83,7 +84,7 @@ FASTFETCH_CONF = os.path.join(VEXYON_DIR, "fastfetch.jsonc")
 # solo install.sh de Arch copiaba: en NixOS no llegaba a ningún $HOME).
 FISH_GREETING = os.path.join(HOME, ".config", "fish", "conf.d", "vexyon-greeting.fish")
 
-POLL_INTERVAL = 0.5  # seconds
+POLL_INTERVAL = 0.5  # seconds — only when inotify is unavailable
 
 
 LUA_HEADER = (
@@ -922,6 +923,49 @@ def regenerate(cfg, reload=True):
     apply_cursor_live(cfg)
 
 
+# inotify en vez de sondear: el daemon vive toda la sesión, y un stat cada
+# 0,5 s eran ~170 000 despertares al día para un fichero que cambia unas pocas
+# veces. Con inotify el proceso duerme bloqueado en read() hasta que algo se
+# escribe en ~/.config/vexyon. Se vigila el DIRECTORIO, no el fichero: una
+# escritura atómica (tmp + rename) cambia el inodo y un watch sobre el fichero
+# quedaría huérfano. Lo que no sea shell.json (p. ej. fastfetch.jsonc, que
+# escribe este mismo daemon) lo filtra la comprobación de mtime del bucle.
+# Sin ctypes.util a propósito: find_library() lanza procesos.
+_IN_CLOSE_WRITE, _IN_MOVED_TO, _IN_CREATE = 0x8, 0x80, 0x100
+_IN_MOVE_SELF, _IN_IGNORED = 0x800, 0x8000
+
+
+def watch_dir_fd():
+    """fd de inotify sobre VEXYON_DIR, o None (y el bucle sondea como antes)."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        fd = libc.inotify_init1(os.O_CLOEXEC)
+        if fd < 0:
+            return None
+        mask = _IN_CLOSE_WRITE | _IN_MOVED_TO | _IN_CREATE | _IN_MOVE_SELF
+        if libc.inotify_add_watch(fd, os.fsencode(VEXYON_DIR), mask) < 0:
+            os.close(fd)
+            return None
+        return fd
+    except (OSError, AttributeError):
+        return None
+
+
+def wait_dir_event(fd):
+    """Bloquea hasta el próximo evento. False si el directorio vigilado se
+    borró o se movió: el watch ya no apunta a ~/.config/vexyon."""
+    buf = os.read(fd, 4096)
+    off = 0
+    while off + 16 <= len(buf):
+        # struct inotify_event { int wd; uint32 mask, cookie, len; char name[]; }
+        mask = int.from_bytes(buf[off + 4:off + 8], sys.byteorder)
+        if mask & (_IN_IGNORED | _IN_MOVE_SELF):
+            return False
+        off += 16 + int.from_bytes(buf[off + 12:off + 16], sys.byteorder)
+    return True
+
+
 def main():
     oneshot = "--oneshot" in sys.argv
     cfg = load_config()
@@ -938,9 +982,17 @@ def main():
 
     last_mtime = os.path.getmtime(SHELL_JSON) if os.path.exists(SHELL_JSON) else 0
     last_good = cfg
-    log("watching shell.json for changes...")
+    fd = watch_dir_fd()
+    log("watching shell.json for changes" + (" (inotify)" if fd is not None else " (polling)"))
     while True:
-        time.sleep(POLL_INTERVAL)
+        if fd is None:
+            time.sleep(POLL_INTERVAL)
+        elif not wait_dir_event(fd):
+            # El directorio desapareció o se movió: el watch ya no sirve.
+            os.close(fd)
+            fd = None
+            log("inotify watch lost; falling back to polling")
+            continue
         try:
             mtime = os.path.getmtime(SHELL_JSON)
         except FileNotFoundError:

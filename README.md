@@ -13,7 +13,7 @@
 
 <br>
 
-![Vexyon Shell — app launcher](assets/screenshots/launcher.png)
+![Vexyon Shell — app launcher](assets/screenshots/launcher.webp)
 
 </div>
 
@@ -29,21 +29,21 @@ Vexyon is a complete desktop shell built from scratch in QML on [Quickshell](htt
 <table>
   <tr>
     <td align="center" width="50%">
-      <img src="assets/screenshots/dashboard.png" alt="Clock, calendar and weather dashboard"><br>
+      <img src="assets/screenshots/dashboard.webp" alt="Clock, calendar and weather dashboard"><br>
       <sub><b>Dashboard</b> — clock, calendar and weather with hourly forecast</sub>
     </td>
     <td align="center" width="50%">
-      <img src="assets/screenshots/settings.png" alt="Settings — bar widget editor"><br>
+      <img src="assets/screenshots/settings.webp" alt="Settings — bar widget editor"><br>
       <sub><b>Settings</b> — add, remove and reorder bar widgets from the UI</sub>
     </td>
   </tr>
   <tr>
     <td align="center" width="50%">
-      <img src="assets/screenshots/wallpaper-picker.png" alt="Wallpaper picker carousel"><br>
+      <img src="assets/screenshots/wallpaper-picker.webp" alt="Wallpaper picker carousel"><br>
       <sub><b>Wallpaper picker</b> — browse and search your wallpapers</sub>
     </td>
     <td align="center" width="50%">
-      <img src="assets/screenshots/lockscreen.png" alt="Lock screen over blurred wallpaper"><br>
+      <img src="assets/screenshots/lockscreen.webp" alt="Lock screen over blurred wallpaper"><br>
       <sub><b>Lock screen</b> — blurred wallpaper, themed clock and status pills</sub>
     </td>
   </tr>
