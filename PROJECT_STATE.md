@@ -218,6 +218,7 @@ same per-channel values −0.01 and back. Two findings while building it:
 - Arch: not run (repositories blocked from this container); `qemu-desktop`
   is assumed to include the GL display modules.
 - NixOS boot VM test (`modules-gating`): still running (software emulation, no KVM, ~10 min) when this was committed; its result is added below in a follow-up commit.
+  - Result (follow-up): **passed** — `nix build .#tests.x86_64-linux.modules-gating.driver` with this tree, run without KVM: four boots, test script finished in 640 s, exit 0. The VM has no NVIDIA, so it checks that the module and its gating are unchanged, not the new `cgroup_device_acl`.
 
 ## Session: resource audit — RAM, CPU, disk; dead code (both repositories)
 
