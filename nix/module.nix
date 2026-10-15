@@ -360,6 +360,27 @@ in
         package = lib.mkDefault pkgs.qemu_kvm;
         swtpm.enable = lib.mkDefault true;
         vhostUserPackages = lib.mkDefault [ pkgs.virtiofsd ];
+        # "Iniciar con aceleración 3D" (gestor de VMs): QEMU renderiza el 3D
+        # del invitado en la GPU (virtio-gpu + virgl, pantalla egl-headless).
+        # Con el driver PROPIETARIO de NVIDIA, su EGL abre /dev/nvidiactl y
+        # /dev/nvidiaN además del render node, y la lista de dispositivos que
+        # libvirt deja tocar a QEMU (cgroup_device_acl) no los incluye: sin
+        # esto, el arranque 3D falla con "egl: render node init failed".
+        # La lista = la de fábrica de libvirt 12 (null … userfaultfd; /dev/kvm
+        # va aparte) + los nodos de NVIDIA; libvirt ignora los que no existan.
+        # `namespaces = []` es el valor por defecto de NixOS para esta opción
+        # y se conserva. mkDefault: un verbatimConfig del usuario manda.
+        verbatimConfig = lib.mkIf (lib.elem "nvidia" config.services.xserver.videoDrivers) (
+          lib.mkDefault ''
+            namespaces = []
+            cgroup_device_acl = [
+              "/dev/null", "/dev/full", "/dev/zero", "/dev/random", "/dev/urandom",
+              "/dev/ptmx", "/dev/userfaultfd",
+              "/dev/nvidiactl", "/dev/nvidia0", "/dev/nvidia1", "/dev/nvidia-modeset",
+              "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools"
+            ]
+          ''
+        );
       };
     };
 

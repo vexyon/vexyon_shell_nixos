@@ -49,8 +49,18 @@ seed_tree() {
   done < <(find "$src" -type f -print0)
 }
 
-mkdir -p "$CFG" "$HYPR" "$DATA" \
-         "$HOME/Pictures/Wallpapers" "$HOME/Pictures/Screenshots"
+mkdir -p "$CFG" "$HYPR" "$DATA"
+
+# Carpetas de usuario (Escritorio/Desktop, Imágenes/Pictures…): las crea la
+# shell UNA vez, en su idioma, al cerrar la bienvenida (donde se elige) — no
+# este script, y nunca más. Hasta entonces nada debe crearlas en el idioma del
+# sistema: se apaga xdg-user-dirs-update para este usuario (lo lanzaría el
+# autostart del paquete si algo procesa el autostart de XDG). Solo mientras no
+# tenga carpetas configuradas y sin pisar un user-dirs.conf suyo.
+if [ ! -e "$HOME/.config/user-dirs.dirs" ] && [ ! -e "$HOME/.config/user-dirs.conf" ]; then
+  printf '%s\n' "# Vexyon: la shell crea las carpetas de usuario una vez, en su idioma." \
+    "enabled=False" > "$HOME/.config/user-dirs.conf"
+fi
 
 copy_if_absent "$SHARE/seed/shell.json"     "$CFG/shell.json"
 # TODAS las raíces Lua, no solo las estáticas: hyprland.lua hace require() de
@@ -157,6 +167,21 @@ if MIG not in done:
             break
     done.append(MIG)
     combos = {(tuple(sorted(k.get("mods", []))), k.get("key")) for k in kbs}
+# Then Super+R: moved once from either old default (Super+Shift+V since 3.0,
+# Super+Shift+R before), only while Super+R is free. As above, a later
+# deliberate choice is never undone.
+MIG2 = "recorder-super-r"
+moved2 = False
+if MIG2 not in done:
+    for k in kbs:
+        if k.get("id") == "recorder" and sorted(k.get("mods", [])) == ["SHIFT", "SUPER"] and k.get("key") in ("V", "R"):
+            if (("SUPER",), "R") not in combos:
+                k["mods"] = ["SUPER"]
+                k["key"] = "R"
+                moved2 = True
+            break
+    done.append(MIG2)
+    combos = {(tuple(sorted(k.get("mods", []))), k.get("key")) for k in kbs}
 added = []
 for k in defaults:
     if k.get("category") != "Media" and k.get("id") not in LATE:
@@ -167,7 +192,7 @@ for k in defaults:
         continue                 # ese combo ya lo usa el usuario para otra cosa
     kbs.append(k)
     added.append(k["id"])
-if added or MIG not in before:
+if added or MIG not in before or MIG2 not in before:
     tmp = sj + ".tmp"
     with open(tmp, "w") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
@@ -177,6 +202,8 @@ if added or MIG not in before:
         print("vexyon-seed: atajo(s) sembrado(s): " + ", ".join(added))
     if moved:
         print("vexyon-seed: grabadora movida de Super+Shift+R a Super+Shift+V")
+    if moved2:
+        print("vexyon-seed: grabadora movida a Super+R")
 PYEOF
 }
 seed_late_keybinds

@@ -18,6 +18,12 @@ import qs.services
 //  uses for screenshots), sound from PipeWire through its PulseAudio server
 //  (pipewire-pulse, already a shell dependency).
 //
+//  What: a whole screen (whatever its workspace shows), a window (its area on
+//  screen when the recording starts) or a dragged region. How: native size or
+//  scaled down to 1440p/1080p/720p, and the screen's own frame rate or a fixed
+//  60/30. Sound: none, system, microphone, or system + microphone — mixed
+//  inside the running PipeWire only while recording (see _script).
+//
 //  The switch is the "Screen recording" module (Settings → Modules,
 //  services/Modules.qml). It is a session module: no service behind it, so
 //  it applies at once.
@@ -42,7 +48,9 @@ Singleton {
     //  `enabled` mirrors the module; `recording.enabled` stays the key in
     //  shell.json, so a choice made before 3.0 is kept.
     readonly property bool enabled: Modules.recorderOn
-    readonly property string audio: Config.get("recording", "audio", "system")   // none | system | mic
+    readonly property string audio: Config.get("recording", "audio", "system")   // none | system | mic | both
+    readonly property string resolution: Config.get("recording", "resolution", "native") // native | 1440 | 1080 | 720
+    readonly property string fps: Config.get("recording", "fps", "auto")          // auto | 60 | 30
     readonly property string format: Config.get("recording", "format", "mp4")    // mp4 | mkv
     readonly property string dir: Config.get("recording", "dir", "~/Videos/Recordings")
     readonly property string dirPath: root.dir.replace(/^~(?=\/|$)/, Quickshell.env("HOME"))
@@ -128,8 +136,72 @@ Singleton {
     function startOutput(name) { if (name) root._launch(["-o", name], name); }
     // geom = "X,Y WxH" in global layout coordinates (what the region overlay
     // and grim use). wf-recorder finds the monitor that contains it.
-    function startRegion(geom) {
-        if (/^-?\d+,-?\d+ \d+x\d+$/.test(geom)) root._launch(["-g", geom], geom);
+    function startRegion(geom, label) {
+        if (/^-?\d+,-?\d+ \d+x\d+$/.test(geom)) root._launch(["-g", geom], label || geom);
+    }
+
+    // ---- windows -----------------------------------------------------------
+    //  wf-recorder captures outputs (screencopy), not windows: a window is
+    //  recorded as its AREA on screen at the moment the recording starts.
+    //  So only windows on a workspace that is showing right now are offered
+    //  (a hidden one has no area to record), and the area is clipped to the
+    //  window's monitor. Geometry comes from Hyprland's own IPC reply
+    //  (lastIpcObject: at/size in layout coordinates, as the region overlay
+    //  uses), refreshed when the picker opens — no process, no polling.
+    function refreshWindows() { Hyprland.refreshToplevels(); Hyprland.refreshMonitors(); }
+    function windowRect(t) {
+        var o = t ? t.lastIpcObject : null;
+        if (!o || !o.at || !o.size || o.mapped === false || o.hidden === true) return null;
+        var x = o.at[0], y = o.at[1], w = o.size[0], h = o.size[1];
+        var m = t.monitor;
+        if (m && m.scale > 0) {
+            var mw = Math.round(m.width / m.scale), mh = Math.round(m.height / m.scale);
+            var tr = m.lastIpcObject ? (m.lastIpcObject.transform || 0) : 0;
+            if (tr % 2 === 1) { var tmp = mw; mw = mh; mh = tmp; }
+            var x2 = Math.min(x + w, m.x + mw), y2 = Math.min(y + h, m.y + mh);
+            x = Math.max(x, m.x); y = Math.max(y, m.y);
+            w = x2 - x; h = y2 - y;
+        }
+        if (w < 16 || h < 16) return null;
+        return { x: x, y: y, w: w, h: h };
+    }
+    //  Windows that can be recorded now: mapped, on a workspace that is
+    //  showing (active on its monitor), not the shell's own layers.
+    function recordableWindows() {
+        var out = [], all = Hyprland.toplevels.values;
+        for (var i = 0; i < all.length; i++) {
+            var t = all[i];
+            if (!t.workspace || !t.workspace.active) continue;
+            var r = root.windowRect(t);
+            if (!r) continue;
+            var o = t.lastIpcObject;
+            out.push({ toplevel: t, rect: r, cls: o["class"] || "", title: t.title || o.title || "",
+                       workspace: t.workspace.name, monitor: t.monitor ? t.monitor.name : "" });
+        }
+        return out;
+    }
+    function startWindow(t) {
+        var r = root.windowRect(t);
+        if (!r) return;
+        var o = t.lastIpcObject || {};
+        root.startRegion(r.x + "," + r.y + " " + r.w + "x" + r.h, o["class"] || t.title || "window");
+    }
+
+    //  Size and frame rate (wf-recorder -F / -r):
+    //   * size: an ffmpeg scale that only ever scales DOWN to that height
+    //     (min(ih,H)), width kept even for H.264;
+    //   * fixed fps: -r adds ffmpeg's fps filter, and -D asks the compositor
+    //     for every frame instead of only changed ones. Without -D a still
+    //     screen gives the fps filter nothing, and at stop the file was left
+    //     unfinished (measured: 262-byte MP4). "auto" keeps the default:
+    //     frames only when the screen changes, the lightest.
+    function _videoArgs() {
+        var a = [];
+        var h = parseInt(root.resolution);
+        if (h > 0) a.push("-F", "scale=-2:'min(ih," + h + ")'");
+        var f = parseInt(root.fps);
+        if (f > 0) a.push("-r", String(f), "-D");
+        return a;
     }
     // Stop = close the recorder's stdin. The wrapper turns that EOF into a
     // clean SIGINT (see _script). The same EOF happens if the shell dies or
@@ -145,17 +217,21 @@ Singleton {
         root.lastError = ""; root.lastFile = ""; root.file = "";
         root.startedAt = 0; root.stopping = false; root._err = [];
         root.target = label;
-        var a = args.slice();
-        // One source at a time: wf-recorder takes a single audio device.
-        // The names are the PulseAudio defaults, so they follow whatever
-        // output/input is current in the volume panel. The backend is named
-        // explicitly: on a build that also has PipeWire audio the default
-        // could differ, and there @DEFAULT_MONITOR@ means nothing.
-        if (root.audio !== "none" && root.soundOk)
-            a.push("--audio-backend=pulse",
-                   "--audio=" + (root.audio === "mic" ? "@DEFAULT_SOURCE@" : "@DEFAULT_MONITOR@"));
+        var a = args.slice().concat(root._videoArgs());
+        // wf-recorder takes ONE audio device. The names are the PulseAudio
+        // defaults, so they follow whatever output/input is current in the
+        // volume panel. The backend is named explicitly: on a build that also
+        // has PipeWire audio the default could differ, and there
+        // @DEFAULT_MONITOR@ means nothing. "both" records the monitor of a
+        // mix the wrapper sets up first (system + default microphone).
+        var mix = "0";
+        if (root.audio !== "none" && root.soundOk) {
+            var dev = root.audio === "mic" ? "@DEFAULT_SOURCE@" : "@DEFAULT_MONITOR@";
+            if (root.audio === "both") { dev = "vexyon_rec_mix.monitor"; mix = "1"; }
+            a.push("--audio-backend=pulse", "--audio=" + dev);
+        }
         var base = "Recording_" + Qt.formatDateTime(new Date(), "yyyy-MM-dd_HH-mm-ss");
-        proc.command = ["bash", "-c", root._script, "vexyon-record", root.dirPath, base, root.ext].concat(a);
+        proc.command = ["bash", "-c", root._script, "vexyon-record", root.dirPath, base, root.ext, mix].concat(a);
         proc.stdinEnabled = true;
         proc.running = true;
     }
@@ -165,8 +241,21 @@ Singleton {
     }
 
     // The wrapper around wf-recorder. Arguments: dir, base name, extension,
-    // then wf-recorder's own options. stdout carries @@ lines for the shell.
+    // mix (1 = system + microphone), then wf-recorder's own options. stdout
+    // carries @@ lines for the shell.
     //
+    //  * MIX (system + microphone): wf-recorder takes one device, so three
+    //    modules are loaded into the running PipeWire (pipewire-pulse) for the
+    //    length of the recording: a silent null sink `vexyon_rec_mix` (never
+    //    routed to the speakers: no feedback), a loopback of system sound
+    //    that follows the default output (stream.capture.sink), and a loopback
+    //    of the default microphone. wf-recorder records the sink's monitor.
+    //    No process is added. They are unloaded when wf-recorder ends, and by
+    //    the stop watcher if the shell died — and leftovers of a crashed run
+    //    are removed before loading. Measured before: one AAC track with both
+    //    tones at −6.3 dBFS; switching the output mid-recording followed.
+    //    If the mix cannot be set up, the recording does not start (the
+    //    error says why) rather than silently recording one source.
     //  * The file name never clashes: Recording_<date>[-N].<ext>.
     //  * The short sleep lets the compositor unmap the picker/region overlay
     //    first, so neither appears in the first frame.
@@ -182,11 +271,27 @@ Singleton {
     //    that line is in the log the process is ended. A 10 s cap ends it in
     //    any case: nothing may keep running after a stop.
     readonly property string _script: [
-        'd=$1; b=$2; x=$3; shift 3',
+        'd=$1; b=$2; x=$3; mix=$4; shift 4',
         'mkdir -p -- "$d" || { printf "@@ERR\\tCannot create %s\\n" "$d"; printf "@@DONE\\t3\\n"; exit 3; }',
+        'mods=""',
+        'unmix() { for m in $mods; do pactl unload-module "$m" >/dev/null 2>&1; done; mods=""; }',
+        'if [ "$mix" = 1 ]; then',
+        '  for m in $(pactl list short modules 2>/dev/null | awk \'/vexyon_rec_/ {print $1}\'); do pactl unload-module "$m" >/dev/null 2>&1; done',
+        '  m1=$(pactl load-module module-null-sink sink_name=vexyon_rec_mix channels=2 channel_map=front-left,front-right sink_properties=device.description=Vexyon-recording-mix 2>/dev/null) &&',
+        '  m2=$(pactl load-module module-loopback sink=vexyon_rec_mix latency_msec=30 source_output_properties="stream.capture.sink=true node.name=vexyon_rec_system" sink_input_properties=node.name=vexyon_rec_system_in 2>/dev/null)',
+        '  if [ -z "${m1:-}" ] || [ -z "${m2:-}" ]; then',
+        '    mods="${m2:-} ${m1:-}"; unmix',
+        '    printf "@@ERR\\tCould not set up system sound + microphone (pactl load-module failed)\\n"; printf "@@DONE\\t4\\n"; exit 4',
+        '  fi',
+        '  mods="$m2 $m1"',
+        '  src=$(pactl get-default-source 2>/dev/null)',
+        '  case "$src" in ""|*.monitor) ;; *)',
+        '    m3=$(pactl load-module module-loopback source="$src" sink=vexyon_rec_mix latency_msec=30 source_output_properties=node.name=vexyon_rec_mic sink_input_properties=node.name=vexyon_rec_mic_in 2>/dev/null) && mods="$m3 $mods" ;;',
+        '  esac',
+        'fi',
         'f="$d/$b.$x"; n=2',
         'while [ -e "$f" ]; do f="$d/$b-$n.$x"; n=$((n + 1)); done',
-        'log=$(mktemp "${XDG_RUNTIME_DIR:-/tmp}/vexyon-rec.XXXXXX") || exit 3',
+        'log=$(mktemp "${XDG_RUNTIME_DIR:-/tmp}/vexyon-rec.XXXXXX") || { unmix; exit 3; }',
         'exec 2>/dev/null 3<&0',
         'sleep 0.15',
         'wf-recorder -y -f "$f" "$@" </dev/null 2>"$log" &',
@@ -202,12 +307,13 @@ Singleton {
         '  done',
         '  kill -KILL "$p"',
         // the wrapper itself was killed (shell reload): nobody else will clean up
-        '  kill -0 $$ || rm -f "$log"',
+        '  kill -0 $$ || { rm -f "$log"; unmix; }',
         '} &',
         'w=$!',
         'exec 3<&-',
         'wait "$p"; rc=$?',
         'kill "$w"',
+        'unmix',
         'if [ "$rc" -ne 0 ] && grep -q "kb/s:" "$log"; then rc=0; fi',
         'if [ "$rc" -ne 0 ]; then',
         '  grep -v -e "^ " -e "^Setting codec" -e "^Using video filter" -e "^selected region" "$log" | tail -n 3 | sed "s/^/@@ERR\\t/"',

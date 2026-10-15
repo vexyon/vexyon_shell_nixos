@@ -10,9 +10,8 @@ import qs.services
 //  * Built-in places: Home plus the XDG user folders (Desktop, Documents,
 //    Downloads, Pictures, Music, Videos) at the paths the user's
 //    user-dirs.dirs configures — ~/Documentos, ~/Bilder… — never guessed from
-//    English names. If that file does not exist yet, the helper runs
-//    `xdg-user-dirs-update` once (the standard tool every desktop runs), which
-//    creates only what is missing.
+//    English names. Listing them never creates anything: the folders are
+//    created ONCE per user by initUserDirs(), in the shell's language.
 //  * Bookmarks: the GTK bookmarks file (~/.config/gtk-3.0/bookmarks), the one
 //    GTK file choosers, Nautilus, Thunar and Nemo already use. Adding one
 //    writes a line there — no symlink, nothing inside the folder — and
@@ -114,4 +113,35 @@ Singleton {
         }
     }
     function move(path, index) { FmHelper.run(["bm-move", path, String(index)], root._apply); }
+
+    //  The user folders (Desktop/Escritorio, Downloads/Descargas…), created
+    //  ONCE per user and never again: shell.qml calls this as soon as the
+    //  welcome screen is closed — so in the language picked there — or, on an
+    //  install that already went past it, at the first start of this version.
+    //  The helper leaves an existing user-dirs.dirs alone and stops
+    //  xdg-user-dirs-update from recreating or renaming them later. The mark
+    //  (state.userDirsInit) is only set once the helper has answered, so a
+    //  failed run is tried again at the next start, not on a timer.
+    property bool _initRunning: false
+    function initUserDirs() {
+        if (root._initRunning || Config.get("state", "userDirsInit", false) === true) return;
+        root._initRunning = true;
+        FmHelper.run(["user-dirs-init", I18n.lang], function(r, code) {
+            root._initRunning = false;
+            if (code !== 0 || !r) return;
+            //  Folders made just now: the shell's own folders go inside them
+            //  (~/Imágenes/Capturas de pantalla in Spanish), unless the user
+            //  already picked other ones (anything but the seed's value).
+            var sd = r.shellDirs || {};
+            var keys = [["behavior", "wallpaperDir", "~/Pictures/Wallpapers", sd.wallpapers],
+                        ["behavior", "screenshotDir", "~/Pictures/Screenshots", sd.screenshots],
+                        ["recording", "dir", "~/Videos/Recordings", sd.recordings]];
+            for (var i = 0; i < keys.length; i++) {
+                var k = keys[i];
+                if (k[3] && Config.get(k[0], k[1], k[2]) === k[2]) Config.set(k[0], k[1], k[3]);
+            }
+            Config.set("state", "userDirsInit", true);
+            if (root.ready) root.refresh();
+        });
+    }
 }

@@ -3634,12 +3634,40 @@ FloatingWindow {
                                 options: [
                                     { v: "none",   l: I18n.t("No sound") },
                                     { v: "system", l: I18n.t("System sound") },
-                                    { v: "mic",    l: I18n.t("Microphone") }
+                                    { v: "mic",    l: I18n.t("Microphone") },
+                                    { v: "both",   l: I18n.t("System + microphone") }
                                 ]
                             }
                             Text {
                                 Layout.fillWidth: true
-                                text: I18n.t("One source at a time: wf-recorder takes a single audio device. System sound is whatever plays on the current output, Microphone is the current input; both follow the volume panel.")
+                                text: I18n.t("System sound is everything that plays on the current output; Microphone is the default input (the one chosen here or in the volume panel). System + microphone records both in one track, mixed only while recording.")
+                                color: Theme.subtext0
+                                wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 3
+                            }
+                            SsSeg {
+                                label: I18n.t("Size")
+                                sect: "recording"; k: "resolution"; def: "native"
+                                options: [
+                                    { v: "native", l: I18n.t("Native size") },
+                                    { v: "1440",   l: "1440p" },
+                                    { v: "1080",   l: "1080p" },
+                                    { v: "720",    l: "720p" }
+                                ]
+                            }
+                            SsSeg {
+                                label: I18n.t("Frame rate")
+                                sect: "recording"; k: "fps"; def: "auto"
+                                options: [
+                                    { v: "auto", l: I18n.t("Screen rate") },
+                                    { v: "60",   l: "60 fps" },
+                                    { v: "30",   l: "30 fps" }
+                                ]
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: I18n.t("Smaller sizes only scale down, never up. Screen rate records a frame only when the screen changes (smallest files); 60 or 30 fps gives a steady rate that video editors and sites prefer.")
                                 color: Theme.subtext0
                                 wrapMode: Text.Wrap
                                 font.family: Theme.fontFamily

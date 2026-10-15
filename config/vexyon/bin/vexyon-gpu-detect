@@ -147,14 +147,17 @@ case "${1:-env}" in
     [ -n "$pick_card" ] && [ "${2:-}" = "$pick_card" ]
     ;;
   offload)
-    # Para el gestor de VMs: ¿hay una GPU dedicada (dGPU) a la que mandar UNA
-    # aplicación, y cómo se hace? Reusa el escaneo y los modos de arriba — no
-    # es un segundo detector. Sin daemon ni estado: se pregunta al abrir el
-    # gestor, una vez. Imprime key=valor, una clave por línea:
+    # Para el gestor de VMs: ¿en qué GPU puede renderizar una VM su 3D
+    # (virtio-gpu + virgl), y está disponible? Reusa el escaneo y los modos de
+    # arriba — no es un segundo detector. Sin daemon ni estado: se pregunta al
+    # abrir el gestor, una vez. Imprime key=valor, una clave por línea:
     #   state   on    híbrida (pin / nopin-external): la dGPU tiene card DRM
+    #           main  la dGPU YA es la GPU principal: MUX en modo dGPU
+    #                 (static-nvidia), una sola Nvidia (torre) o varias GPUs
+    #                 sin integrada (static-none)
     #           off   hay dGPU pero ahora no se puede usar (motivo en why)
-    #           none  nada a lo que descargar: una sola GPU, o la dGPU YA es la
-    #                 principal (static-nvidia / static-none)
+    #           none  solo hay una GPU integrada: nada que ofrecer
+    #   render  render node de esa GPU (/dev/dri/renderDN): donde QEMU dibuja
     #   name    fabricante de la dGPU (NVIDIA / AMD / Intel), si se sabe
     #   why     motivo de off: no-driver (dispositivo de vídeo PCI sin card
     #           DRM: atado a vfio-pci o con el driver vetado),
@@ -168,28 +171,36 @@ case "${1:-env}" in
     PCI_SYS="${VEXYON_PCI_SYS:-/sys/bus/pci/devices}"   # override solo para tests
     vname() { case "$1" in 0x10de) echo NVIDIA ;; 0x1002) echo AMD ;; 0x8086) echo Intel ;; "") ;; *) echo "vendor $1" ;; esac; }
     drv() { [ -e "$1/driver" ] && basename "$(readlink -f "$1/driver")"; }
-    st=none dname="" dwhy="" ddrv="" denv=""
+    # render node de una card: hermano renderDN bajo el mismo dispositivo PCI
+    rnode() { local r; for r in "$1"/device/drm/renderD*; do [ -e "$r" ] && { echo "/dev/dri/${r##*/}"; return; }; done; }
+    # de entre todas las cards (salvo $1), la Nvidia; si no, la de más VRAM
+    best_card() {
+      local c b v vram r best="" best_rank=9 best_vram=-1
+      for c in "$GPU_SYS"/card*; do
+        b=${c##*/}
+        [[ $b =~ ^card[0-9]+$ ]] || continue
+        [ -r "$c/device/vendor" ] || continue
+        [ "$b" = "${1:-}" ] && continue
+        v=$(<"$c/device/vendor")
+        vram=$(cat "$c/device/mem_info_vram_total" 2>/dev/null || echo 0)
+        r=1; [ "$v" = 0x10de ] && r=0
+        if [ "$r" -lt "$best_rank" ] || { [ "$r" -eq "$best_rank" ] && [ "$vram" -gt "$best_vram" ]; }; then
+          best=$c best_rank=$r best_vram=$vram
+        fi
+      done
+      echo "$best"
+    }
+    st=none dname="" dwhy="" ddrv="" denv="" drender=""
     case "$mode" in
       pin|nopin-external)
         # La dGPU es cualquier card que no sea la iGPU electa; si hubiera
         # varias, la Nvidia y si no la de más VRAM.
-        best="" best_rank=9 best_vram=-1
-        for c in "$GPU_SYS"/card*; do
-          b=${c##*/}
-          [[ $b =~ ^card[0-9]+$ ]] || continue
-          [ -r "$c/device/vendor" ] || continue
-          [ "$b" = "$pick_card" ] && continue
-          v=$(<"$c/device/vendor")
-          vram=$(cat "$c/device/mem_info_vram_total" 2>/dev/null || echo 0)
-          r=1; [ "$v" = 0x10de ] && r=0
-          if [ "$r" -lt "$best_rank" ] || { [ "$r" -eq "$best_rank" ] && [ "$vram" -gt "$best_vram" ]; }; then
-            best=$c best_rank=$r best_vram=$vram
-          fi
-        done
+        best=$(best_card "$pick_card")
         if [ -n "$best" ]; then
           st=on
           dname=$(vname "$(<"$best/device/vendor")")
           ddrv=$(drv "$best/device")
+          drender=$(rnode "$best")
           if [ "$ddrv" = nvidia ]; then
             denv="__NV_PRIME_RENDER_OFFLOAD=1 __VK_LAYER_NV_optimus=NVIDIA_only __GLX_VENDOR_LIBRARY_NAME=nvidia"
           else
@@ -198,14 +209,36 @@ case "${1:-env}" in
           fi
         fi
         ;;
+      static-nvidia|static-none)
+        # La dGPU YA es la principal (MUX en modo dGPU, varias GPUs sin
+        # integrada): no hay a dónde "descargar", pero la VM puede renderizar
+        # su 3D en ella.
+        best=$(best_card "")
+        if [ -n "$best" ]; then
+          st=main
+          dname=$(vname "$(<"$best/device/vendor")")
+          ddrv=$(drv "$best/device")
+          drender=$(rnode "$best")
+        fi
+        ;;
       static-single)
-        # Una sola GPU en DRM: ¿de verdad hay una sola, o hay una dGPU que
-        # alguien apagó? (1) un dispositivo de vídeo PCI (clase 0x03) sin card
-        # DRM; (2) los conmutadores, que en modo integrada SACAN la dGPU del bus
-        # PCI y no dejan rastro en sysfs: solo ellos saben que existe.
-        # Solo si la GPU que queda es candidata a integrada: con una única
-        # Nvidia (una torre) no hay ninguna dGPU "apagada" de la que hablar.
-        [ -n "$pick_card" ] || { printf 'state=none\nname=\nwhy=\ndriver=\nenv=\n'; exit 0; }
+        # Una sola GPU en DRM. Si no es candidata a integrada (una única
+        # Nvidia: una torre), ES la dedicada y el 3D va en ella.
+        if [ -z "$pick_card" ]; then
+          best=$(best_card "")
+          if [ -n "$best" ]; then
+            st=main
+            dname=$(vname "$(<"$best/device/vendor")")
+            ddrv=$(drv "$best/device")
+            drender=$(rnode "$best")
+          fi
+          printf 'state=%s\nname=%s\nwhy=%s\ndriver=%s\nenv=%s\nrender=%s\n' "$st" "$dname" "$dwhy" "$ddrv" "$denv" "$drender"
+          exit 0
+        fi
+        # Queda una integrada: ¿de verdad hay una sola GPU, o hay una dGPU
+        # que alguien apagó? (1) un dispositivo de vídeo PCI (clase 0x03) sin
+        # card DRM; (2) los conmutadores, que en modo integrada SACAN la dGPU
+        # del bus PCI y no dejan rastro en sysfs: solo ellos saben que existe.
         drm_slots=" "
         for c in "$GPU_SYS"/card*; do
           [[ ${c##*/} =~ ^card[0-9]+$ ]] && [ -e "$c/device" ] || continue
@@ -232,7 +265,7 @@ case "${1:-env}" in
         fi
         ;;
     esac
-    printf 'state=%s\nname=%s\nwhy=%s\ndriver=%s\nenv=%s\n' "$st" "$dname" "$dwhy" "$ddrv" "$denv"
+    printf 'state=%s\nname=%s\nwhy=%s\ndriver=%s\nenv=%s\nrender=%s\n' "$st" "$dname" "$dwhy" "$ddrv" "$denv" "$drender"
     ;;
   *)
     echo "usage: vexyon-gpu-detect [env|lua|is-igpu cardN|offload]" >&2

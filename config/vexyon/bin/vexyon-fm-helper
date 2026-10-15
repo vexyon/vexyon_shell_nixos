@@ -10,6 +10,7 @@ resident except what the Wayland clipboard itself requires (see clip-set).
     clip-done                    a cut was pasted: take it off the clipboard
 
     places                       XDG user folders + sidebar bookmarks
+    user-dirs-init en|es         create the user folders ONCE, in that language
     bm-add [--at N] PATH...      add sidebar bookmarks
     bm-remove PATH               remove a bookmark (the folder is never touched)
     bm-move PATH N               move a bookmark to position N
@@ -49,9 +50,17 @@ loses data.
 PLACES
 ------
 User folders come from user-dirs.dirs (the configured, possibly translated
-paths such as ~/Documentos), never from English names. When the file does not
-exist yet, `xdg-user-dirs-update` creates it — the standard tool every desktop
-runs, which only fills in what is missing.
+paths such as ~/Documentos), never from English names. Listing them never
+creates anything.
+
+They are created ONCE per user, by `user-dirs-init`, in the shell's language
+(the one picked in the welcome screen): Desktop/Documents/Downloads… in
+English, Escritorio/Documentos/Descargas… in Spanish (the names xdg-user-dirs
+itself uses for es). Only when user-dirs.dirs does not exist yet: folders the
+user already has (made by Vexyon before, or by another desktop) are left as
+they are. It also writes user-dirs.conf with enabled=False (unless the user
+has one), so xdg-user-dirs-update — run at login by some desktops and by
+Arch's xdg-user-dirs package — never recreates or renames them afterwards.
 
 Bookmarks live in $XDG_CONFIG_HOME/gtk-3.0/bookmarks, the file GTK file
 choosers, Nautilus, Thunar and Nemo already share. Lines Vexyon cannot show
@@ -396,21 +405,71 @@ def read_user_dirs():
 
 
 def user_dirs():
-    created = False
-    dirs = read_user_dirs()
-    if dirs is None and shutil.which("xdg-user-dirs-update"):
-        try:
-            subprocess.run(["xdg-user-dirs-update"], stdin=subprocess.DEVNULL,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=10)
-            created = True
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        dirs = read_user_dirs()
     res = {}
-    for k, p in (dirs or {}).items():
+    for k, p in (read_user_dirs() or {}).items():
         res[k] = {"path": p, "exists": os.path.isdir(p)}
-    return res, created
+    return res
+
+
+# The folder names of each shell language. Spanish = xdg-user-dirs' own es
+# translation (what xdg-user-dirs-update creates under es_ES), so a Spanish
+# Vexyon and a Spanish GNOME agree on ~/Descargas.
+USER_DIR_NAMES = {
+    "en": {"DESKTOP": "Desktop", "DOWNLOAD": "Downloads", "TEMPLATES": "Templates",
+           "PUBLICSHARE": "Public", "DOCUMENTS": "Documents", "MUSIC": "Music",
+           "PICTURES": "Pictures", "VIDEOS": "Videos", "PROJECTS": "Projects"},
+    "es": {"DESKTOP": "Escritorio", "DOWNLOAD": "Descargas", "TEMPLATES": "Plantillas",
+           "PUBLICSHARE": "Público", "DOCUMENTS": "Documentos", "MUSIC": "Música",
+           "PICTURES": "Imágenes", "VIDEOS": "Vídeos", "PROJECTS": "Proyectos"},
+}
+# Same set and order as xdg-user-dirs 0.20's defaults (PROJECTS is new there).
+USER_DIR_ORDER = ["DESKTOP", "DOWNLOAD", "TEMPLATES", "PUBLICSHARE",
+                  "DOCUMENTS", "MUSIC", "PICTURES", "VIDEOS", "PROJECTS"]
+# Where the shell keeps its own files, inside those folders: the defaults of
+# behavior.wallpaperDir / behavior.screenshotDir / recording.dir.
+SHELL_SUBDIRS = {
+    "en": {"wallpapers": ("PICTURES", "Wallpapers"), "screenshots": ("PICTURES", "Screenshots"),
+           "recordings": ("VIDEOS", "Recordings")},
+    "es": {"wallpapers": ("PICTURES", "Fondos de pantalla"),
+           "screenshots": ("PICTURES", "Capturas de pantalla"),
+           "recordings": ("VIDEOS", "Grabaciones de pantalla")},
+}
+USER_DIRS_CONF = os.path.join(CONFIG, "user-dirs.conf")
+USER_DIRS_LOCALE = os.path.join(CONFIG, "user-dirs.locale")
+
+
+def user_dirs_init(lang):
+    lang = lang if lang in USER_DIR_NAMES else "en"
+    created, shell_dirs = [], {}
+    if not os.path.exists(USER_DIRS):
+        names = USER_DIR_NAMES[lang]
+        lines = ["# Written once by Vexyon (shell language: %s). Edit freely:" % lang,
+                 "# Vexyon never rewrites it.", ""]
+        for k in USER_DIR_ORDER:
+            path = os.path.join(HOME, names[k])
+            try:
+                os.makedirs(path, exist_ok=True)
+                created.append(path)
+            except OSError:
+                pass
+            lines.append('XDG_%s_DIR="$HOME/%s"' % (k, names[k]))
+        write_atomic(USER_DIRS, ("\n".join(lines) + "\n").encode("utf-8"))
+        # what xdg-user-dirs-gtk compares against before offering to rename
+        write_atomic(USER_DIRS_LOCALE, (("es_ES" if lang == "es" else "en_US") + "\n").encode())
+        # the shell's own folders, as "~/…" paths for shell.json
+        for key, (parent, sub) in SHELL_SUBDIRS[lang].items():
+            rel = os.path.join(names[parent], sub)
+            try:
+                os.makedirs(os.path.join(HOME, rel), exist_ok=True)
+            except OSError:
+                continue
+            shell_dirs[key] = "~/" + rel
+    if not os.path.exists(USER_DIRS_CONF):
+        write_atomic(USER_DIRS_CONF,
+                     b"# Vexyon: the user folders were created once; do not let\n"
+                     b"# xdg-user-dirs-update recreate or rename them at login.\n"
+                     b"enabled=False\n")
+    out({"lang": lang, "created": created, "shellDirs": shell_dirs})
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +512,7 @@ def builtin_paths(dirs):
 
 
 def places(extra=None):
-    dirs, created = user_dirs()
+    dirs = user_dirs()
     builtin = builtin_paths(dirs)
     bms, seen = [], set()
     for _, p, label in bookmark_entries(read_bookmark_lines()):
@@ -462,8 +521,7 @@ def places(extra=None):
         seen.add(p)
         bms.append({"path": p, "label": label or os.path.basename(p) or p,
                     "custom": bool(label), "exists": os.path.isdir(p)})
-    res = {"home": os.path.normpath(HOME), "dirs": dirs, "bookmarks": bms,
-           "created": created}
+    res = {"home": os.path.normpath(HOME), "dirs": dirs, "bookmarks": bms}
     if extra:
         res.update(extra)
     out(res)
@@ -867,6 +925,8 @@ def main():
         clip_done()
     elif cmd == "places":
         places()
+    elif cmd == "user-dirs-init" and len(rest) == 1:
+        user_dirs_init(rest[0])
     elif cmd == "bm-add" and rest:
         bm_add(rest)
     elif cmd == "bm-remove" and len(rest) == 1:

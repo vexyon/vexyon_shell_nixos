@@ -51,15 +51,19 @@ Singleton {
     // Available output devices (real sinks, not stream nodes) for the
     // audio-output drill-down. Tracked so their volume/description stay live.
     readonly property var sinks: Pipewire.ready && Pipewire.nodes && Pipewire.nodes.values
-        ? Pipewire.nodes.values.filter(function(n) { return n && n.audio && n.isSink && !n.isStream; })
+        ? Pipewire.nodes.values.filter(function(n) { return n && n.audio && n.isSink && !n.isStream && !root.isRecorderNode(n); })
         : []
     readonly property string sinkName: root.nodeLabel(root.sink)
 
     // Streams de reproducción (sink-inputs) para la pestaña "Streams" del
     // panel de volumen — nodos de app, no dispositivos.
     readonly property var streams: Pipewire.ready && Pipewire.nodes && Pipewire.nodes.values
-        ? Pipewire.nodes.values.filter(function(n) { return n && n.audio && n.isSink && n.isStream; })
+        ? Pipewire.nodes.values.filter(function(n) { return n && n.audio && n.isSink && n.isStream && !root.isRecorderNode(n); })
         : []
+    // The recorder's temporary "system + microphone" mix (Recorder._script):
+    // a null sink and two loopbacks that exist only while recording. Not
+    // devices or apps the user should see or pick in the volume panel.
+    function isRecorderNode(n) { return !!n && !!n.name && n.name.indexOf("vexyon_rec_") === 0; }
 
     function streamLabel(n) {
         if (!n) return "";
@@ -80,4 +84,87 @@ Singleton {
     function setVolume(v) { if (ready) setNodeVolume(sink, v); }
     function step(delta) { setVolume(volume + delta); }
     function toggleMute() { if (ready) sink.audio.muted = !sink.audio.muted; }
+
+    // ---- sound from one side only after boot ----------------------------------
+    //  Reported on a hybrid laptop (NixOS): after login only one side played
+    //  until the volume was moved once. Moving it makes PipeWire rewrite the
+    //  device's mixer for EVERY channel — and that is what the restored state
+    //  lacked: either a side restored at zero, or an amplifier that only takes
+    //  its setting on a mixer write. So, once per output and per session, as
+    //  soon as its channel volumes are known, the shell does that write itself:
+    //   * a side at (near) zero while another plays → every channel to the
+    //     level of the one that plays (that is not a balance anyone picks);
+    //   * otherwise the same per-channel values a hair down and straight back,
+    //     so a deliberate balance is kept. Never louder than before.
+    //  Muted or at 0 it is left alone. No timer runs except the one-shot that
+    //  lets the OSD ignore the echo of these writes (`settling`).
+    property int _settledId: -1
+    property bool settling: false
+    property var _settleOff: null       // phase 1 written, waiting for PipeWire to confirm it
+    property var _settleFinal: null     // what phase 2 writes back
+    property var _settleNode: null      // the output both phases write to
+    onSinkChanged: root._settle()
+    Connections {
+        target: root.sink
+        function onReadyChanged() { root._settle(); }
+    }
+    Connections {
+        target: root.ready ? root.sink.audio : null
+        function onVolumesChanged() { root._settle(); }
+    }
+    function _settle() {
+        if (!root.ready || !root.sink.ready) return;
+        var a = root.sink.audio, vs = a.volumes;
+        if (root._settleFinal !== null) {
+            //  Phase 2 only once PipeWire reports phase 1: written back to
+            //  back, Quickshell drops the second write (it matches the value
+            //  it still holds) and nothing reaches the mixer (measured).
+            //  (Another output became the default meanwhile: the timer
+            //  finishes the first one; this one is settled after that.)
+            if (root.sink !== root._settleNode) return;
+            var hit = vs && vs.length === root._settleOff.length;
+            for (var k = 0; hit && k < vs.length; k++) hit = Math.abs(vs[k] - root._settleOff[k]) < 0.002;
+            if (hit) root._settleFinish();
+            return;
+        }
+        if (root.sink.id === root._settledId) return;
+        if (!vs || vs.length === 0) return;        // not known yet: wait for volumesChanged
+        root._settledId = root.sink.id;
+        var hi = 0, lo = 1;
+        for (var i = 0; i < vs.length; i++) { hi = Math.max(hi, vs[i]); lo = Math.min(lo, vs[i]); }
+        if (a.muted || !(hi > 0)) return;
+        //  Per-channel writes (`volumes`), never `volume`: Quickshell's
+        //  `volume` setter scales the channels to a new AVERAGE, keeping their
+        //  ratio — on [0.5, 0] it gave [1.0, 0] (measured): louder, still one-sided.
+        var even = vs.length > 1 && lo < 0.01 && hi > 0.05;
+        var fin = [], off = [];
+        for (var j = 0; j < vs.length; j++) {
+            fin.push(even ? hi : vs[j]);
+            off.push(Math.max(0, fin[j] - 0.01));
+        }
+        root.settling = true;
+        root._settleOff = off;
+        root._settleFinal = fin;
+        root._settleNode = root.sink;
+        a.volumes = off;
+        settleEnd.restart();                     // phase 2 anyway if no confirmation in 1 s
+    }
+    function _settleFinish() {
+        if (root._settleFinal === null) return;
+        var fin = root._settleFinal, node = root._settleNode;
+        root._settleFinal = null;
+        root._settleOff = null;
+        root._settleNode = null;
+        if (node && node.ready && node.audio) node.audio.volumes = fin;
+        settleEnd.restart();                     // `settling` ends 1 s after the last write
+        root._settle();                          // an output that became default meanwhile
+    }
+    Timer {
+        id: settleEnd
+        interval: 1000
+        onTriggered: {
+            if (root._settleFinal !== null) root._settleFinish();
+            else root.settling = false;
+        }
+    }
 }

@@ -38,7 +38,8 @@ Singleton {
     // External volume/mute changes (any origin) pop the OSD too.
     Connections {
         target: Audio.sink !== null ? Audio.sink.audio : null
-        function onVolumeChanged() { if (root.armed) root.show("volume"); }
+        // (Audio.settling: the one-off mixer write after login, not a change)
+        function onVolumeChanged() { if (root.armed && !Audio.settling) root.show("volume"); }
         function onMutedChanged()  { if (root.armed) root.show("volume"); }
     }
     Connections {

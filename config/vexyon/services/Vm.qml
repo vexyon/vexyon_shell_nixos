@@ -385,6 +385,16 @@ Singleton {
         }).join("\n");
     }
     function humanizeError(t) {
+        // Arranque con aceleración 3D (start(name, true)): marcadores y
+        // errores de QEMU/libvirt traducidos a lo que el usuario puede hacer.
+        if (t.indexOf("@@SAVED") !== -1)
+            return I18n.t("This VM has a saved state. Start it normally (or discard the saved state) before starting it with 3D acceleration.");
+        if (t.indexOf("egl: ") !== -1 || t.indexOf("render node") !== -1) {
+            return t + "\n\n" + I18n.t("QEMU could not draw on that GPU. With the NVIDIA driver, libvirt must let QEMU open /dev/nvidia* (the Vexyon installer sets this up; re-run it, or rebuild on NixOS). A plain Start still works.");
+        }
+        if (t.indexOf("virtio-vga-gl") !== -1 || t.indexOf("egl-headless") !== -1) {
+            return t + "\n\n" + I18n.t("This QEMU was built without 3D display support. The QEMU the Vexyon installer sets up has it (qemu-desktop on Arch, qemu_kvm on NixOS).");
+        }
         if (t.indexOf("Cannot access storage file") !== -1
             || t.indexOf("Permission denied") !== -1) {
             return t + "\n\n" + I18n.t("libvirt could not read that file. Its QEMU process usually runs as root and can read anywhere, so this normally means the path is wrong, or QEMU has been configured to run as an unprivileged user. Putting the file in /var/lib/libvirt/images/ always works.");
@@ -450,20 +460,36 @@ Singleton {
     //  proceso que ya existía — NO es un sondeo: no hay Timer, no hay nada
     //  repitiéndose en el shell, y cuando la orden acaba no queda nada vivo.
     property string _startedName: ""
-    property bool _startedDgpu: false
-    // `onDgpu`: el botón "Iniciar (pantalla en la GPU dedicada)". Abre SIEMPRE
-    // la pantalla al terminar (es lo único que cambia respecto a Iniciar), así
-    // que espera al display aunque openOnStart esté apagado.
-    function start(name, onDgpu) {
+    property bool _started3d: false
+    // `on3d`: el botón "Iniciar con aceleración 3D" (ver `dgpu` más abajo).
+    //  Arranque TRANSITORIO: `virsh create` con la definición guardada pasada
+    //  por `vexyon-vm-xml gpu3d <render node>` (virtio-gpu con virgl + una
+    //  pantalla egl-headless en esa GPU). Con el mismo nombre y UUID libvirt
+    //  arranca ESTE dominio con ese XML solo para esta vez: la definición
+    //  guardada no cambia y el Iniciar normal arranca como siempre (medido en
+    //  libvirt 12.2: en vivo virtio, en la persistente qxl antes y después).
+    //  Abre SIEMPRE la pantalla al terminar, aunque openOnStart esté apagado.
+    //  Con un estado guardado (managedsave) no se hace: `create` lo
+    //  ignoraría y quedaría un estado viejo para el próximo Iniciar.
+    function start(name, on3d) {
         root._startedName = name;
-        root._startedDgpu = onDgpu === true;
-        var wait = (root.openOnStart || root._startedDgpu)
-            ? "; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do " +
+        root._started3d = on3d === true && root.dgpu.render !== "";
+        //  `&&`, no `;`: si el arranque falla, la orden acaba YA con su error.
+        //  Con `;` esperaba 10 s a un display que no iba a llegar y salía con
+        //  el código del bucle (0): el fallo pasaba por éxito y se abría el
+        //  visor de una VM apagada.
+        var wait = (root.openOnStart || root._started3d)
+            ? " && for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do " +
                 "d=$($V domdisplay " + q(name) + " 2>/dev/null); " +
                 "[ -n \"$d\" ] && break; " +
                 "sleep 0.5; done"
             : "";
-        root.run("start", root._netsUp(name) + "$V start " + q(name) + wait);
+        var go = root._started3d
+            ? "$V dominfo " + q(name) + " 2>/dev/null | grep -q '^Managed save: *yes' && { echo @@SAVED >&2; exit 1; }; " +
+              "$V dumpxml --inactive " + q(name) + " | " + q(root.xmlBin) + " gpu3d " + q(root.dgpu.render) +
+              " | $V create /dev/stdin >/dev/null"
+            : "$V start " + q(name) + " >/dev/null";
+        root.run("start", root._netsUp(name) + go + wait);
     }
 
     //  Antes de arrancar, levantar las redes de libvirt que nombra la VM y
@@ -1826,7 +1852,7 @@ Singleton {
     //  márgenes. Necesita el agente `spice-vdagent` DENTRO del invitado y el
     //  canal `com.redhat.spice.0` en el dominio (Vm.hasSpiceAgent): sin las dos
     //  cosas virt-viewer no puede pedirle nada al invitado. La UI lo dice.
-    function openViewer(name, onDgpu) {
+    function openViewer(name) {
         if (!root.enabled || !name) return;
         // Sin virt-viewer, `execDetached` no falla de forma visible: el proceso
         // simplemente no arranca y el usuario ve... nada. Se dice.
@@ -1838,36 +1864,36 @@ Singleton {
                    "--hotkeys=" + root.viewerHotkeys];
         if (root.viewerFullscreen) cmd.push("-f");
         cmd.push(name);
-        // En la GPU dedicada: el MISMO virt-viewer con las variables que da
-        // vexyon-gpu-detect (ver `dgpu`) delante, vía `env`. `env` hace exec,
-        // así que la ventana sigue siendo de clase "virt-viewer" y le siguen
-        // valiendo la regla del monitor enfocado (bridge) y la apertura en
-        // ventana: nada de lo arreglado cambia.
-        if (onDgpu === true && root.dgpu.state === "on" && root.dgpu.env.length > 0)
-            cmd = ["env"].concat(root.dgpu.env).concat(cmd);
         Quickshell.execDetached(cmd);
     }
 
-    // ---- GPU dedicada para el VISOR (no para la VM) --------------------------
-    //  En portátiles híbridos (iGPU + dGPU: Intel/AMD + Nvidia, Intel + AMD,
-    //  AMD + AMD…) el gestor ofrece abrir la pantalla con la dGPU. Eso SOLO
-    //  elige qué GPU del ANFITRIÓN usa la ventana de virt-viewer; la VM no
-    //  recibe ninguna GPU (eso sería passthrough VFIO, descartado a propósito).
-    //  Y con el display que crea este gestor (SPICE sin GL) spice-gtk pinta la
-    //  pantalla del invitado con cairo en la CPU: medido, el visor no carga
-    //  ningún driver de GPU con o sin estas variables. La UI lo dice.
+    // ---- aceleración 3D de la VM en una GPU del anfitrión ---------------------
+    //  Antes el botón de la "GPU dedicada" solo elegía la GPU de la VENTANA de
+    //  virt-viewer, y con el display de este gestor (SPICE sin GL) el visor
+    //  pinta en la CPU: no cambiaba nada (medido y reportado así en un portátil
+    //  híbrido Intel + RTX 5070). Ahora la GPU la usa la VM:
+    //   * "Iniciar con aceleración 3D" arranca la VM una vez (transitoria, ver
+    //     start()) con virtio-gpu + virgl, y QEMU renderiza el 3D del invitado
+    //     en el render node de esa GPU (pantalla egl-headless). El SPICE de
+    //     siempre recibe los fotogramas ya hechos: virt-viewer no necesita GPU.
+    //   * Solo invitados Linux (Mesa trae el driver virgl). Windows no tiene
+    //     driver 3D para virtio-gpu: vería un adaptador básico. Eso sería
+    //     passthrough VFIO, descartado a propósito. La UI lo dice.
     //
     //  La decisión NO se toma aquí: la toma `vexyon-gpu-detect offload`, el
     //  MISMO script que fija el shell a la iGPU (mismo escaneo de sysfs, mismos
-    //  modos). Devuelve state on/off/none, el motivo si está apagada y las
-    //  variables que ponen UNA app en la dGPU (el trío de prime-run con el
-    //  driver de Nvidia, DRI_PRIME=pci-… con Mesa). Se pregunta UNA vez al
-    //  abrir el gestor — sin sondeo: una dGPU solo cambia de estado reiniciando
-    //  o cerrando sesión (envycontrol, supergfxctl).
-    //   none -> no hay botón (una sola GPU, como la torre)
-    //   off  -> botón gris y el motivo debajo
-    //   on   -> botón activo
-    property var dgpu: ({ state: "none", name: "", why: "", driver: "", env: [] })
+    //  modos). Devuelve state, el motivo si está apagada y `render`, el render
+    //  node de la GPU para el 3D. Se pregunta UNA vez al abrir el gestor — sin
+    //  sondeo: una GPU solo cambia de estado reiniciando o cerrando sesión.
+    //   none -> no hay botón (solo una iGPU)
+    //   off  -> híbrida con la dGPU apagada: botón gris y el motivo debajo
+    //   on   -> híbrida: 3D en la dGPU (la shell sigue en la iGPU)
+    //   main -> la dGPU YA es la GPU principal (MUX en modo dGPU, torre con
+    //           Nvidia): 3D en ella
+    //  `gl3d`: si el QEMU de libvirt tiene la pantalla egl-headless
+    //  (domcapabilities). "0" -> botón gris con el motivo; "?" (libvirt no
+    //  respondió) -> se deja intentar, el error de arranque dirá qué pasa.
+    property var dgpu: ({ state: "none", name: "", why: "", driver: "", render: "", gl3d: "?" })
     readonly property string gpuBin: {
         var d = Quickshell.env("VEXYON_BIN_DIR");
         var base = (d && d !== "") ? d : Quickshell.env("HOME") + "/.config/vexyon/bin";
@@ -2121,8 +2147,8 @@ Singleton {
             // terminar la orden (que ya ha esperado a que el dominio publique
             // su display), no al pulsar: lanzarlo antes abría un visor que se
             // cerraba solo.
-            if (code === 0 && root.lastAction === "start" && (root.openOnStart || root._startedDgpu))
-                root.openViewer(root._startedName, root._startedDgpu);
+            if (code === 0 && root.lastAction === "start" && (root.openOnStart || root._started3d))
+                root.openViewer(root._startedName);
             root.actionDone(root.lastAction, code === 0);
             // Releer SIEMPRE tras una acción: es el mecanismo por el que la
             // pastilla de barra aparece/desaparece sin ningún temporizador.
@@ -2315,8 +2341,15 @@ Singleton {
 
     Process {
         id: gpuProbe
-        // con bash delante: una subida por la web de GitHub pierde el +x
-        command: ["bash", root.gpuBin, "offload"]
+        // con bash delante: una subida por la web de GitHub pierde el +x. La
+        // pregunta a libvirt solo si hay GPU que ofrecer (on/main).
+        command: ["bash", "-c",
+            "o=$(bash \"$0\" offload); printf '%s\\n' \"$o\"; " +
+            "case \"$o\" in *state=on*|*state=main*) " +
+            "  if c=$(virsh -c " + root.uri + " domcapabilities 2>/dev/null); then " +
+            "    case \"$c\" in *'<value>egl-headless</value>'*) echo gl3d=1 ;; *) echo gl3d=0 ;; esac; " +
+            "  else echo gl3d=?; fi ;; esac",
+            root.gpuBin]
         stdout: StdioCollector {
             onStreamFinished: {
                 var m = {}, ls = this.text.split("\n");
@@ -2324,10 +2357,11 @@ Singleton {
                     var e = ls[i].indexOf("=");
                     if (e > 0) m[ls[i].slice(0, e)] = ls[i].slice(e + 1).trim();
                 }
-                var st = (m.state === "on" || m.state === "off") ? m.state : "none";
+                var st = (m.state === "on" || m.state === "off" || m.state === "main") ? m.state : "none";
+                var rn = /^\/dev\/dri\/renderD\d+$/.test(m.render || "") ? m.render : "";
                 root.dgpu = {
                     state: st, name: m.name || "", why: m.why || "", driver: m.driver || "",
-                    env: (m.env || "").split(" ").filter(function(x) { return x.indexOf("=") > 0; })
+                    render: rn, gl3d: m.gl3d || "?"
                 };
             }
         }

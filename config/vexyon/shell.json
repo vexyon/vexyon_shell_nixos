@@ -243,11 +243,8 @@
     },
     {
       "id": "recorder",
-      "mods": [
-        "SUPER",
-        "SHIFT"
-      ],
-      "key": "V",
+      "mods": ["SUPER"],
+      "key": "R",
       "action": "global",
       "arg": "recorder",
       "desc": "Screen recording: open the recorder / stop recording",

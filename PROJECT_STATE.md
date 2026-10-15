@@ -20,6 +20,205 @@ VEXYON OUT-OF-THE-BOX POLICY Every Vexyon feature must ship together with all re
 
 PERMANENT POLICY: If Vexyon's installation changes, its GitHub README.md MUST be updated in the same development task. No exceptions.
 
+## Session: VM 3D on the GPU, one-sided sound at login, user folders in the shell's language, recorder (system + mic, window, size, fps), Super+R
+
+### Why (owner's report, NixOS on a Lenovo Legion: Intel iGPU + RTX 5070, supergfxctl Hybrid and dGPU-only)
+
+1. "The dedicated-GPU button in the VMs does not work" (Hybrid and dGPU-only).
+2. User folders: created at install in the wrong language. Wanted: in the
+   shell's language, once, after the language is picked, never again (not on
+   a rebuild/switch, not on a reinstall).
+3. At login, sound came from one side only until the volume was moved.
+4. Super+R must open the recorder (when its module is on), Super+Shift+C the
+   calculator — as defaults.
+5. The recorder could not record system sound and the microphone together;
+   add resolution, frame rate, and recording a workspace / the whole screen /
+   one app window.
+
+### 1. VMs: Start with 3D acceleration
+
+**Root cause.** The button only put the *viewer window* (virt-viewer) on the
+dGPU. The VMs the manager creates use SPICE without GL, so spice-gtk paints on
+the CPU: nothing used the GPU (this was measured and written in the session
+that added the button). In dGPU-only mode `vexyon-gpu-detect offload` said
+`none` (static-nvidia), so there was not even a button.
+
+**What it does now.** "Start with 3D acceleration" (hybrid: "Start with 3D
+(dedicated GPU)") starts the VM ONCE with:
+
+- `<video><model type='virtio' heads='1' primary='yes'><acceleration accel3d='yes'/>`
+  → QEMU `virtio-vga-gl` (virgl);
+- `<graphics type='egl-headless'><gl rendernode='/dev/dri/renderDN'/>` on
+  the chosen GPU → QEMU renders the guest's OpenGL there;
+- the existing SPICE display kept, without GL: QEMU copies finished frames to
+  it, so virt-viewer needs no GPU and no cross-GPU buffer import (the thing
+  that breaks SPICE GL between an iGPU compositor and a dGPU).
+
+Transient, by design: `virsh dumpxml --inactive NAME | vexyon-vm-xml gpu3d
+NODE | virsh create /dev/stdin`. With the same name and UUID libvirt starts
+the defined domain with that XML for this run only. Measured (libvirt 12.2):
+live config virtio, saved definition qxl before and after (byte-identical
+`dumpxml --inactive`), next plain Start qxl. A VM with a managed-save state is
+refused with a message (create would ignore the saved state).
+
+| file | change |
+|---|---|
+| `bin/vexyon-gpu-detect` (both repos, same `offload` block) | new `render=` (the GPU's render node) and state `main`: the dGPU already is the main GPU (static-nvidia, static-none, a lone NVIDIA). `env`/`lua`/`is-igpu` untouched |
+| `bin/vexyon-vm-xml` | new `gpu3d <render node>` filter |
+| `services/Vm.qml` | `start(name, true)` = transient 3D start; `openViewer(name)` no longer takes the dGPU env (nothing to offload); `dgpu.render`, `dgpu.gl3d` (libvirt `domcapabilities` lists `egl-headless`, asked only when there is a GPU to offer); errors explained (`humanizeError`) |
+| `modules/VmManager.qml` | one button (the two old ones removed), explanation line, greyed with the reason when not possible |
+| `nix/module.nix` (NixOS) | with `services.xserver.videoDrivers` containing `"nvidia"`: `virtualisation.libvirtd.qemu.verbatimConfig = mkDefault` NixOS's own `namespaces = []` + `cgroup_device_acl` = libvirt 12's built-in list + `/dev/nvidiactl`, `/dev/nvidia0`, `/dev/nvidia1`, `/dev/nvidia-modeset`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools` |
+| `install.sh` (Arch) | same list appended to `/etc/libvirt/qemu.conf` when the NVIDIA driver is present (`/proc/driver/nvidia` or `nvidia-utils`) and no `cgroup_device_acl` line exists |
+
+Why the device list: the proprietary NVIDIA EGL (used by QEMU through GBM on
+the render node) also opens `/dev/nvidiactl` and `/dev/nvidiaN`; libvirt's
+device cgroup for QEMU only allows its built-in list (null, full, zero,
+random, urandom, ptmx, userfaultfd — read from the libvirt 12.2 binary) plus
+the render node. libvirt ignores entries that do not exist ("Ignoring
+non-existent device"; a VM started fine in the lab with the NVIDIA entries
+and no NVIDIA). NixOS's QEMU (`qemu_kvm`) has `virtio-vga-gl` and
+`egl-headless`, links virglrenderer 1.3.0, mesa libgbm (backends from
+`/run/opengl-driver/lib/gbm`, where the NVIDIA module puts its GBM backend)
+and loads EGL through libglvnd.
+
+Also fixed in passing (pre-existing): the Start command waited for the
+display after `;`, so a failed `virsh start` waited 10 s and exited 0 — the
+error was shown but the action counted as done and the viewer opened on a
+stopped VM. Now `&&`: a failure ends at once.
+
+### 2. User folders: once, in the shell's language
+
+- `vexyon-fm-helper user-dirs-init en|es` (new): only if
+  `~/.config/user-dirs.dirs` does not exist, creates Desktop/Downloads/
+  Templates/Public/Documents/Music/Pictures/Videos/Projects (xdg-user-dirs
+  0.20's set; Spanish = xdg-user-dirs' own es translation, read from its
+  `.mo`: Escritorio, Descargas, Plantillas, Público, Documentos, Música,
+  Imágenes, Vídeos, Proyectos), writes `user-dirs.dirs` and
+  `user-dirs.locale`, and the shell's own folders inside them
+  (Wallpapers/Screenshots/Recordings, or Fondos de pantalla/Capturas de
+  pantalla/Grabaciones de pantalla). Always writes `user-dirs.conf`
+  `enabled=False` unless the user has one.
+- `places` (file manager) no longer runs `xdg-user-dirs-update`: listing
+  never creates anything.
+- `Places.initUserDirs()` + `shell.qml`: runs when `state.firstRun` becomes
+  false (the welcome screen closed, so the language just picked there) or,
+  on an install already past it, at the first start of this version. Mark
+  `state.userDirsInit` in shell.json, set only after the helper answered. The
+  shell's folder settings (`behavior.wallpaperDir`, `behavior.screenshotDir`,
+  `recording.dir`) follow the new folders only if still at the seed values.
+- Installers: no more `mkdir ~/Pictures/Wallpapers ~/Pictures/Screenshots`
+  (Arch install.sh; NixOS vexyon-seed did it at EVERY login). Both write
+  `user-dirs.conf` `enabled=False` while the user has no folders yet, so
+  `xdg-user-dirs-update` (run at login by Arch's xdg-user-dirs package, or by
+  anything that processes XDG autostart) cannot create them in the system
+  language before the welcome screen.
+- Measured with the real `xdg-user-dirs-update` 0.20: with `enabled=False`
+  nothing is created or reassigned; without it, a deleted folder is
+  "reassigned to homedir" and `Projects` appears.
+
+### 3. Sound from one side only after login
+
+Not reproducible here (no Legion, no hardware mixer). What a volume change
+does, which fixed it for the owner: PipeWire rewrites the device route for
+every channel. `Audio.qml` now does that write itself, once per default output
+per session, when the channel volumes are known: a channel at < 1% while
+another is > 5% → every channel to the playing one's level; otherwise the
+same per-channel values −0.01 and back. Two findings while building it:
+
+- Quickshell's `volume` setter scales the channels to a new AVERAGE keeping
+  their ratio: on [0.50, 0.00] it gave [1.00, 0.00] — louder and still
+  one-sided. Only `volumes` (per channel) is used.
+- Written back to back, the second write was dropped (it matched the value
+  Quickshell still held) and nothing reached PipeWire. Phase 2 now runs when
+  PipeWire reports phase 1 (or after 1 s). Measured with real PipeWire 1.6.6:
+  [50%, 0%] → [50%, 50%]; [60%, 40%] and [35%, 35%] → unchanged after the
+  round trip, phase 1 confirmed by PipeWire in both. Muted or at 0 → left
+  alone. The OSD ignores it (`Audio.settling`).
+
+### 4. Shortcuts
+
+- Seeds (`shell.json`, `share/vexyon/defaults/keybinds.json`): recorder on
+  Super+R. Super+Shift+C → calculator was already the default.
+- Migration `recorder-super-r` (Arch `install.sh`, NixOS `vexyon-seed` — the
+  same Python): moved once from Super+Shift+V or Super+Shift+R, only if
+  Super+R is free. Tested on six configurations with both scripts.
+- `config/hypr/vexyon-keybinds.lua` (seed, both repos) regenerated with the
+  bridge's own `build_keybinds_lua`: it lacked 11 binds.
+- With the Screen recording module off, Super+R opens Settings → Screen
+  recording (unchanged behaviour of the recorder shortcut).
+
+### 5. Recorder
+
+| file | change |
+|---|---|
+| `services/Recorder.qml` | `audio` adds `both`; `resolution` (native/1440/1080/720), `fps` (auto/60/30); `startWindow()`, `windowRect()` (Hyprland IPC geometry, clipped to the window's monitor in logical coordinates, rotation handled), `recordableWindows()` (windows on a workspace that is showing); wrapper loads/unloads the mix |
+| `modules/RecorderPanel.qml` | screen tiles name their workspace; Window tile → window list step; Quality chips; W key |
+| `modules/Settings.qml` | Sound gains System + microphone; Size; Frame rate |
+| `services/Audio.qml` | `vexyon_rec_*` nodes hidden from the volume panel |
+
+- System + microphone: null sink `vexyon_rec_mix` + loopback of system sound
+  (`stream.capture.sink=true`, follows the default output) + loopback of the
+  default source, loaded by the wrapper only while recording, unloaded when
+  wf-recorder ends and by the stop watcher if the shell dies (tested:
+  wrapper killed mid-recording → valid 2.7 s file, 0 modules left). If the
+  mix cannot be set up, the recording does not start and says why.
+- Size: `-F scale=-2:'min(ih,H)'` (only down, even width). Fixed fps:
+  `-r N -D`. Without `-D` a still screen gave the fps filter no frames and
+  at stop the MP4 stayed unfinished (262 bytes, measured); with `-D` a still
+  screen recorded 119 frames in 4 s at 30 fps and stopped in 0.1 s.
+- Window: wf-recorder captures outputs, not windows, so a window is its area
+  at the start (the UI says so). Workspace: a screen tile records the screen
+  showing it.
+
+### How it was verified (lab: cloud container, headless sway, Mesa llvmpipe, real PipeWire/WirePlumber/pipewire-pulse, real libvirt 12.2 + QEMU 10.2.4 TCG)
+
+- Recorder, through the real shell UI (keys sent with wtype, settings over
+  IPC): panel with the new options, Window step (empty list here: sway is not
+  Hyprland), recording of the screen at 720p/30 fps with System + microphone
+  → 1152×720, 219 frames in 7.3 s, AAC with the microphone tone (440 Hz)
+  −12.6 dBFS and the system tone (880 Hz) −10.8 dBFS, control −72 dBFS; 3
+  modules and wf-recorder during, none after. `windowRect()` unit-tested on
+  nine window/monitor cases (inside, clipped, scaled 1.6, rotated, hidden,
+  tiny).
+- Audio settle: real Audio.qml against real PipeWire, three channel layouts
+  (above).
+- User folders: real shell, three cases — new install in Spanish (nothing
+  while the welcome screen is open; Spanish folders + subfolders after; config
+  updated), new install in English, existing install (created once at
+  start). Second start with two folders deleted: not recreated.
+- Shortcuts: migration on six configurations, NixOS and Arch versions.
+- VMs: `vexyon-gpu-detect offload` on six fake layouts in both repos
+  (hybrid → on/renderD129; MUX both GPUs → main; MUX NVIDIA only → main;
+  NVIDIA tower → main; Intel only → none; Intel + supergfxctl Integrated →
+  off). Through the real shell: detection `on`, `gl3d=1`; "Start with 3D" on
+  a lab domain → QEMU started with egl-headless and `virtio-vga-gl` and failed
+  as expected here ("egl: no drm render node available": the container has no
+  GPU), the explained error shown, the action not left busy, the definition
+  unchanged; a plain Start afterwards ran normally. The VM manager shows the
+  new button and line. libvirt's generated QEMU command line:
+  `-display egl-headless,rendernode=… -device virtio-vga-gl -spice …`.
+- NixOS: `nix build` of the package (all QML byte-identical to the repo);
+  full system evaluation with and without `videoDrivers = [ "nvidia" ]` and
+  with a user `verbatimConfig` (the user's wins).
+- Static: pyflakes (helpers, bridge), `bash -n`, shellcheck (same counts as
+  before), i18n check 0 missing, parity loop (only the allowed files differ).
+
+### Not verified
+
+- **No real GPU here**: 3D rendering on the RTX 5070 (virgl through the
+  NVIDIA EGL/GBM driver inside QEMU) was not run — only up to QEMU asking for
+  the render node. Whether the NVIDIA proprietary driver needs more than the
+  device list (it may, e.g. a newer nvidia-egl-gbm) is unknown until tested
+  on the Legion. Intel/AMD (Mesa) render nodes need no extra device.
+- The one-sided sound: the fix repeats what the owner's volume change did;
+  the actual cause on the Legion (WirePlumber state vs amplifier) was not
+  observed. If it persists, `wpctl inspect @DEFAULT_AUDIO_SINK@` right after
+  login will tell.
+- Window recording and the workspace label need Hyprland (lab: sway).
+- Arch: not run (repositories blocked from this container); `qemu-desktop`
+  is assumed to include the GL display modules.
+- NixOS boot VM test (`modules-gating`): still running (software emulation, no KVM, ~10 min) when this was committed; its result is added below in a follow-up commit.
+
 ## Session: resource audit — RAM, CPU, disk; dead code (both repositories)
 
 ### Why

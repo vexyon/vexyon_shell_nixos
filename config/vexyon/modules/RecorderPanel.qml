@@ -2,23 +2,26 @@ import QtQuick
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Wayland
+import Quickshell.Hyprland
 import qs.services
 import qs.components
 
 // ============================================================================
 //  RecorderPanel — what to record. Opened by the recorder shortcut
-//  (Super+Shift+V by default; Super+Shift+R before 3.0), the launcher entry or Settings.
+//  (Super+R by default; Super+Shift+V in 3.0, Super+Shift+R before), the launcher entry or Settings.
 //
 //  Lives behind a LazyLoader in shell.qml (active = Panels.recorder AND the
 //  Screen recording switch): while closed there is no window and no object.
 //  Opens on the FOCUSED monitor via Panels.openScreen, like the calculator.
 //
-//  One tile per monitor plus "Region". A monitor tile starts recording that
-//  monitor at once; Region hands over to the screenshot selector in record
-//  mode (Panels.recordRegion), whose result comes back through
-//  Panels.regionPicked. While a recording runs the card shows it and offers
-//  Stop instead. Keyboard: ←/→ (or Tab) choose, Enter records, R = region,
-//  Esc closes.
+//  One tile per monitor (named with the workspace it shows), "Window" and
+//  "Region". A monitor tile starts recording that monitor at once; Window
+//  lists the windows on screen and records the chosen one's area; Region
+//  hands over to the screenshot selector in record mode (Panels.recordRegion),
+//  whose result comes back through Panels.regionPicked. Sound, size and frame
+//  rate are chips saved in shell.json ("recording"). While a recording runs
+//  the card shows it and offers Stop instead. Keyboard: ←/→ (or Tab) choose,
+//  Enter records, W = window, R = region, Esc closes (or goes back).
 // ============================================================================
 PanelWindow {
     id: win
@@ -31,7 +34,20 @@ PanelWindow {
 
     property bool shown: false
     readonly property var screensList: Quickshell.screens
-    readonly property int tileCount: win.screensList.length + 1     // + Region
+    readonly property int tileCount: win.screensList.length + 2     // + Window + Region
+    readonly property int windowTile: win.screensList.length
+    readonly property int regionTile: win.screensList.length + 1
+    // Window step: the windows on screen right now (Recorder.recordableWindows),
+    // read when the step opens — Hyprland answers over its socket, no process.
+    property bool pickingWindow: false
+    property var windowsList: []
+    property int wsel: 0
+    function workspaceOf(name) {
+        var ms = Hyprland.monitors.values;
+        for (var i = 0; i < ms.length; i++)
+            if (ms[i].name === name && ms[i].activeWorkspace) return ms[i].activeWorkspace.name;
+        return "";
+    }
     property string focusedName: ""
     property int sel: 0
 
@@ -53,10 +69,31 @@ PanelWindow {
             var name = win.screensList[i].name;
             Recorder.startOutput(name);
             win.close();
+        } else if (i === win.windowTile) {
+            Recorder.refreshWindows();
+            win.wsel = 0;
+            win.pickingWindow = true;
+            win.reloadWindows();
         } else {
             win.close();
             Panels.recordRegion = true;
         }
+    }
+    function reloadWindows() { win.windowsList = Recorder.recordableWindows(); }
+    // The IPC reply lands a moment after refreshWindows(): re-read on it.
+    Connections {
+        target: win.pickingWindow ? Hyprland : null
+        function onRawEvent(e) { win.reloadWindows(); }
+    }
+    Timer {
+        // one-shot: Hyprland's reply to refreshToplevels() has arrived by now
+        interval: 250; running: win.pickingWindow; onTriggered: win.reloadWindows()
+    }
+    function pickWindow(i) {
+        if (i < 0 || i >= win.windowsList.length) return;
+        var t = win.windowsList[i].toplevel;
+        win.close();
+        Recorder.startWindow(t);
     }
     function stopNow() { Recorder.stop(); win.close(); }
 
@@ -74,6 +111,16 @@ PanelWindow {
         anchors.fill: parent
         focus: true
         Keys.onPressed: function(e) {
+            if (win.pickingWindow) {
+                var n = win.windowsList.length;
+                if (e.key === Qt.Key_Escape || e.key === Qt.Key_Backspace) win.pickingWindow = false;
+                else if (e.key === Qt.Key_Return || e.key === Qt.Key_Enter) win.pickWindow(win.wsel);
+                else if (n > 0 && (e.key === Qt.Key_Down || e.key === Qt.Key_Tab || e.key === Qt.Key_Right)) win.wsel = (win.wsel + 1) % n;
+                else if (n > 0 && (e.key === Qt.Key_Up || e.key === Qt.Key_Backtab || e.key === Qt.Key_Left)) win.wsel = (win.wsel + n - 1) % n;
+                else return;
+                e.accepted = true;
+                return;
+            }
             if (e.key === Qt.Key_Escape) win.close();
             else if (Recorder.recording) {
                 if (e.key === Qt.Key_Return || e.key === Qt.Key_Enter) win.stopNow();
@@ -84,7 +131,8 @@ PanelWindow {
                 win.sel = (win.sel + 1) % win.tileCount;
             else if (e.key === Qt.Key_Left || e.key === Qt.Key_Up || e.key === Qt.Key_Backtab)
                 win.sel = (win.sel + win.tileCount - 1) % win.tileCount;
-            else if (e.key === Qt.Key_R) win.activate(win.tileCount - 1);
+            else if (e.key === Qt.Key_R) win.activate(win.regionTile);
+            else if (e.key === Qt.Key_W) win.activate(win.windowTile);
             else return;
             e.accepted = true;
         }
@@ -203,10 +251,113 @@ PanelWindow {
                     }
                 }
 
+                // ---------- step 2: which window ----------
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    visible: Recorder.ready && !Recorder.recording && win.pickingWindow
+                    spacing: 8
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 8
+                        IconButton {
+                            icon: Icons.back
+                            iconColor: Theme.subtext0
+                            iconSize: Theme.fontSize - 1
+                            implicitWidth: 26; implicitHeight: 26
+                            onClicked: win.pickingWindow = false
+                        }
+                        Text {
+                            Layout.fillWidth: true
+                            text: I18n.t("WHICH WINDOW")
+                            color: Theme.subtext1
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontSize - 2
+                            font.bold: true
+                        }
+                    }
+                    Text {
+                        Layout.fillWidth: true
+                        visible: win.windowsList.length === 0
+                        text: I18n.t("No window on screen right now. Only windows on a workspace that is showing can be recorded.")
+                        color: Theme.subtext0
+                        wrapMode: Text.Wrap
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSize - 2
+                    }
+                    Repeater {
+                        model: win.windowsList
+                        delegate: Rectangle {
+                            required property var modelData
+                            required property int index
+                            Layout.fillWidth: true
+                            implicitHeight: 42
+                            radius: Theme.radius
+                            color: wrowMa.containsMouse ? Theme.surface2 : Theme.surface1
+                            border.width: win.wsel === index ? 2 : 0
+                            border.color: Theme.accent
+                            RowLayout {
+                                anchors.fill: parent
+                                anchors.leftMargin: 12; anchors.rightMargin: 12
+                                spacing: 10
+                                Text {
+                                    text: Icons.window
+                                    color: win.wsel === index ? Theme.accent : Theme.subtext0
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: Theme.fontSize
+                                }
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 0
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: modelData.cls !== "" ? modelData.cls : modelData.title
+                                        color: Theme.text
+                                        elide: Text.ElideRight
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize - 1
+                                        font.bold: true
+                                    }
+                                    Text {
+                                        Layout.fillWidth: true
+                                        visible: modelData.title !== "" && modelData.cls !== ""
+                                        text: modelData.title
+                                        color: Theme.subtext0
+                                        elide: Text.ElideRight
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize - 3
+                                    }
+                                }
+                                Text {
+                                    text: modelData.rect.w + " × " + modelData.rect.h
+                                    color: Theme.subtext0
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: Theme.fontSize - 3
+                                }
+                            }
+                            MouseArea {
+                                id: wrowMa
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onEntered: win.wsel = index
+                                onClicked: win.pickWindow(index)
+                            }
+                        }
+                    }
+                    Text {
+                        Layout.fillWidth: true
+                        text: I18n.t("The window's area is recorded as it is when you start: keep the window there, and anything placed over it is recorded too.")
+                        color: Theme.overlay2
+                        wrapMode: Text.Wrap
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSize - 3
+                    }
+                }
+
                 // ---------- choose what to record ----------
                 ColumnLayout {
                     Layout.fillWidth: true
-                    visible: Recorder.ready && !Recorder.recording
+                    visible: Recorder.ready && !Recorder.recording && !win.pickingWindow
                     spacing: 10
 
                     Text {
@@ -227,7 +378,11 @@ PanelWindow {
                                 required property int index
                                 selected: win.sel === index
                                 title: modelData.name
-                                sub: modelData.width + " × " + modelData.height
+                                // the workspace it shows: recording a screen IS recording
+                                // whatever workspace is on it
+                                sub: (win.workspaceOf(modelData.name) !== ""
+                                      ? I18n.t("Workspace %1").arg(win.workspaceOf(modelData.name)) + " · " : "")
+                                     + modelData.width + "×" + modelData.height
                                 badge: modelData.name === win.focusedName ? I18n.t("This screen") : ""
                                 aspect: modelData.height > 0 ? modelData.width / modelData.height : 16 / 9
                                 onPicked: win.activate(index)
@@ -235,12 +390,20 @@ PanelWindow {
                             }
                         }
                         Tile {
-                            selected: win.sel === win.tileCount - 1
+                            selected: win.sel === win.windowTile
+                            title: I18n.t("Window")
+                            sub: I18n.t("Pick one")
+                            glyph: Icons.window
+                            onPicked: win.activate(win.windowTile)
+                            onPointedAt: win.sel = win.windowTile
+                        }
+                        Tile {
+                            selected: win.sel === win.regionTile
                             title: I18n.t("Region")
                             sub: I18n.t("Drag a box")
                             glyph: Icons.crop
-                            onPicked: win.activate(win.tileCount - 1)
-                            onPointedAt: win.sel = win.tileCount - 1
+                            onPicked: win.activate(win.regionTile)
+                            onPointedAt: win.sel = win.regionTile
                         }
                     }
 
@@ -252,40 +415,14 @@ PanelWindow {
                         font.pixelSize: Theme.fontSize - 2
                         font.bold: true
                     }
-                    Flow {
-                        Layout.fillWidth: true
-                        spacing: 6
-                        Repeater {
-                            model: [
-                                { v: "none",   l: I18n.t("No sound") },
-                                { v: "system", l: I18n.t("System sound") },
-                                { v: "mic",    l: I18n.t("Microphone") }
-                            ]
-                            delegate: Rectangle {
-                                required property var modelData
-                                readonly property bool on: Recorder.audio === modelData.v
-                                width: chipTxt.implicitWidth + 24
-                                height: 30
-                                radius: Theme.radius
-                                opacity: Recorder.soundOk || modelData.v === "none" ? 1 : 0.45
-                                color: on ? Theme.accent : (chipMa.containsMouse ? Theme.surface2 : Theme.surface1)
-                                Text {
-                                    id: chipTxt
-                                    anchors.centerIn: parent
-                                    text: modelData.l
-                                    color: parent.on ? Theme.onAccent : Theme.text
-                                    font.family: Theme.fontFamily
-                                    font.pixelSize: Theme.fontSize - 2
-                                }
-                                MouseArea {
-                                    id: chipMa
-                                    anchors.fill: parent
-                                    hoverEnabled: true
-                                    cursorShape: Qt.PointingHandCursor
-                                    onClicked: Config.set("recording", "audio", modelData.v)
-                                }
-                            }
-                        }
+                    ChipRow {
+                        key: "audio"; value: Recorder.audio; dim: !Recorder.soundOk
+                        options: [
+                            { v: "none",   l: I18n.t("No sound") },
+                            { v: "system", l: I18n.t("System sound") },
+                            { v: "mic",    l: I18n.t("Microphone") },
+                            { v: "both",   l: I18n.t("System + microphone") }
+                        ]
                     }
                     Text {
                         Layout.fillWidth: true
@@ -295,6 +432,32 @@ PanelWindow {
                         wrapMode: Text.Wrap
                         font.family: Theme.fontFamily
                         font.pixelSize: Theme.fontSize - 3
+                    }
+
+                    Text {
+                        Layout.topMargin: 4
+                        text: I18n.t("QUALITY")
+                        color: Theme.subtext1
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSize - 2
+                        font.bold: true
+                    }
+                    ChipRow {
+                        key: "resolution"; value: Recorder.resolution
+                        options: [
+                            { v: "native", l: I18n.t("Native size") },
+                            { v: "1440",   l: "1440p" },
+                            { v: "1080",   l: "1080p" },
+                            { v: "720",    l: "720p" }
+                        ]
+                    }
+                    ChipRow {
+                        key: "fps"; value: Recorder.fps
+                        options: [
+                            { v: "auto", l: I18n.t("Screen rate") },
+                            { v: "60",   l: "60 fps" },
+                            { v: "30",   l: "30 fps" }
+                        ]
                     }
 
                     Text {
@@ -308,7 +471,7 @@ PanelWindow {
                     }
                     Text {
                         Layout.fillWidth: true
-                        text: I18n.t("←/→ choose · Enter record · R region · Esc close")
+                        text: I18n.t("←/→ choose · Enter record · W window · R region · Esc close")
                         color: Theme.overlay2
                         wrapMode: Text.Wrap
                         font.family: Theme.fontFamily
@@ -391,6 +554,44 @@ PanelWindow {
             cursorShape: Qt.PointingHandCursor
             onEntered: tile.pointedAt()
             onClicked: tile.picked()
+        }
+    }
+
+    // A row of choices saved in shell.json ("recording" section).
+    component ChipRow: Flow {
+        id: cr
+        property string key: ""
+        property string value: ""
+        property bool dim: false
+        property var options: []
+        Layout.fillWidth: true
+        spacing: 6
+        Repeater {
+            model: cr.options
+            delegate: Rectangle {
+                required property var modelData
+                readonly property bool on: cr.value === modelData.v
+                width: chipTxt.implicitWidth + 24
+                height: 30
+                radius: Theme.radius
+                opacity: !cr.dim || modelData.v === "none" ? 1 : 0.45
+                color: on ? Theme.accent : (chipMa.containsMouse ? Theme.surface2 : Theme.surface1)
+                Text {
+                    id: chipTxt
+                    anchors.centerIn: parent
+                    text: modelData.l
+                    color: parent.on ? Theme.onAccent : Theme.text
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fontSize - 2
+                }
+                MouseArea {
+                    id: chipMa
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: Config.set("recording", cr.key, modelData.v)
+                }
+            }
         }
     }
 

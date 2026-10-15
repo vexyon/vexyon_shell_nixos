@@ -197,6 +197,9 @@ FloatingWindow {
     //  desde otra terminal, un cuelgue. Se suelta al cerrar, y si no queda
     //  ninguna VM encendida el proceso que escucha desaparece.
     // Texto bajo los botones de la GPU dedicada (ver Vm.dgpu).
+    // Aceleración 3D (ver Vm.dgpu): qué hace, o por qué está gris.
+    readonly property bool can3d: (Vm.dgpu.state === "on" || Vm.dgpu.state === "main")
+                                  && Vm.dgpu.render !== "" && Vm.dgpu.gl3d !== "0"
     function dgpuNote() {
         var g = Vm.dgpu;
         if (g.state === "off") {
@@ -206,10 +209,14 @@ FloatingWindow {
                     : g.driver === "vfio-pci" ? I18n.t("it is bound to vfio-pci, reserved for passthrough")
                     : I18n.t("no graphics driver is loaded for it");
             return I18n.t("Dedicated GPU is currently disabled") + ": " + why + ". "
-                 + I18n.t("Only the normal start is available.");
+                 + I18n.t("3D acceleration needs it; the normal start works as always.");
         }
-        return I18n.t("Dedicated GPU") + (g.name !== "" ? " (" + g.name + ")" : "") + ": "
-             + I18n.t("only the window that shows the VM uses it; the VM itself gets no GPU. VMs without 3D, like the ones created here, are drawn on the CPU either way, so the difference may be none.");
+        if (g.render === "")
+            return I18n.t("3D acceleration is not available: the GPU has no render node (/dev/dri/renderD*).");
+        if (g.gl3d === "0")
+            return I18n.t("3D acceleration is not available: this QEMU was built without 3D display support. The QEMU the Vexyon installer sets up has it (qemu-desktop on Arch, qemu_kvm on NixOS).");
+        return I18n.t("3D acceleration: the VM draws its graphics on %1 (virtio-gpu with virgl), for that start only — a normal Start is unchanged. Linux guests only: Windows has no 3D driver for it and shows a basic display.")
+                   .arg(g.name !== "" ? g.name : I18n.t("the GPU"));
     }
 
     property bool _watching: false
@@ -225,7 +232,7 @@ FloatingWindow {
             Vm.prime();      // recuerda la petición si Config aún no está lista
             vm._watch(true);
             Vm.refresh();
-            Vm.detectGpu();  // ¿hay GPU dedicada para el visor? Una vez por apertura
+            Vm.detectGpu();  // ¿hay GPU para la aceleración 3D? Una vez por apertura
             if (vm.selected !== "") Vm.loadDetail(vm.selected);
         } else {
             vm._watch(false);
@@ -944,14 +951,16 @@ FloatingWindow {
                                 enabled: !Vm.busy && vm.sel && vm.sel.state === "shut off"
                                 onClicked: Vm.start(vm.selected)
                             }
-                            // GPU dedicada (portátiles híbridos): SOLO la ventana del
-                            // visor usa la dGPU; la VM no recibe ninguna GPU. Sin
-                            // híbrida (Vm.dgpu.state "none", p.ej. la torre) no existe.
+                            // Aceleración 3D en la dGPU (híbrida) o en la GPU principal
+                            // cuando ya es la dGPU (MUX, torre). Arranque transitorio:
+                            // la definición guardada no cambia (Vm.start).
                             ActBtn {
-                                glyph: Icons.play; label: I18n.t("Start (display on dedicated GPU)")
+                                glyph: Icons.play
+                                label: Vm.dgpu.state === "on" ? I18n.t("Start with 3D (dedicated GPU)")
+                                                              : I18n.t("Start with 3D acceleration")
                                 tint: Theme.green
                                 visible: Vm.dgpu.state !== "none" && Vm.has.viewer
-                                enabled: Vm.dgpu.state === "on" && !Vm.busy && vm.sel && vm.sel.state === "shut off"
+                                enabled: vm.can3d && !Vm.busy && vm.sel && vm.sel.state === "shut off"
                                 onClicked: Vm.start(vm.selected, true)
                             }
                             ActBtn {
@@ -1005,25 +1014,18 @@ FloatingWindow {
                                 onClicked: Vm.openViewer(vm.selected)
                             }
                             ActBtn {
-                                glyph: Icons.desktop; label: I18n.t("Open display on dedicated GPU")
-                                tint: Theme.blue
-                                visible: Vm.dgpu.state !== "none" && Vm.has.viewer
-                                enabled: Vm.dgpu.state === "on" && vm.sel && vm.sel.state !== "shut off"
-                                onClicked: Vm.openViewer(vm.selected, true)
-                            }
-                            ActBtn {
                                 glyph: Icons.bars; label: I18n.t("Text console")
                                 tint: Theme.mauve
                                 enabled: vm.sel && vm.sel.state !== "shut off"
                                 onClicked: Vm.openConsole(vm.selected)
                             }
                         }
-                        // Qué hace (y qué NO) la GPU dedicada, o por qué está gris.
+                        // Qué hace (y qué NO) la aceleración 3D, o por qué está gris.
                         Text {
                             Layout.fillWidth: true
                             visible: Vm.dgpu.state !== "none" && Vm.has.viewer
                             text: vm.dgpuNote()
-                            color: Vm.dgpu.state === "off" ? Theme.yellow : Theme.subtext0
+                            color: !vm.can3d ? Theme.yellow : Theme.subtext0
                             wrapMode: Text.Wrap
                             font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
                         }

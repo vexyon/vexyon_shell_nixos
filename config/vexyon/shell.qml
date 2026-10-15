@@ -41,8 +41,18 @@ ShellRoot {
         function onReloadFailed(err) { Quickshell.inhibitReloadPopup() }
     }
 
+    // Carpetas de usuario: se crean UNA vez, en el idioma de la shell, en
+    // cuanto se cierra la bienvenida (donde se elige el idioma). Una
+    // instalación que ya la pasó las recibe en el primer arranque de esta
+    // versión. Ver Places.initUserDirs(); hasta entonces no se toca Places.
+    readonly property bool _userDirsDue: Config.ready
+        && Config.get("state", "firstRun", true) === false
+        && Config.get("state", "userDirsInit", false) !== true
+    on_UserDirsDueChanged: if (_userDirsDue) Places.initUserDirs()
+
     // Force the core singletons to instantiate at startup.
     Component.onCompleted: {
+        if (_userDirsDue) Places.initUserDirs();
         console.log("[Vexyon] shell loaded. active theme:", Theme.activeId);
         // Touch Wallpaper so its singleton instantiates now -> startup restore
         // of the saved background runs (swww loses its image across relogin).
@@ -80,7 +90,7 @@ ShellRoot {
         }
     }
 
-    // Super+Shift+V (Super+Shift+R antes de 3.0): grabación de pantalla. Grabando → para. Si no → abre el
+    // Super+R (antes Super+Shift+V / Super+Shift+R): grabación de pantalla. Grabando → para. Si no → abre el
     // selector (qué grabar). Apagado en Ajustes → lleva a Ajustes → Grabación
     // de pantalla, igual que Super+V con las VMs.
     //  ⚠️ Modules PRIMERO y return antes de tocar `Recorder`: con el

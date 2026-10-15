@@ -10,6 +10,31 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
 
 ### Fixed
 
+- **VMs: the dedicated-GPU button did nothing.** It only moved the
+  viewer window to the dGPU, and the VMs the manager creates draw no 3D, so
+  nothing changed — and in dGPU-only (MUX) mode it was not even shown. It is
+  now **Start with 3D acceleration** (see Added).
+- **Sound from one side only after login** (reported on a hybrid laptop
+  until the volume was moved). Once per output and per session, as soon as
+  its channel volumes are known, the shell now makes the same mixer write a
+  volume change makes: a side left at zero is brought to the level of the
+  other, otherwise the same values a hair down and back (a deliberate balance
+  is kept, never louder). The OSD ignores it.
+- **The screen recorder could not record system sound and the microphone
+  together.** New *System + microphone* choice (see Added).
+- **VM manager: a failed Start passed for a success.** The command waited
+  10 s for a display that never came and exited 0, so the error was hidden
+  and the viewer opened on a stopped VM; it now stops at the error.
+- **User folders were created at install time, in English.** The installers
+  made `~/Pictures/Wallpapers` and `~/Pictures/Screenshots` (NixOS: at every
+  login), and the file manager ran `xdg-user-dirs-update` in the system
+  language. Now the shell creates them once, in its own language (see
+  Changed).
+- The shipped `config/hypr/vexyon-keybinds.lua` seed lacked eleven binds
+  (VM manager, calculator, recorder, fullscreen, theme switcher, media keys);
+  regenerated from the default `shell.json`. The bridge rewrites it at login
+  anyway, so only the first seconds of a first session were affected.
+
 - **File Manager: copy/paste between two windows.** Copied or cut files were
   kept in a property of the window they were copied in, so a second window
   (or any other program) had nothing to paste. They now go to the system
@@ -20,6 +45,24 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
   after a complete move), cut items shown dimmed in every window.
 
 ### Added
+
+- **VMs: Start with 3D acceleration.** A Linux guest's graphics are drawn
+  on the dedicated GPU of a hybrid laptop, or on the main GPU when it already
+  is the dedicated one (MUX in dGPU mode, desktop with one NVIDIA):
+  virtio-gpu with virgl, QEMU rendering on that GPU's render node through an
+  egl-headless display while the usual SPICE window shows the frames.
+  Transient (`virsh create`): only that start uses it, the VM's saved
+  definition does not change, and a plain Start is as before. Windows guests
+  have no 3D driver for virtio-gpu. The installers let QEMU open the NVIDIA
+  device nodes it needs (`cgroup_device_acl`; only with the NVIDIA driver,
+  never over a value you set).
+- **Screen recording: what, how and sound.** Record a whole screen (the tile
+  names the workspace it shows), one window (its area on screen when you
+  start) or a region; at native size or scaled down to 1440p/1080p/720p; at
+  the screen's own rate or a fixed 60/30 fps; with system sound, the
+  microphone, or **system + microphone** in one track. The mix is a null sink
+  and two loopbacks loaded into the running PipeWire only while recording,
+  and removed when it ends — also if the shell dies mid-recording.
 
 - **File Manager: user folders at their real paths.** Desktop, Documents,
   Downloads, Pictures, Music and Videos come from `user-dirs.dirs`, so
@@ -43,6 +86,18 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
   source, read-only destination, permissions) are shown on the card.
 
 ### Changed
+
+- **Screen recording is on Super+R** (was Super+Shift+V). Existing
+  installs are moved once, only while Super+R is free; a later choice of
+  your own is never undone. Super+Shift+C opens the calculator, as before.
+- **User folders are created once, in the shell's language**, when the
+  welcome screen is closed: Desktop/Documents/Downloads… in English,
+  Escritorio/Documentos/Descargas… in Spanish (xdg-user-dirs' own names), plus
+  the wallpaper, screenshot and recording folders inside them. An install
+  that already went past the welcome screen gets them at its next start, in
+  its current language. Never again after that, never over an existing
+  `user-dirs.dirs`, and `user-dirs.conf` (`enabled=False`) keeps
+  `xdg-user-dirs-update` from recreating or renaming them.
 
 - **Much lower idle cost, same features.** With the default bar the shell
   used to start about 6 processes a second (a bash pipeline every 2 s for the

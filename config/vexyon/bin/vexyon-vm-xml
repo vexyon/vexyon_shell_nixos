@@ -214,6 +214,40 @@ def cmd_video(root, argv):
     return root
 
 
+def cmd_gpu3d(root, argv):
+    """gpu3d <render node> — el MISMO dominio con aceleración 3D en esa GPU.
+
+    Para "Iniciar con aceleración 3D": el QML pasa la salida a `virsh create`
+    (arranque TRANSITORIO con el mismo nombre y UUID), así que la definición
+    guardada NO cambia — el Iniciar normal sigue arrancando la VM como siempre.
+
+      * vídeo: virtio-gpu con accel3d (virgl) — QEMU crea `virtio-vga-gl`;
+      * <graphics type='egl-headless'> con el render node de la GPU elegida:
+        ahí renderiza QEMU el 3D del invitado (en la dGPU, p. ej.);
+      * el SPICE de siempre se queda, SIN GL: QEMU le copia cada fotograma
+        ya hecho, así que virt-viewer no necesita GPU ninguna ni importar
+        buffers de otra tarjeta (que es lo que rompe SPICE GL entre GPUs).
+    """
+    node = argv[0]
+    if not node.startswith("/dev/dri/"):
+        die("render node inválido: %s" % node)
+    dev = devices(root)
+    for v in dev.findall("video"):
+        dev.remove(v)
+    v = ET.SubElement(dev, "video")
+    m = ET.SubElement(v, "model", {"type": "virtio", "heads": "1", "primary": "yes"})
+    ET.SubElement(m, "acceleration", {"accel3d": "yes"})
+    for g in dev.findall("graphics"):
+        if g.get("type") == "egl-headless":
+            dev.remove(g)
+        elif g.get("type") == "spice":
+            for gl in g.findall("gl"):
+                g.remove(gl)
+    g = ET.SubElement(dev, "graphics", {"type": "egl-headless"})
+    ET.SubElement(g, "gl", {"rendernode": node})
+    return root
+
+
 def cmd_cpu(root, argv):
     """cpu <sockets> <cores> <threads> — 0 0 0 borra la topología."""
     s, c, t = argv[0], argv[1], argv[2]
@@ -669,6 +703,7 @@ COMMANDS = {
     "info": cmd_info,
     "boot": cmd_boot,
     "video": cmd_video,
+    "gpu3d": cmd_gpu3d,
     "cpu": cmd_cpu,
     "spice-agent": cmd_spice_agent,
     "clipboard": cmd_clipboard,

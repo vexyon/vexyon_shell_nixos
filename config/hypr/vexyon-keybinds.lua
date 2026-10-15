@@ -6,9 +6,6 @@
 
 -- --- Static core mouse binds ---
 hl.gesture({ fingers = 3, direction = "horizontal", action = "workspace" })
--- bindm equivalent = bind NORMAL sin opts (se dispara al pulsar y el arrastre
--- sigue al puntero). `{ drag = true }` NO sirve: implica release=true y solo
--- dispara al soltar; `{ mouse = true }` del ejemplo oficial es inerte.
 hl.bind("SUPER + mouse:272", hl.dsp.window.drag())
 hl.bind("SUPER + mouse:273", hl.dsp.window.resize())
 
@@ -19,7 +16,11 @@ hl.bind("SUPER + A", hl.dsp.global("quickshell:launcher"))  -- Open App Launcher
 hl.bind("SUPER + E", hl.dsp.global("quickshell:filemanager"))  -- Open File Manager
 hl.bind("SUPER + B", hl.dsp.exec_cmd("vexyon-open-browser"))  -- Open default browser
 hl.bind("SUPER + C", hl.dsp.global("quickshell:controlcenter"))  -- Open Control Center
+hl.bind("SUPER + V", hl.dsp.global("quickshell:vmmanager"))  -- Open VM Manager (or Settings to enable it)
+hl.bind("SUPER + SHIFT + C", hl.dsp.global("quickshell:calculator"))  -- Open Calculator
+hl.bind("SUPER + R", hl.dsp.global("quickshell:recorder"))  -- Screen recording: open the recorder / stop recording
 hl.bind("SUPER + W", hl.dsp.window.float({ action = "toggle" }))  -- Toggle floating for window under cursor
+hl.bind("SUPER + SHIFT + F", hl.dsp.window.fullscreen({ mode = "fullscreen" }))  -- Toggle fullscreen for focused window
 hl.bind("SUPER + ALT + W", hl.dsp.global("quickshell:wallpaper"))  -- Open Wallpaper Picker
 hl.bind("SUPER + S", hl.dsp.workspace.toggle_special("scratchpad"))  -- Toggle Scratchpad
 hl.bind("SUPER + SHIFT + S", hl.dsp.window.move({ workspace = "special:scratchpad", follow = false }))  -- Send window under cursor to Scratchpad
@@ -34,13 +35,22 @@ hl.bind("SUPER + SHIFT + down", hl.dsp.window.swap({ direction = "down" }))  -- 
 hl.bind("Print", hl.dsp.global("quickshell:screenshot"))  -- Interactive screenshot / snip
 hl.bind("SUPER + L", hl.dsp.global("quickshell:lock"))  -- Lock screen
 hl.bind("SUPER + X", hl.dsp.global("quickshell:powermenu"))  -- Power menu
+hl.bind("SUPER + ALT + T", hl.dsp.global("quickshell:themeswitcher"))  -- Switch theme (quick)
+hl.bind("XF86AudioRaiseVolume", hl.dsp.global("quickshell:volumeUp"), { locked = true, repeating = true })  -- Volume up
+hl.bind("XF86AudioLowerVolume", hl.dsp.global("quickshell:volumeDown"), { locked = true, repeating = true })  -- Volume down
+hl.bind("XF86AudioMute", hl.dsp.global("quickshell:volumeMute"), { locked = true })  -- Toggle mute
+hl.bind("XF86AudioMicMute", hl.dsp.global("quickshell:micMute"), { locked = true })  -- Toggle microphone mute
+hl.bind("XF86MonBrightnessUp", hl.dsp.global("quickshell:brightnessUp"), { locked = true, repeating = true })  -- Brightness up
+hl.bind("XF86MonBrightnessDown", hl.dsp.global("quickshell:brightnessDown"), { locked = true, repeating = true })  -- Brightness down
+hl.bind("XF86AudioPlay", hl.dsp.global("quickshell:mediaPlayPause"), { locked = true })  -- Play / pause media
+hl.bind("XF86AudioPause", hl.dsp.global("quickshell:mediaPause"), { locked = true })  -- Pause media
+hl.bind("XF86AudioNext", hl.dsp.global("quickshell:mediaNext"), { locked = true })  -- Next track
+hl.bind("XF86AudioPrev", hl.dsp.global("quickshell:mediaPrev"), { locked = true })  -- Previous track
 
 -- --- Workspace binds (generated from workspaceCount) ---
 for i = 1, 10 do
     local key = i % 10
     hl.bind("SUPER + " .. key, hl.dsp.focus({ workspace = i }))
-end
-for i = 1, 10 do
-    local key = i % 10
+    -- NON-silent move: the user FOLLOWS the window to the target workspace.
     hl.bind("SUPER + SHIFT + " .. key, hl.dsp.window.move({ workspace = i }))
 end
