@@ -133,6 +133,9 @@ card_info() {
 # it (radio on/off, the device list). "pkexec must be setuid root" means it
 # could not, and why matters:
 #   missing    no pkexec at all
+#   nowrapper  NixOS without /run/wrappers/bin/pkexec: nixpkgs made it opt-in
+#              (security.polkit.enablePkexecWrapper), Vexyon's module turns
+#              it on; only the store's copy, without setuid, is left
 #   notsetuid  the binary lost its setuid bit
 #   nosuid     its file system is mounted nosuid
 #   nnp        this process tree has no_new_privs set, which makes the kernel
@@ -147,6 +150,8 @@ admin_check() {
     [ -n "$p" ] && [ -e "$p" ] && { ADMIN_PKEXEC=$p; break; }
   done
   if [ -z "$ADMIN_PKEXEC" ]; then ADMIN_REASON=missing
+  elif [ ! -u "$ADMIN_PKEXEC" ] && [ -d /run/wrappers/bin ] && [ ! -e /run/wrappers/bin/pkexec ]; then
+    ADMIN_REASON=nowrapper
   elif [ ! -u "$ADMIN_PKEXEC" ]; then ADMIN_REASON=notsetuid
   elif findmnt -no OPTIONS --target "$ADMIN_PKEXEC" 2>/dev/null | tr ',' '\n' | grep -qx nosuid; then
     ADMIN_REASON=nosuid
@@ -170,6 +175,7 @@ admin_gate() {
   admin_check
   case "$ADMIN_REASON" in
     missing) die "pkexec was not found. Rebuild your system (NixOS) or run the Vexyon installer again." ;;
+    nowrapper) die "This NixOS has no setuid pkexec (/run/wrappers/bin/pkexec). Update the Vexyon flake input and rebuild: Vexyon turns on security.polkit.enablePkexecWrapper, unless your configuration sets it to false." ;;
     notsetuid) die "$ADMIN_PKEXEC is not setuid root. Rebuild your system (NixOS) or reinstall polkit." ;;
     nosuid) die "$ADMIN_PKEXEC is on a file system mounted nosuid, so it cannot become root." ;;
     nnp)

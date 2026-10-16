@@ -1503,6 +1503,8 @@ Singleton {
             "This session does not allow programs to become administrator (no_new_privs), so pkexec cannot run.": "Esta sesión no permite que los programas obtengan permisos de administrador (no_new_privs), así que pkexec no puede funcionar.",
             "This session does not allow setuid programs (no_new_privs), so Vexyon starts the radio through systemd instead.": "Esta sesión no permite programas setuid (no_new_privs), así que Vexyon arranca la radio a través de systemd.",
             "Administrator access for the radio (pkexec)": "Acceso de administrador para la radio (pkexec)",
+            "This NixOS has no setuid pkexec (/run/wrappers/bin/pkexec). Update the Vexyon flake input and rebuild: Vexyon turns on security.polkit.enablePkexecWrapper, unless your configuration sets it to false.": "Este NixOS no tiene el pkexec con setuid (/run/wrappers/bin/pkexec). Actualiza la entrada del flake de Vexyon y reconstruye: Vexyon activa security.polkit.enablePkexecWrapper, salvo que tu configuración lo ponga a false.",
+            "pkexec cannot become administrator on this system (“pkexec must be setuid root”). On NixOS, update the Vexyon flake input and rebuild; on Arch, run the Vexyon installer again.": "pkexec no puede obtener permisos de administrador en este sistema («pkexec must be setuid root»). En NixOS, actualiza la entrada del flake de Vexyon y reconstruye; en Arch, vuelve a ejecutar el instalador de Vexyon.",
             "Only the people on your AirDrop list can send you files (Settings → AirDrop).": "Solo las personas de tu lista de AirDrop pueden enviarte archivos (Ajustes → AirDrop)."
         }
     })

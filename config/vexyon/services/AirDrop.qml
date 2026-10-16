@@ -78,6 +78,8 @@ Singleton {
         // pkexec could not become root (vexyon-airdrop's admin_check says why).
         if (/pkexec must be setuid root/.test(t))
             return I18n.t("pkexec could not become administrator, so the radio cannot start. Settings → AirDrop shows why.");
+        if (/^This NixOS has no setuid pkexec/.test(t))
+            return I18n.t("This NixOS has no setuid pkexec (/run/wrappers/bin/pkexec). Update the Vexyon flake input and rebuild: Vexyon turns on security.polkit.enablePkexecWrapper, unless your configuration sets it to false.");
         if (/^pkexec was not found/.test(t))
             return I18n.t("pkexec was not found. Rebuild your system (NixOS) or run the Vexyon installer again.");
         if ((m = t.match(/^(\S+) is not setuid root/)))

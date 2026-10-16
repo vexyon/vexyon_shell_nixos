@@ -10,6 +10,14 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
 
 ### Fixed
 
+- **NixOS: "pkexec must be setuid root" (AirDrop, Settings → Modules).**
+  Recent nixpkgs no longer installs `/run/wrappers/bin/pkexec` unless
+  `security.polkit.enablePkexecWrapper` is set; only the store's pkexec,
+  without setuid, was left, so AirDrop's radio and the module switches could
+  not become root. The NixOS module now sets it (`mkDefault`, only where the
+  option exists). Settings → AirDrop names this case ("This NixOS has no
+  setuid pkexec…") instead of "reinstall polkit", and Settings → Modules no
+  longer reports it as "Not authorized".
 - **File choosers failed: "No file chooser is available … Could not activate
   remote peer 'org.freedesktop.portal.Desktop': startup job failed".**
   Since xdg-desktop-portal 1.21 the portal's unit is

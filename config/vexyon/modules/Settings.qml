@@ -3580,6 +3580,7 @@ FloatingWindow {
                                     label: I18n.t("Administrator access for the radio (pkexec)")
                                     note: adBody.adm === null ? ""
                                         : adBody.adm.reason === "missing" ? I18n.t("pkexec was not found. Rebuild your system (NixOS) or run the Vexyon installer again.")
+                                        : adBody.adm.reason === "nowrapper" ? I18n.t("This NixOS has no setuid pkexec (/run/wrappers/bin/pkexec). Update the Vexyon flake input and rebuild: Vexyon turns on security.polkit.enablePkexecWrapper, unless your configuration sets it to false.")
                                         : adBody.adm.reason === "notsetuid" ? I18n.t("%1 is not setuid root. Rebuild your system (NixOS) or reinstall polkit.").arg(adBody.adm.pkexec)
                                         : adBody.adm.reason === "nosuid" ? I18n.t("%1 is on a file system mounted nosuid, so it cannot become administrator.").arg(adBody.adm.pkexec)
                                         : adBody.adm.reason === "nnp" && adBody.adm.escape === true

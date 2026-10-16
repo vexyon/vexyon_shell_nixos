@@ -236,9 +236,13 @@ Singleton {
             if (code !== 0) {
                 root.errorId = id;
                 // pkexec: 126 = the password dialog was dismissed, 127 = not
-                // authorized (or no authentication agent). Our own codes: 3 =
+                // authorized (or no authentication agent) — and also a pkexec
+                // that cannot become root at all (NixOS without its setuid
+                // wrapper), told apart by its message. Our own codes: 3 =
                 // the system part is not installed, 4 = could not save.
-                root.error = code === 126 ? I18n.t("Cancelled — nothing was changed.")
+                root.error = /must be setuid root/.test(setErr.text)
+                               ? I18n.t("pkexec cannot become administrator on this system (“pkexec must be setuid root”). On NixOS, update the Vexyon flake input and rebuild; on Arch, run the Vexyon installer again.")
+                           : code === 126 ? I18n.t("Cancelled — nothing was changed.")
                            : code === 127 ? I18n.t("Not authorized — nothing was changed.")
                            : code === 3 ? I18n.t("The system part of Vexyon modules is not installed. Run the Vexyon installer again (on NixOS: rebuild your system).")
                            : (setErr.text.trim() !== "" ? setErr.text.trim().replace(/^vexyon-modules: /, "")

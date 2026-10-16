@@ -206,9 +206,27 @@ let
   '';
 in
 {
-  # La radio de AirDrop (Ajustes → Módulos → AirDrop): opciones
-  # services.omdrop-owl.*. Inerte salvo que se active, y se activa abajo.
-  imports = [ omdrop-owl.nixosModules.default ];
+  imports = [
+    # La radio de AirDrop (Ajustes → Módulos → AirDrop): opciones
+    # services.omdrop-owl.*. Inerte salvo que se active, y se activa abajo.
+    omdrop-owl.nixosModules.default
+
+    # pkexec con setuid (/run/wrappers/bin/pkexec): lo usan la radio de
+    # AirDrop (omdrop → omdrop-owl) y Ajustes → Módulos (vexyon-modules).
+    # nixpkgs lo hizo opcional (security.polkit.enablePkexecWrapper, apagado
+    # por defecto): sin él solo queda el pkexec del store, sin setuid, y todo
+    # eso falla con "pkexec must be setuid root". mkDefault: el usuario puede
+    # apagarlo. Un módulo aparte porque solo se define si la opción existe:
+    # los nixpkgs anteriores no la tienen y lo instalan siempre.
+    (
+      { options, ... }:
+      {
+        config = lib.optionalAttrs (options.security.polkit ? enablePkexecWrapper) (
+          lib.mkIf cfg.enable { security.polkit.enablePkexecWrapper = lib.mkDefault true; }
+        );
+      }
+    )
+  ];
 
   options.services.vexyon = {
     enable = lib.mkEnableOption "the Vexyon desktop shell";
@@ -374,7 +392,7 @@ in
 
     services.udisks2.enable = true; # medios extraíbles (activado por D-Bus)
     networking.networkmanager.enable = lib.mkDefault true;
-    security.polkit.enable = true;
+    security.polkit.enable = true; # y su pkexec con setuid: imports, arriba
     security.rtkit.enable = true;
     services.pipewire = {
       enable = lib.mkDefault true;

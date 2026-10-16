@@ -20,6 +20,76 @@ VEXYON OUT-OF-THE-BOX POLICY Every Vexyon feature must ship together with all re
 
 PERMANENT POLICY: If Vexyon's installation changes, its GitHub README.md MUST be updated in the same development task. No exceptions.
 
+## Session: NixOS without the setuid pkexec (owner's screenshot)
+
+### Why
+
+After the previous update, Settings → AirDrop on the owner's NixOS showed
+"Administrator access for the radio (pkexec) ✗ —
+/run/current-system/sw/bin/pkexec is not setuid root". The owner asked
+whether their motherboard (ASUS ROG Strix Z790-A Gaming WiFi II) or its
+antenna was to blame. It is not: the Wi-Fi row (wlo1, iwlwifi) is green.
+
+### Root cause
+
+`admin_check` picks the first pkexec that exists; it fell through to the
+system profile's copy, so **`/run/wrappers/bin/pkexec` does not exist** on
+the owner's system. Current nixpkgs (`nixos/modules/security/polkit.nix`)
+has `security.polkit.enablePkexecWrapper = mkEnableOption "the setuid pkexec
+wrapper"` — **off by default** — and `security.wrappers.pkexec.enable =
+cfg.enablePkexecWrapper`. The nixpkgs our builds and VM tests use (26.05
+snapshot) still installs the wrapper unconditionally, which is why nothing
+showed here. Without it, AirDrop's radio (omdrop → `pkexec
+omdrop-discoverable`) and Settings → Modules (`pkexec vexyon-modules set`)
+both fail with "pkexec must be setuid root". This was also the cause behind
+the earlier pkexec report, not no_new_privs.
+
+### What changed
+
+- `nix/module.nix`: a small module in `imports` sets
+  `security.polkit.enablePkexecWrapper = lib.mkDefault true` when
+  `services.vexyon.enable`, and only when `options.security.polkit` has that
+  option (older nixpkgs: no option, wrapper always installed). A separate
+  module because a definition of a non-existent option is an error even
+  under `mkIf false`; wrapping the main `config` in `mkMerge` would have
+  re-indented 450 lines.
+- `bin/vexyon-airdrop`: new reason `nowrapper` (NixOS: `/run/wrappers/bin`
+  exists, no pkexec in it, the one found is not setuid) with a plain message:
+  update the Vexyon flake input and rebuild, unless the configuration sets
+  the option to false. Settings → AirDrop and `say()` show it in Spanish
+  too; "reinstall polkit" stays for the real not-setuid case.
+- `services/Modules.qml`: a pkexec that prints "must be setuid root" (exit
+  127) is no longer reported as "Not authorized"; it gets its own message.
+- NixOS README: the module's list and a note on the wrapper; CHANGELOG.
+
+### Verified
+
+- `nix-instantiate --eval` of a full NixOS configuration with the module,
+  against **nixpkgs master** (c5b2566, 2026-10-16, 26.11pre) and against our
+  26.05 snapshot: master + Vexyon → option `true`, wrapper enabled; master
+  without Vexyon → off; master with `enablePkexecWrapper = false` set by the
+  user → off (the user wins); 26.05 → no option, wrapper on as before.
+  The whole system (`system.build.toplevel.drvPath`, greeter on) evaluates
+  on master with no warnings.
+- Ad-hoc NixOS VM test `vexyon-pkexec-nowrapper` (26.05 snapshot,
+  `security.wrappers.pkexec.enable = false` to recreate the owner's state):
+  `command -v pkexec` → `/run/current-system/sw/bin/pkexec`, which prints
+  "pkexec must be setuid root" (the owner's error, reproduced);
+  `vexyon-airdrop info` → `"reason":"nowrapper"`; `vexyon-airdrop off`
+  stops with the new message, exit 1, omdrop not run. Passed.
+- `modules-gating` (the flake's test) with the changed module: passed (548 s).
+- shellcheck of vexyon-airdrop clean; I18n checker 0 missing; byte-identity
+  check: only the platform files differ.
+
+### Not verified
+
+- No VM built from nixpkgs master (its closure is not in this container's
+  store); the wrapper on master is shown by evaluation only.
+- Not run on the owner's machine: after updating the flake input and
+  rebuilding, `/run/wrappers/bin/pkexec` should exist and the AirDrop row
+  turn green; whether the iPhone then sees the computer depends on the radio,
+  not tested here.
+
 ## Session: file chooser, portal start, AirDrop pkexec, headset (owner's report)
 
 ### Why (owner's report, in Catalan, after testing on NixOS)
