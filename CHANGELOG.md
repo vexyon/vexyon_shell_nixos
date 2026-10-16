@@ -10,6 +10,34 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
 
 ### Fixed
 
+- **File choosers failed: "No file chooser is available … Could not activate
+  remote peer 'org.freedesktop.portal.Desktop': startup job failed".**
+  Since xdg-desktop-portal 1.21 the portal's unit is
+  `Requisite=graphical-session.target`, and nothing in a greetd →
+  `vexyon-start` → Hyprland session started that target (Hyprland exports
+  its environment but does not start it), so every portal request — file
+  choosers, screen sharing, the dark-mode setting — failed. The shell now
+  starts `vexyon-session.target` (BindsTo `graphical-session.target`, like
+  `sway-session.target`) once it is up, and `vexyon-start` stops
+  `graphical-session.target` when the compositor exits (only if this
+  session started it), so nothing bound to it outlives the display.
+  Installed by `install.sh` (`/etc/systemd/user`) and the NixOS module
+  (`systemd.user.targets.vexyon-session`).
+- **AirDrop: "pkexec must be setuid root"** when turning visibility on or
+  looking for devices. `vexyon-airdrop` now checks whether pkexec can become
+  root and why not — not found, not setuid, on a `nosuid` mount, or the
+  session has `no_new_privs` — and says so in the panel and in a new
+  Settings → AirDrop row. Under `no_new_privs` the root-needing commands
+  (`on`, `off`, `peers`, `send`) are re-run as a transient unit of the
+  user's systemd manager (`systemd-run --user`), which does not inherit it;
+  polkit still decides. AirDrop's *Change* folder no longer depends on the
+  desktop portal: omdrop asks the Vexyon file manager (`OMDROP_PICKER`).
+- **Headset on one side after login, again** (Corsair HS80 MAX, a 2.4 GHz
+  USB dongle). The login-time mixer write was not enough: the dongle can
+  apply it late or lose it after PipeWire suspends the idle device. The same
+  write is now also made when playback starts on the default output (its
+  first link turns active — an event, nothing polled), at most once every
+  20 s. Values are written back unchanged: inaudible, balance kept.
 - **Screenshots showed the selector.** The saved image could carry the
   corner handles, the border and the accent tint of the selection: the
   overlay was unmapped right before grim ran and Hyprland's layer fade was
@@ -53,6 +81,17 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
 
 ### Added
 
+- **The Vexyon file manager is the file chooser of every app.** A browser's
+  *Upload* or *Save as*, GTK apps and Flatpaks get a Vexyon file manager
+  window in pick mode (open one or several files, choose a folder, save with
+  a name; the app's file-type filters; replacing a file asks first; Esc or
+  closing cancels). `vexyon-portal` is an xdg-desktop-portal FileChooser
+  backend, D-Bus-activated only when an app asks and gone 30 s later;
+  `vexyon-pick` asks the running shell (`qs ipc call vexyon pick`) and waits
+  on a FIFO; the portal configuration puts it first with
+  `xdg-desktop-portal-gtk` as the fallback, which it hands the request to by
+  itself when the shell is not running. The session exports
+  `GTK_USE_PORTAL=1` so GTK 3 apps and Firefox use the portal.
 - **AirDrop** (new optional module, Settings → Modules → AirDrop, on by
   default). Send and receive files with nearby iPhones, iPads and Macs from a
   new bar button (left click: its panel; right click: visible / not
@@ -115,6 +154,10 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
 
 ### Changed
 
+- **AirDrop: who can send is chosen in Settings only.** The panel lost its
+  Everyone / Contacts Only chips (it shows one line while Contacts Only is
+  on). Settings explains that Contacts Only is optional and needs no Mac or
+  Contacts app: it is a list of Apple ID emails or phone numbers kept there.
 - **Screen recording is on Super+R** (was Super+Shift+V). Existing
   installs are moved once, only while Super+R is free; a later choice of
   your own is never undone. Super+Shift+C opens the calculator, as before.

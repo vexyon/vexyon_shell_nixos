@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  vexyon-session start|stop — tie the Vexyon session to systemd's
+#  graphical-session.target. The same file ships in both repos.
+#
+#  Hyprland exports its environment to systemd and D-Bus but does not start
+#  graphical-session.target, and nothing else in a greetd → vexyon-start →
+#  Hyprland session does. Since xdg-desktop-portal 1.21 the portal's unit is
+#  Requisite=graphical-session.target, so without it every portal request
+#  (file choosers, screen sharing, the dark-mode setting) fails with
+#  "Could not activate remote peer 'org.freedesktop.portal.Desktop': startup
+#  job failed". vexyon-session.target (Arch: install.sh; NixOS: the module)
+#  BindsTo= it, the way sway-session.target does:
+#    start  run by the shell once it is up (shell.qml): the compositor's
+#           environment is in systemd by then, so whatever
+#           graphical-session.target pulls in sees WAYLAND_DISPLAY. Nothing
+#           is started when a session manager (uwsm…) already did it.
+#    stop   at logout and before a GPU restart of the compositor
+#           (vexyon-start runs the same lines). It stops
+#           graphical-session.target itself, and only when this session
+#           started it: StopWhenUnneeded alone would keep it up as long as
+#           the portal (Requisite= on it) runs, bound to a dead display.
+# ============================================================================
+set -u
+
+case "${1:-}" in
+  start)
+    have=()
+    for v in WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XDG_SESSION_DESKTOP HYPRLAND_INSTANCE_SIGNATURE; do
+      [ -n "${!v:-}" ] && have+=("$v")
+    done
+    if [ ${#have[@]} -gt 0 ]; then
+      systemctl --user import-environment "${have[@]}" 2>/dev/null
+      if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+        dbus-update-activation-environment "${have[@]}" 2>/dev/null
+      fi
+    fi
+    systemctl --user is-active --quiet graphical-session.target \
+      || systemctl --user start --no-block vexyon-session.target ;;
+  stop)
+    if systemctl --user is-active --quiet vexyon-session.target; then
+      systemctl --user stop --no-block graphical-session.target vexyon-session.target 2>/dev/null
+    fi ;;
+  *)
+    echo "usage: vexyon-session start|stop" >&2
+    exit 2 ;;
+esac

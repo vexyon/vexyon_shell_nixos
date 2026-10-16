@@ -3485,7 +3485,12 @@ FloatingWindow {
                             readonly property var inf: AirDrop.info
                             readonly property bool checked: adBody.inf !== null
                             readonly property bool ready: adBody.checked && adBody.inf.installed === true
-                                && adBody.inf.doctor !== null && AirDrop.problems.length === 0
+                                && adBody.inf.doctor !== null && AirDrop.problems.length === 0 && adBody.adminOk
+                            // pkexec puede hacerse root (vexyon-airdrop admin_check); con
+                            // no_new_privs vale si se puede salir por systemd-run.
+                            readonly property var adm: adBody.checked && adBody.inf.admin ? adBody.inf.admin : null
+                            readonly property bool adminOk: adBody.adm === null || adBody.adm.reason === ""
+                                || (adBody.adm.reason === "nnp" && adBody.adm.escape === true)
                             readonly property string modeText:
                                   !adBody.checked || adBody.inf.mode === "" ? ""
                                 : adBody.inf.mode === "shared" ? I18n.t("Wi-Fi stays connected while you are visible. Your router has to be on channel 6, 44 or 149.")
@@ -3571,6 +3576,19 @@ FloatingWindow {
                                 }
                                 ReqRow {
                                     pending: !adBody.checked
+                                    ok: adBody.adminOk
+                                    label: I18n.t("Administrator access for the radio (pkexec)")
+                                    note: adBody.adm === null ? ""
+                                        : adBody.adm.reason === "missing" ? I18n.t("pkexec was not found. Rebuild your system (NixOS) or run the Vexyon installer again.")
+                                        : adBody.adm.reason === "notsetuid" ? I18n.t("%1 is not setuid root. Rebuild your system (NixOS) or reinstall polkit.").arg(adBody.adm.pkexec)
+                                        : adBody.adm.reason === "nosuid" ? I18n.t("%1 is on a file system mounted nosuid, so it cannot become administrator.").arg(adBody.adm.pkexec)
+                                        : adBody.adm.reason === "nnp" && adBody.adm.escape === true
+                                          ? I18n.t("This session does not allow setuid programs (no_new_privs), so Vexyon starts the radio through systemd instead.")
+                                        : adBody.adm.reason === "nnp" ? I18n.t("This session does not allow programs to become administrator (no_new_privs), so pkexec cannot run.")
+                                        : adBody.adm.pkexec
+                                }
+                                ReqRow {
+                                    pending: !adBody.checked
                                     ok: adBody.checked && adBody.inf.wifi !== "" && adBody.inf.profile !== ""
                                         && (adBody.inf.profile === "tested" || adBody.inf.allowUntested === true)
                                     label: !adBody.checked ? I18n.t("Wi-Fi card")
@@ -3633,7 +3651,7 @@ FloatingWindow {
                             }
                             Text {
                                 Layout.fillWidth: true
-                                text: I18n.t("Contacts Only accepts files only from the people below (the email or phone number of their Apple ID); anyone else is refused before anything is received. Apple devices that are not on the list do not see this computer either.")
+                                text: I18n.t("Everyone is the normal choice: any iPhone, iPad or Mac nearby can see this computer and send it files. Contacts Only is optional and needs no Mac or Contacts app: it is a list you keep here of the Apple ID emails or phone numbers allowed to send to you. Anyone else is refused before anything is received, and their devices do not see this computer.")
                                 color: Theme.subtext0
                                 wrapMode: Text.Wrap
                                 font.family: Theme.fontFamily

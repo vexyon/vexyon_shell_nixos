@@ -20,6 +20,231 @@ VEXYON OUT-OF-THE-BOX POLICY Every Vexyon feature must ship together with all re
 
 PERMANENT POLICY: If Vexyon's installation changes, its GitHub README.md MUST be updated in the same development task. No exceptions.
 
+## Session: file chooser, portal start, AirDrop pkexec, headset (owner's report)
+
+### Why (owner's report, in Catalan, after testing on NixOS)
+
+1. The headset (Corsair HS80 MAX, 2.4 GHz USB dongle) still sounds mostly on
+   the right after boot until the volume is moved; and new "noise" in music.
+2. AirDrop: changing the received-files folder always fails with "No file
+   chooser is available: GDBus.Error:…NameHasNoOwner: Could not activate
+   remote peer 'org.freedesktop.portal.Desktop': startup job failed".
+3. The Vexyon file manager must be as good as Nautilus/Thunar: whenever a
+   website or app asks for a file or folder, it should open instead of the
+   GTK dialog.
+4. AirDrop: "pkexec must be setuid root" on *Find devices* and on the
+   *Visible as <host>* switch; the iPhone 13 Pro then finds nothing.
+5. Why is there contacts stuff without a Mac with contacts?
+
+### Root causes found
+
+- **Portal (2, and 3's precondition).** xdg-desktop-portal 1.21.0 (upstream
+  commit 4d284de, "Launch service after graphical session") made its unit
+  `Requisite=graphical-session.target` + `After=graphical-session.target`.
+  Hyprland 0.55 imports its environment into systemd/D-Bus but never starts
+  `graphical-session.target` (checked in its source and binary), and neither
+  greetd nor `vexyon-start` does, so the portal job fails as a dependency:
+  "startup job failed". The nixpkgs used for our builds still has 1.20.4
+  (no Requisite), which is why the earlier VM test showed the portal
+  working; the owner's system evidently has ≥ 1.21.
+- **pkexec (4).** Not reproduced. "must be setuid root" means pkexec ran
+  with euid ≠ 0: no setuid wrapper, a `nosuid` mount, or `no_new_privs` in
+  the process tree. omdrop already puts `/run/wrappers/bin` first in its
+  PATH; Hyprland (`prctl` only for ambient CAP_SYS_NICE and PDEATHSIG),
+  Quickshell (no `prctl`) and NixOS's greetd unit set no `no_new_privs`.
+  The cause on the owner's machine stays unknown, so the shell now detects
+  all three and works around the only one that can be worked around.
+- **Headset (1).** The 3.0 fix writes the mixer once per output at login.
+  The volume keys fix it although Quickshell's `volume` setter keeps the
+  channel ratio, so PipeWire's channel volumes were never uneven: the
+  dongle had not applied (or lost) the hardware mixer. The noise is most
+  likely 2.4 GHz interference (dongle in a USB 3 port, Wi-Fi on 2.4 GHz);
+  nothing in Vexyon touches the audio stream.
+- **Contacts (5).** omdrop's Contacts Only is AirDrop's mode that accepts
+  only a list of Apple IDs (email / phone) kept in Settings. No Mac needed.
+
+### What changed
+
+- **`vexyon-session.target`** (Arch: `/etc/systemd/user`, written by
+  install.sh; NixOS: `systemd.user.targets.vexyon-session`):
+  `BindsTo=graphical-session.target`, `Wants=`/`After=graphical-session-pre`,
+  like sway-session.target. **`bin/vexyon-session start`** (shared) imports
+  WAYLAND_DISPLAY/DISPLAY/XDG_CURRENT_DESKTOP/XDG_SESSION_*/
+  HYPRLAND_INSTANCE_SIGNATURE into systemd and dbus-daemon and starts the
+  target unless `graphical-session.target` is already active (uwsm…). The
+  shell runs it from `shell.qml` `Component.onCompleted` (the shell is the
+  one part that is always current: hyprland.lua is seeded once and never
+  updated on NixOS). `vexyon-start` (both, platform files) and
+  `vexyon-session stop` stop `graphical-session.target` itself on exit (EXIT
+  trap) and before a GPU in-place restart — only when
+  `vexyon-session.target` is active, i.e. this session started it.
+  Stopping only our target is not enough (found in the VM test): with
+  xdg-desktop-portal's `Requisite=` on it, `StopWhenUnneeded=` keeps
+  `graphical-session.target` up while the portal runs, bound to a dead
+  display. `vexyon-start` also exports `GTK_USE_PORTAL=1`.
+- **File manager as the system file chooser.**
+  - `modules/FileManager.qml` pick mode: `pickMode` file | files | folder |
+    save, title (translated when it is a known key), start folder, save
+    name, glob filters (chip cycles them; "All files"), banner with Cancel /
+    Open|Select|Save, overwrite needs a second Save, Esc / closing the
+    window = cancel, a folder pick shows only folders.
+  - `services/FilePicker.qml` (new singleton): validates ids, turns the IPC
+    JSON into window properties, writes the answer `{"ok":true,"paths":[…]}`
+    / `{"ok":false}` to the requester's FIFO with a bounded write
+    (`timeout 10`), and `withdrawn(id)` closes a window whose requester went
+    away.
+  - `shell.qml` IPC: `pick(id, json)`, `unpick(id)`.
+  - `bin/vexyon-pick` (new, shared): `folder|file|files|save DIR [TITLE]
+    [NAME]` (omdrop's pick.py contract: a path line, or NUL-separated paths
+    for files) or `--json OPTIONS` (raw answer). FIFO under
+    `$XDG_RUNTIME_DIR/vexyon-pick/` (0700/0600); waits in the background so
+    TERM is handled at once (`ipc unpick` + exit 1). Exit 0 chosen, 1
+    cancelled, 2 no shell.
+  - `bin/vexyon-portal` (new, shared, Python + PyGObject):
+    `org.freedesktop.impl.portal.FileChooser` (OpenFile, SaveFile,
+    SaveFiles) on `org.freedesktop.impl.portal.desktop.vexyon`; one
+    `vexyon-pick --json` per request, Request.Close answered at once with
+    response 2 and the window withdrawn; vexyon-pick exit 2 (no shell) →
+    the same call forwarded to xdg-desktop-portal-gtk; exits after 30 s
+    idle.
+  - Registration: `share/vexyon/portal/vexyon.portal` (shared;
+    `UseIn=Hyprland` as the legacy fallback), D-Bus service file per
+    platform, and the portals config FileChooser=vexyon;gtk (NixOS:
+    `xdg.portal.config.hyprland`, `mkDefault`; Arch:
+    `/etc/xdg/xdg-desktop-portal/hyprland-portals.conf` from
+    `share/vexyon/portal/hyprland-portals.conf`, only when absent or ours —
+    marker `# Vexyon:`). NixOS: the shell package is in
+    `xdg.portal.extraPortals`; `pythonEnv` gains `pygobject3`; vexyon-portal
+    wrapped with `GI_TYPELIB_PATH`; every wrapper gets
+    `--set-default VEXYON_QML_ROOT`. Arch: `python-gobject` in PKGS;
+    vexyon-portal + vexyon-pick in `/usr/local/lib/vexyon`; D-Bus service in
+    `/usr/share/dbus-1/services`; `vexyon.portal` in
+    `/usr/share/xdg-desktop-portal/portals`.
+- **AirDrop.**
+  - `bin/vexyon-airdrop` exports `OMDROP_PICKER` = vexyon-pick, so omdrop's
+    folder/file choosers are the Vexyon file manager, no portal involved.
+  - `admin_check`: pkexec path (`/run/wrappers/bin`, `/usr/bin`, PATH),
+    `missing` / `notsetuid` / `nosuid` (findmnt) / `nnp`
+    (`/proc/self/status`). `info` JSON gains
+    `admin: {pkexec, reason, escape}`. `on`, `off`, `peers`, `send` stop with
+    a plain reason for the first three; under `nnp` they re-exec themselves
+    with `systemd-run --user --pipe --wait --collect` (only variables that
+    are set are passed; `VEXYON_AIRDROP_ESCAPED` prevents a loop).
+  - Settings → AirDrop: new row "Administrator access for the radio
+    (pkexec)" and `ready` requires it; AirDrop.qml `say()` translates
+    "pkexec must be setuid root" and the new messages.
+  - Panel: the Everyone / Contacts Only chips are gone (one line while
+    Contacts Only is on); "Send to a nearby device" wraps (Spanish was cut
+    by the button). Settings rewords the explanation (Everyone is the
+    normal choice; Contacts Only is an optional Apple-ID list, no Mac).
+- **Audio** (`services/Audio.qml`): `PwNodeLinkTracker` on the default sink
+  plus a `PwObjectTracker` binding its link groups (their `state` is -1
+  until bound — found in the lab); `playing` = a link group Active; on
+  false→true `_settle(true)` re-makes the login write, at most every 20 s.
+  The login settle no longer arms the 20 s guard, so the first playback
+  right after login is nudged too.
+- I18n: all new strings in Spanish (checker: 0 missing); the old Contacts
+  Only explanation key replaced.
+
+### Verified (in this container: no KVM, no Hyprland, no Wi-Fi, no headset)
+
+- **Portal backend over D-Bus** (`dbus-run-session` + `gdbus`): OpenFile
+  single (filters and `current_filter` mapped), multiple, directory;
+  SaveFile with `current_file`; SaveFiles (names joined into the chosen
+  folder); `Request.Close` while open → the pending call answers response 2
+  at once and the picker gets TERM; idle exit after 30 s; no shell →
+  forwarded to a stand-in `org.freedesktop.impl.portal.desktop.gtk` (its
+  answer returned) or FAILED when there is none.
+- **End to end through the real xdg-desktop-portal 1.20.4** (private bus,
+  `XDG_DESKTOP_PORTAL_DIR` with `vexyon.portal` + our
+  `hyprland-portals.conf`, `XDG_CURRENT_DESKTOP=Hyprland`): its log says
+  "Using vexyon.portal for org.freedesktop.impl.portal.FileChooser
+  (config)"; a client's OpenFile opened a Vexyon file manager window in
+  the headless sway lab (real Quickshell 0.3.0), a double-click returned
+  `file://…/dog.jpg` in the Response signal; SaveFile returned
+  `…/new%20photo.png`; a client that went away closed the window and left
+  no FIFO behind. Without the config the legacy `UseIn=Hyprland` also
+  picks it. After vexyon-portal's 30 s idle exit, the next request
+  re-activates it through D-Bus and is answered.
+- **Pick window in the lab** (`vexyon-pick`): file (filter "Images" hides
+  notes.txt), save (existing name → warning, second Save replaces; a file
+  hidden by the filter is still detected), folder (only folders shown;
+  Select returns the selected folder), files (NUL-terminated output),
+  Cancel → exit 1, TERM → window closes, exit 1, FIFO removed.
+- **AirDrop *Change* folder** with a fake omdrop that calls
+  `$OMDROP_PICKER folder …` like the real one: Settings → AirDrop → Change
+  opened the pick window titled "Guardar los archivos recibidos en", the
+  chosen folder was written to config.toml and shown. The Settings page
+  shows the new pkexec row (here "pkexec was not found": the container
+  has none) and the new Contacts Only text; the panel has no chips and the
+  Spanish "Enviar a un dispositivo cercano" wraps.
+- **Audio nudge** in the lab (PipeWire 1.6.6, WirePlumber 0.5.14): link
+  group state is -1 until bound (hence the PwObjectTracker); with it, the
+  first playback → `_settle(true)` with the volumes unchanged (60/40 kept)
+  and two `change` events on the sink (the two-phase write); a second
+  playback within 20 s → nothing; one 26 s later → nudge again.
+- **NixOS**: `nix-instantiate --parse` of module.nix and package.nix;
+  `nix build .#vexyon-shell` (local nixpkgs 26.05 snapshot, omdrop-owl
+  pinned): `share/xdg-desktop-portal/portals/vexyon.portal`, the D-Bus
+  service with the store `Exec=`, vexyon-portal wrapped with
+  `GI_TYPELIB_PATH`; the built wrapper imports PyGObject and answers over
+  D-Bus. Full system evaluation and build of an ad-hoc VM test with the
+  module (`scratchpad sess/test.nix`).
+- **Arch**: `bash -n` + shellcheck (only the pre-existing SC2154 left);
+  the new install.sh section run against a fake root: fresh (all six files,
+  service `Exec=` absolute, target unit), a user's own
+  `hyprland-portals.conf` kept with the warning, an old Vexyon one
+  refreshed. `systemd-analyze --user verify` of the target: no errors.
+  `vexyon-session` against a fake systemctl: imports only the set
+  variables, starts the target only when `graphical-session.target` is not
+  already active; `stop` stops graphical-session.target only when
+  vexyon-session.target is active.
+- shellcheck clean: vexyon-pick, vexyon-airdrop, vexyon-session;
+  vexyon-start has only its pre-existing SC2155. I18n checker: 0 missing.
+- Byte-identity check between the repos: only the platform files differ.
+- **NixOS VM tests** (no KVM, `nixos-test-driver`):
+  - ad-hoc `vexyon-session-portal-nnp` (the module + the built package,
+    xdg-desktop-portal 1.20.4 with 1.21's `Requisite=`/`After=` added by a
+    drop-in), passed: hyprland-portals.conf has FileChooser=vexyon;gtk and
+    `vexyon.portal` is linked; **before**, the portal call fails with
+    "Could not activate remote peer 'org.freedesktop.portal.Desktop':
+    startup job failed" — the owner's error, reproduced; after
+    `vexyon-session start` both targets are active and the portal answers;
+    an app-style FileChooser.OpenFile through the frontend D-Bus-activates
+    vexyon-portal (its log: "vexyon-pick: the Vexyon shell is not running",
+    no gtk fallback chosen for FileChooser), and a direct call answers
+    `ua{sv} 2 0`; `vexyon-session stop` leaves vexyon-session.target,
+    graphical-session.target and the portal inactive; under
+    `setpriv --no-new-privs` a direct pkexec prints "pkexec must be setuid
+    root", `vexyon-airdrop info` reports `"reason":"nnp","escape":true`,
+    and `vexyon-airdrop off` (fake omdrop) runs with `NoNewPrivs: 0` and no
+    setuid error; without setpriv the reason is empty.
+  - `modules-gating` (the flake's test), passed (748 s).
+
+### Not verified
+
+- Nothing on the owner's hardware or a real Hyprland session: no Wi-Fi
+  card / AWDL here, no iPhone, no HS80 MAX, no NVIDIA. Whether the playback
+  nudge cures that dongle is a hypothesis built on its behaviour (the
+  volume keys fix it) — not measured.
+- The pkexec cause on the owner's machine is still unknown: none of the
+  three detectable causes was reproduced on a real session (the VM shows
+  the no_new_privs case and the escape working). If it persists, Settings →
+  AirDrop now names the cause.
+- xdg-desktop-portal 1.21+ itself was not run (our nixpkgs has 1.20.4); its
+  `Requisite=`/`After=` lines were added by hand in the VM to reproduce the
+  failure. A real browser/GTK app talking to the portal was not run (no
+  graphical session in the container); the portal path was driven with
+  busctl/gdbus/PyGObject clients instead.
+- Arch: the installer section was run against a fake root, not on an Arch
+  machine; `python-gobject` was not installed here.
+- Seen once in the VM with two TCG VMs running at once: xdg-desktop-portal
+  starts every backend it is configured for when it starts (25 s timeout)
+  and vexyon-portal (Python) missed it, so that frontend instance had no
+  FileChooser at all. Its interpreter + PyGObject start takes ~0.15 s warm
+  in this container; not measured on the owner's machine.
+- 2.4 GHz noise: advice only, nothing in Vexyon changes it.
+
 ## Session: AirDrop (new optional module "airdrop")
 
 ### Why (owner's request)

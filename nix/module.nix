@@ -338,8 +338,38 @@ in
 
     xdg.portal = {
       enable = true;
-      extraPortals = [ pkgs.xdg-desktop-portal-gtk ];
+      # vexyon: el gestor de ficheros de Vexyon como selector de ficheros de
+      # todo el sistema (bin/vexyon-portal; el .portal y su servicio D-Bus van
+      # en el paquete). gtk: Settings (color-scheme) y la reserva del selector.
+      extraPortals = [
+        pkgs.xdg-desktop-portal-gtk
+        vexyon
+      ];
       # xdg-desktop-portal-hyprland lo añade programs.hyprland.
+      # El hyprland-portals.conf de Hyprland manda FileChooser a gtk; este
+      # (en /etc/xdg, que se lee antes) lo manda a vexyon. mkDefault: una
+      # elección propia del usuario gana.
+      config.hyprland = {
+        default = lib.mkDefault [
+          "hyprland"
+          "gtk"
+        ];
+        "org.freedesktop.impl.portal.FileChooser" = lib.mkDefault [
+          "vexyon"
+          "gtk"
+        ];
+      };
+    };
+
+    # graphical-session.target: xdg-desktop-portal >= 1.21 es
+    # Requisite=graphical-session.target y Hyprland no lo arranca. La shell
+    # arranca este target al levantarse y vexyon-start lo para al salir
+    # (bin/vexyon-session), como sway-session.target.
+    systemd.user.targets.vexyon-session = {
+      description = "Vexyon session";
+      bindsTo = [ "graphical-session.target" ];
+      wants = [ "graphical-session-pre.target" ];
+      after = [ "graphical-session-pre.target" ];
     };
 
     services.udisks2.enable = true; # medios extraíbles (activado por D-Bus)

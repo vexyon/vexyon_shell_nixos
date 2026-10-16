@@ -20,7 +20,7 @@ FloatingWindow {
     // Instancia dinámica: shell.qml crea una NUEVA por cada Super+E
     // (fmFactory.createObject). Nace visible y se autodestruye al cerrarse.
     visible: true
-    title: "Vexyon Files"
+    title: fm.picking ? (fm.pickTitle !== "" ? I18n.t(fm.pickTitle) : I18n.t("Choose a file")) : "Vexyon Files"
     implicitWidth: 920
     implicitHeight: 600
     color: Theme.base
@@ -366,6 +366,14 @@ FloatingWindow {
 
     function open(entry) {
         if (entry.isDir) navigate(entry.path);
+        else if (fm.picking) {
+            // selector: abrir un fichero = elegirlo; al guardar, toma su nombre
+            if (fm.pickMode === "save") fm.pickName = entry.name;
+            else if (fm.pickMode !== "folder") {
+                if (!fm.isSelected(entry.path)) fm.setSelectionPaths([entry.path]);
+                fm.acceptPick();
+            }
+        }
         else if (fm.pickImageFor !== "") {
             // eligiendo la imagen de un icono de carpeta: abrir = usarla
             if (/\.(svg|png)$/i.test(entry.name)) fm.useImage(entry.path);
@@ -569,7 +577,7 @@ FloatingWindow {
             "find " + fm.shq(fm.cwd) + " -maxdepth 1 -mindepth 1 -printf '%y\\t%D:%i\\t%f\\n' 2>/dev/null | sort -t$'\\t' -k1,1 -k3,3f"]
         stdout: StdioCollector {
             onStreamFinished: {
-                var out = [];
+                var out = [], names = {};
                 var lines = this.text.split("\n");
                 var base = fm.cwd === "/" ? "" : fm.cwd;
                 for (var i = 0; i < lines.length; i++) {
@@ -580,12 +588,15 @@ FloatingWindow {
                     if (tab2 < 0) continue;
                     var type = l.substring(0, tab);
                     var name = l.substring(tab2 + 1);
+                    names[name] = true;
                     if (name.charAt(0) === "." && !fm.showHidden) continue; // hide dotfiles
                     var isDir = (type === "d");
+                    if (!fm.pickShows(name, isDir)) continue;            // selector: filtro / solo carpetas
                     out.push({ name: name, isDir: isDir, path: base + "/" + name,
                                id: isDir ? l.substring(tab + 1, tab2) : "" });
                 }
                 fm.entries = out;
+                fm.cwdNames = names;
                 FolderIcons.adopt(out);
             }
         }
@@ -617,7 +628,11 @@ FloatingWindow {
         // Cierre (Super+Q/killactive o botón de la ventana): Qt pone
         // visible=false — la instancia dinámica se autodestruye. destroy()
         // difiere el borrado real, así que es seguro desde este handler.
-        else fm.destroy();
+        // Cerrar un selector sin elegir = cancelar (quien espera, lo sabe).
+        else {
+            if (fm.picking && !fm.pickDone) { fm.pickDone = true; FilePicker.reply(fm.pickId, null); }
+            fm.destroy();
+        }
     }
 
     // Theme-driven, per-type Nerd Font glyphs. Monochrome glyphs tinted from the
@@ -870,6 +885,85 @@ FloatingWindow {
                     : why === "notdir" ? I18n.t("Only folders can be added to the sidebar.")
                     : I18n.t("That folder can't be added to the sidebar."), false);
         });
+    }
+
+    // ---- selector de ficheros del sistema ------------------------------------
+    //  El MISMO gestor hace de diálogo de abrir/guardar para todo el sistema:
+    //  las apps (portal xdg, servicio vexyon-portal), AirDrop y cualquier
+    //  script llegan por `vexyon-pick`, que pide una ventana con
+    //  `qs ipc call vexyon pick <id> <json>` (shell.qml) y espera la respuesta
+    //  que FilePicker.reply() le deja en su FIFO. Cerrar la ventana = cancelar.
+    property string pickMode: ""        // "" | "file" | "files" | "folder" | "save"
+    property string pickId: ""
+    property string pickTitle: ""
+    property string pickName: ""        // save: nombre propuesto
+    property var pickFilters: []        // [{ name, patterns: ["*.png", …] }]
+    property int pickFilter: -1         // índice en pickFilters; -1 = todos los ficheros
+    property bool pickDone: false
+    property bool pickArmed: false      // save: confirmar que se reemplaza
+    property var cwdNames: ({})         // todos los nombres de cwd, también los que oculta el filtro
+    readonly property bool picking: fm.pickMode !== ""
+    readonly property string pickAcceptLabel: fm.pickMode === "save" ? I18n.t("Save")
+        : fm.pickMode === "folder" ? I18n.t("Select") : I18n.t("Open")
+    onPickFilterChanged: if (fm.picking) fm.refresh()
+
+    // glob ("*.png", "*.[jJ]pg") -> RegExp, sin distinguir mayúsculas
+    function globRe(g) {
+        var r = "";
+        for (var i = 0; i < g.length; i++) {
+            var c = g.charAt(i);
+            if (c === "*") r += ".*";
+            else if (c === "?") r += ".";
+            else if (c === "[") { var j = g.indexOf("]", i); if (j > i) { r += g.substring(i, j + 1); i = j; } else r += "\\["; }
+            else r += c.replace(/[.+^${}()|\\\/]/g, "\\$&");
+        }
+        return new RegExp("^" + r + "$", "i");
+    }
+    function pickShows(name, isDir) {
+        if (!fm.picking) return true;
+        if (fm.pickMode === "folder") return isDir;
+        if (isDir || fm.pickFilter < 0 || fm.pickFilter >= fm.pickFilters.length) return true;
+        var pats = fm.pickFilters[fm.pickFilter].patterns || [];
+        if (pats.length === 0) return true;
+        for (var i = 0; i < pats.length; i++) if (fm.globRe(pats[i]).test(name)) return true;
+        return false;
+    }
+    function acceptPick() {
+        if (!fm.picking || fm.pickDone) return;
+        var out = [], i;
+        if (fm.pickMode === "folder") {
+            for (i = 0; i < fm.entries.length; i++)
+                if (fm.selection[fm.entries[i].path] && fm.entries[i].isDir) { out.push(fm.entries[i].path); break; }
+            if (out.length === 0) out.push(fm.cwd);
+        } else if (fm.pickMode === "save") {
+            var name = fm.pickName.trim();
+            if (name === "" || name.indexOf("/") !== -1) { fm.notice(I18n.t("Type a file name."), true); return; }
+            if (fm.cwdNames[name] === true && !fm.pickArmed) {
+                fm.pickArmed = true;
+                fm.notice(I18n.t("“%1” already exists. Press Save again to replace it.").arg(name), true);
+                return;
+            }
+            out.push((fm.cwd === "/" ? "" : fm.cwd) + "/" + name);
+        } else {
+            for (i = 0; i < fm.entries.length; i++)
+                if (fm.selection[fm.entries[i].path] && !fm.entries[i].isDir) out.push(fm.entries[i].path);
+            if (out.length === 0) { fm.notice(I18n.t("Select a file first."), true); return; }
+            if (fm.pickMode === "file") out = [out[0]];
+        }
+        fm.finishPick(out);
+    }
+    function finishPick(paths) {
+        if (fm.pickDone) return;
+        fm.pickDone = true;
+        FilePicker.reply(fm.pickId, paths);
+        fm.visible = false;
+    }
+    function cancelPick() { fm.finishPick(null); }
+    onPickNameChanged: fm.pickArmed = false
+    // quien pedía ya no espera (la app retiró la petición): cerrar sin responder
+    Connections {
+        target: fm.picking ? FilePicker : null
+        function onWithdrawn(id) { if (id === fm.pickId) { fm.pickDone = true; fm.visible = false; } }
     }
 
     // ---- icono de carpeta ----------------------------------------------------
@@ -1512,6 +1606,100 @@ FloatingWindow {
                     IconButton {
                         icon: fm.gridMode ? Icons.list : Icons.grid
                         onClicked: fm.gridMode = !fm.gridMode
+                    }
+                }
+            }
+
+            // ---- selector de ficheros del sistema ----
+            Rectangle {
+                visible: fm.picking
+                Layout.fillWidth: true
+                Layout.preferredHeight: pickRow.implicitHeight + 16
+                color: Qt.alpha(Theme.accent, 0.14)
+                RowLayout {
+                    id: pickRow
+                    anchors.left: parent.left; anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.leftMargin: 14
+                    anchors.rightMargin: 10
+                    spacing: 10
+                    Text {
+                        text: fm.pickMode === "save" ? Icons.download : fm.pickMode === "folder" ? Icons.folder : Icons.file
+                        color: Theme.accent; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize + 1
+                    }
+                    Text {
+                        Layout.fillWidth: fm.pickMode !== "save"
+                        Layout.maximumWidth: fm.pickMode === "save" ? 220 : -1
+                        // El título lo pone quien pide (una app, omdrop): se traduce si es
+                        // uno conocido ("Open", "Save received files to"…), si no tal cual.
+                        text: fm.pickTitle !== "" ? I18n.t(fm.pickTitle)
+                            : fm.pickMode === "save" ? I18n.t("Save as")
+                            : fm.pickMode === "folder" ? I18n.t("Choose a folder")
+                            : fm.pickMode === "files" ? I18n.t("Choose files") : I18n.t("Choose a file")
+                        color: Theme.text
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSize - 2
+                        font.bold: true
+                        elide: Text.ElideRight
+                    }
+                    // nombre al guardar
+                    Rectangle {
+                        visible: fm.pickMode === "save"
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 30
+                        radius: Theme.radius - 2
+                        color: Theme.mantle
+                        border.width: 1; border.color: pickNameIn.activeFocus ? Theme.accent : Theme.surface2
+                        TextInput {
+                            id: pickNameIn
+                            anchors.fill: parent; anchors.leftMargin: 10; anchors.rightMargin: 10
+                            verticalAlignment: TextInput.AlignVCenter
+                            clip: true
+                            text: fm.pickName
+                            onTextEdited: fm.pickName = text
+                            onAccepted: fm.acceptPick()
+                            color: Theme.text
+                            selectionColor: Theme.accent
+                            font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1
+                            Keys.onEscapePressed: fmKeys.forceActiveFocus()
+                        }
+                    }
+                    // filtro de la app (cicla; el último es "todos los ficheros")
+                    Rectangle {
+                        visible: fm.pickMode !== "folder" && fm.pickFilters.length > 0
+                        Layout.preferredHeight: 28
+                        Layout.preferredWidth: Math.min(200, pickFilterTxt.implicitWidth + 24)
+                        radius: Theme.radius
+                        color: pickFilterMa.containsMouse ? Theme.surface2 : Theme.surface1
+                        Text {
+                            id: pickFilterTxt
+                            anchors.centerIn: parent
+                            width: Math.min(implicitWidth, 176)
+                            elide: Text.ElideRight
+                            text: fm.pickFilter >= 0 && fm.pickFilter < fm.pickFilters.length
+                                  ? fm.pickFilters[fm.pickFilter].name : I18n.t("All files")
+                            color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
+                        }
+                        MouseArea {
+                            id: pickFilterMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                            onClicked: fm.pickFilter = fm.pickFilter + 1 >= fm.pickFilters.length ? -1 : fm.pickFilter + 1
+                        }
+                    }
+                    Rectangle {
+                        Layout.preferredHeight: 28
+                        Layout.preferredWidth: pickNo.implicitWidth + 24
+                        radius: Theme.radius
+                        color: pickNoMa.containsMouse ? Theme.surface2 : Theme.surface1
+                        Text { id: pickNo; anchors.centerIn: parent; text: I18n.t("Cancel"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2 }
+                        MouseArea { id: pickNoMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: fm.cancelPick() }
+                    }
+                    Rectangle {
+                        Layout.preferredHeight: 28
+                        Layout.preferredWidth: pickOk.implicitWidth + 24
+                        radius: Theme.radius
+                        color: pickOkMa.containsMouse ? Qt.lighter(Theme.accent, 1.1) : Theme.accent
+                        Text { id: pickOk; anchors.centerIn: parent; text: fm.pickAcceptLabel; color: Theme.onAccent; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2; font.bold: true }
+                        MouseArea { id: pickOkMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: fm.acceptPick() }
                     }
                 }
             }
@@ -2314,6 +2502,7 @@ FloatingWindow {
                 else if (fm.ctxOpen) fm.ctxOpen = false;
                 else if (fm.pickImageFor !== "") fm.endImagePick(true);
                 else if (fm.selCount > 0) fm.clearSelection();
+                else if (fm.picking) fm.cancelPick();
                 else fm.goUp();
                 event.accepted = true;
             } else if (event.key === Qt.Key_Delete) {
@@ -2337,6 +2526,16 @@ FloatingWindow {
             } else if (ctrl && event.key === Qt.Key_D) {
                 // Ctrl+D (Nautilus): la carpeta seleccionada —o esta— a la barra lateral
                 if (!fm.inTrash) fm.addToSidebar(fm.selCount > 0 ? fm.selectedList() : [fm.cwd]);
+                event.accepted = true;
+            } else if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && fm.picking
+                       && (fm.pickMode === "folder" || fm.pickMode === "save" || fm.selCount > 1)) {
+                // selector: Intro = aceptar (con un solo fichero, abrirlo ya lo elige)
+                var one = fm.selectedList();
+                if (fm.pickMode === "folder" && one.length === 1) {
+                    for (var k = 0; k < fm.entries.length; k++)
+                        if (fm.entries[k].path === one[0] && fm.entries[k].isDir && fm.entries[k].path !== fm.cwd) { fm.navigate(one[0]); one = null; break; }
+                }
+                if (one !== null) fm.acceptPick();
                 event.accepted = true;
             } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
                 var s = fm.selectedList();

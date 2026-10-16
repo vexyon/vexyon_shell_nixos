@@ -32,6 +32,15 @@ ShellRoot {
             else if (value !== "" && !isNaN(Number(value))) v = Number(value);
             Config.set(section, key, v);
         }
+        // El gestor de archivos como selector de ficheros del sistema: lo pide
+        // `vexyon-pick` (portal xdg, AirDrop, scripts), que espera la respuesta
+        // en su FIFO (services/FilePicker.qml).
+        function pick(id: string, options: string): void {
+            if (!FilePicker.validId(id)) return;
+            var w = fmFactory.createObject(shell, Object.assign({ pickId: id }, FilePicker.options(options)));
+            if (!w) FilePicker.reply(id, null);
+        }
+        function unpick(id: string): void { if (FilePicker.validId(id)) FilePicker.withdrawn(id); }
     }
 
     // Silence the reload popup; the bridge/hyprctl reload is expected churn.
@@ -50,8 +59,16 @@ ShellRoot {
         && Config.get("state", "userDirsInit", false) !== true
     on_UserDirsDueChanged: if (_userDirsDue) Places.initUserDirs()
 
+    // graphical-session.target, without which the desktop portal does not
+    // start (file choosers, screen sharing): bin/vexyon-session explains it.
+    readonly property string _sessionBin: {
+        var d = Quickshell.env("VEXYON_BIN_DIR");
+        return ((d && d !== "") ? d : Quickshell.env("HOME") + "/.config/vexyon/bin") + "/vexyon-session";
+    }
+
     // Force the core singletons to instantiate at startup.
     Component.onCompleted: {
+        Quickshell.execDetached(["bash", shell._sessionBin, "start"]);
         if (_userDirsDue) Places.initUserDirs();
         console.log("[Vexyon] shell loaded. active theme:", Theme.activeId);
         // Touch Wallpaper so its singleton instantiates now -> startup restore

@@ -23,8 +23,12 @@
 }:
 
 let
-  # El generador de fondos es Pillow puro; el resto de helpers son bash.
-  pythonEnv = python3.withPackages (ps: [ ps.pillow ]);
+  # El generador de fondos es Pillow puro; vexyon-portal (el selector de
+  # ficheros del portal) habla D-Bus con PyGObject; el resto son bash.
+  pythonEnv = python3.withPackages (ps: [
+    ps.pillow
+    ps.pygobject3
+  ]);
 
   # PATH horneado en los wrappers. Los helpers los invocan Hyprland (binds),
   # udev (hotplug) y Quickshell (Process), entornos donde el PATH del usuario
@@ -165,9 +169,23 @@ stdenvNoCC.mkDerivation (finalAttrs: {
         --prefix PATH : "${runtimeBin}" \
         --set-default VEXYON_SHARE "$share" \
         --set-default VEXYON_BIN_DIR "$out/bin" \
+        --set-default VEXYON_QML_ROOT "$share/qml" \
         --set-default VEXYON_GREETER_STATE_DIR "${greeterStateDir}" \
         --set VEXYON_MODULES_HELPER "$out/libexec/vexyon/vexyon-modules"
     done
+    # PyGObject necesita los typelib de GLib/Gio.
+    wrapProgram $out/bin/vexyon-portal \
+      --prefix GI_TYPELIB_PATH : "${glib.out}/lib/girepository-1.0"
+
+    # --- el gestor de ficheros como selector del sistema (portal) ----------
+    # xdg-desktop-portal arranca vexyon-portal por D-Bus cuando una app pide
+    # un fichero; el módulo lo pone en xdg.portal.extraPortals y en
+    # xdg.portal.config (FileChooser = vexyon, gtk de reserva).
+    install -Dm644 share/vexyon/portal/vexyon.portal \
+      $out/share/xdg-desktop-portal/portals/vexyon.portal
+    install -d $out/share/dbus-1/services
+    printf '[D-BUS Service]\nName=org.freedesktop.impl.portal.desktop.vexyon\nExec=%s\n' \
+      "$out/bin/vexyon-portal" > $out/share/dbus-1/services/org.freedesktop.impl.portal.desktop.vexyon.service
 
     runHook postInstall
   '';

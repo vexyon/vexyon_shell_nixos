@@ -51,7 +51,8 @@ Singleton {
 
     // ---- what Settings and the panel show about the hardware ----------------
     //  { installed, version, host, helper, wifi, driver, profile, mode,
-    //    allowUntested, doctor: { ready, missing: [{ id, say }] } | null }
+    //    allowUntested, admin: { pkexec, reason, escape },
+    //    doctor: { ready, missing: [{ id, say }] } | null }
     property var info: null
     readonly property bool infoLoading: infoProc.running
     readonly property var problems: root.info && root.info.doctor && root.info.doctor.missing
@@ -74,6 +75,17 @@ Singleton {
             return I18n.t("Your Wi-Fi network is on %1 MHz, but AirDrop can only share channel 6, 44 or 149 with it. Moving the router to one of those channels makes this work.").arg(m[1]);
         if ((m = t.match(/^(?:omdrop-discoverable: )?omdrop-owl hasn't been tested on this computer's Wi-Fi \(([^)]*)\)/)))
             return I18n.t("AirDrop has not been tested with this Wi-Fi card (%1) yet, so it stays off for it. To try it anyway: on NixOS set services.omdrop-owl.allowUntested = true and rebuild; on Arch put 1 in /etc/omdrop/allow-untested.").arg(m[1]);
+        // pkexec could not become root (vexyon-airdrop's admin_check says why).
+        if (/pkexec must be setuid root/.test(t))
+            return I18n.t("pkexec could not become administrator, so the radio cannot start. Settings → AirDrop shows why.");
+        if (/^pkexec was not found/.test(t))
+            return I18n.t("pkexec was not found. Rebuild your system (NixOS) or run the Vexyon installer again.");
+        if ((m = t.match(/^(\S+) is not setuid root/)))
+            return I18n.t("%1 is not setuid root. Rebuild your system (NixOS) or reinstall polkit.").arg(m[1]);
+        if ((m = t.match(/^(\S+) is on a file system mounted nosuid/)))
+            return I18n.t("%1 is on a file system mounted nosuid, so it cannot become administrator.").arg(m[1]);
+        if (/^This session does not allow programs to become root/.test(t))
+            return I18n.t("This session does not allow programs to become administrator (no_new_privs), so pkexec cannot run.");
         return t;
     }
 

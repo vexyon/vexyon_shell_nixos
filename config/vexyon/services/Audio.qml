@@ -98,6 +98,16 @@ Singleton {
     //     so a deliberate balance is kept. Never louder than before.
     //  Muted or at 0 it is left alone. No timer runs except the one-shot that
     //  lets the OSD ignore the echo of these writes (`settling`).
+    //
+    //  Not enough on its own (reported again with a Corsair HS80 MAX, a 2.4 GHz
+    //  USB dongle): the volume keys fix it although Quickshell's `volume`
+    //  setter keeps the channels' RATIO — so PipeWire's channel volumes were
+    //  never uneven; the dongle simply had not applied the mixer, and it can
+    //  lose it again after the write at login (headset linking up later, the
+    //  device resumed after PipeWire suspended it while idle). So the same
+    //  write is made again whenever playback STARTS on the default output
+    //  (its first link turns active: an event, nothing polled), at most once
+    //  every 20 s. The values written back are the ones read: inaudible.
     property int _settledId: -1
     property bool settling: false
     property var _settleOff: null       // phase 1 written, waiting for PipeWire to confirm it
@@ -112,7 +122,24 @@ Singleton {
         target: root.ready ? root.sink.audio : null
         function onVolumesChanged() { root._settle(); }
     }
-    function _settle() {
+    PwNodeLinkTracker { id: sinkLinks; node: root.sink }
+    // A link group's state is only kept up to date while it is bound.
+    PwObjectTracker { objects: sinkLinks.linkGroups }
+    readonly property bool playing: {
+        var gs = sinkLinks.linkGroups;
+        for (var i = 0; i < gs.length; i++) if (gs[i] && gs[i].state === PwLinkState.Active) return true;
+        return false;
+    }
+    property real _lastNudge: 0
+    onPlayingChanged: {
+        if (!root.playing || !root.ready) return;
+        var now = Date.now();
+        if (now - root._lastNudge < 20000) return;
+        root._lastNudge = now;
+        root._settle(true);
+    }
+
+    function _settle(force) {
         if (!root.ready || !root.sink.ready) return;
         var a = root.sink.audio, vs = a.volumes;
         if (root._settleFinal !== null) {
@@ -127,7 +154,7 @@ Singleton {
             if (hit) root._settleFinish();
             return;
         }
-        if (root.sink.id === root._settledId) return;
+        if (root.sink.id === root._settledId && force !== true) return;
         if (!vs || vs.length === 0) return;        // not known yet: wait for volumesChanged
         root._settledId = root.sink.id;
         var hi = 0, lo = 1;

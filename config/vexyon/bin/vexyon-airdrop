@@ -26,6 +26,9 @@
 #    vexyon-airdrop <anything else>        handed to `omdrop` unchanged
 #                                          (off, status --json, peers, send,
 #                                          dir, visibility, senders, limit…).
+#
+#  omdrop asks for folders and files through vexyon-pick (OMDROP_PICKER): the
+#  Vexyon file manager, without depending on the desktop portal.
 # ============================================================================
 set -u
 
@@ -36,6 +39,15 @@ die() { printf '%s\n' "$*" >&2; exit 1; }
 OMDROP=${VEXYON_OMDROP:-}
 [ -n "$OMDROP" ] || OMDROP=$(command -v omdrop 2>/dev/null || true)
 [ -n "$OMDROP" ] || { [ -x /usr/local/lib/vexyon/plugins/omdrop/bin/omdrop ] && OMDROP=/usr/local/lib/vexyon/plugins/omdrop/bin/omdrop; }
+
+# Folder and file choosers: the Vexyon file manager (vexyon-pick, beside this
+# script in both installs), not omdrop's pick.py through the desktop portal.
+if [ -z "${OMDROP_PICKER:-}" ]; then
+  for p in "$(dirname "$(readlink -f "$0")")/vexyon-pick" "${VEXYON_BIN_DIR:-/nonexistent}/vexyon-pick" \
+           "$(dirname "$0")/vexyon-pick"; do
+    [ -x "$p" ] && { export OMDROP_PICKER="$p"; break; }
+  done
+fi
 
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/airdrop/config.toml"
 UNIT_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/airdrop-receiver.service"
@@ -117,17 +129,74 @@ card_info() {
     "$( [ "$(head -n 1 /etc/omdrop/allow-untested 2>/dev/null | tr -d '[:space:]')" = 1 ] && echo true || echo false)"
 }
 
+# Can pkexec become root from here? omdrop runs omdrop-owl's helper through
+# it (radio on/off, the device list). "pkexec must be setuid root" means it
+# could not, and why matters:
+#   missing    no pkexec at all
+#   notsetuid  the binary lost its setuid bit
+#   nosuid     its file system is mounted nosuid
+#   nnp        this process tree has no_new_privs set, which makes the kernel
+#              ignore setuid. A transient unit of the user's systemd manager
+#              does not inherit it, so the root-needing commands go through
+#              `systemd-run --user` instead (escape below): same user, same
+#              polkit check, only a clean parent.
+ADMIN_PKEXEC="" ADMIN_REASON=""
+admin_check() {
+  local p
+  for p in /run/wrappers/bin/pkexec /usr/bin/pkexec "$(command -v pkexec 2>/dev/null)"; do
+    [ -n "$p" ] && [ -e "$p" ] && { ADMIN_PKEXEC=$p; break; }
+  done
+  if [ -z "$ADMIN_PKEXEC" ]; then ADMIN_REASON=missing
+  elif [ ! -u "$ADMIN_PKEXEC" ]; then ADMIN_REASON=notsetuid
+  elif findmnt -no OPTIONS --target "$ADMIN_PKEXEC" 2>/dev/null | tr ',' '\n' | grep -qx nosuid; then
+    ADMIN_REASON=nosuid
+  elif [ "$(awk '/^NoNewPrivs:/ {print $2}' /proc/self/status 2>/dev/null)" = 1 ]; then
+    ADMIN_REASON=nnp
+  fi
+}
+# The user's systemd manager is there to start a transient unit.
+can_escape() { command -v systemd-run >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; }
+
+admin_json() {
+  local esc=false
+  [ "$ADMIN_REASON" = nnp ] && can_escape && esc=true
+  printf '"admin":{"pkexec":%s,"reason":%s,"escape":%s}' \
+    "$(json_str "$ADMIN_PKEXEC")" "$(json_str "$ADMIN_REASON")" "$esc"
+}
+
+# Stop with the reason when pkexec cannot work at all; under no_new_privs,
+# re-run this command as a transient user unit (see admin_check).
+admin_gate() {
+  admin_check
+  case "$ADMIN_REASON" in
+    missing) die "pkexec was not found. Rebuild your system (NixOS) or run the Vexyon installer again." ;;
+    notsetuid) die "$ADMIN_PKEXEC is not setuid root. Rebuild your system (NixOS) or reinstall polkit." ;;
+    nosuid) die "$ADMIN_PKEXEC is on a file system mounted nosuid, so it cannot become root." ;;
+    nnp)
+      if [ -n "${VEXYON_AIRDROP_ESCAPED:-}" ] || ! can_escape; then
+        die "This session does not allow programs to become root (no_new_privs), so pkexec cannot run."
+      fi
+      local env=(--setenv=VEXYON_AIRDROP_ESCAPED=1) v
+      for v in PATH OMDROP_PICKER VEXYON_OMDROP WAYLAND_DISPLAY LANG VEXYON_BIN_DIR VEXYON_QML_ROOT; do
+        [ -n "${!v:-}" ] && env+=("--setenv=$v=${!v}")
+      done
+      exec systemd-run --user --quiet --collect --pipe --wait --same-dir "${env[@]}" \
+        "$(readlink -f "$0")" "$@" ;;
+  esac
+}
+
 cmd_info() {
   local doctor version
+  admin_check
   if [ -z "$OMDROP" ]; then
-    printf '{"installed":false,"host":%s,%s,"doctor":null}\n' "$(json_str "$(host_name)")" "$(card_info)"
+    printf '{"installed":false,"host":%s,%s,%s,"doctor":null}\n' "$(json_str "$(host_name)")" "$(card_info)" "$(admin_json)"
     return 0
   fi
   version=$("$OMDROP" version 2>/dev/null | awk '{print $2; exit}')
   doctor=$(timeout 15 "$OMDROP" doctor --json 2>/dev/null)
   [ -n "$doctor" ] || doctor=null
-  printf '{"installed":true,"version":%s,"host":%s,%s,"doctor":%s}\n' \
-    "$(json_str "$version")" "$(json_str "$(host_name)")" "$(card_info)" "$doctor"
+  printf '{"installed":true,"version":%s,"host":%s,%s,%s,"doctor":%s}\n' \
+    "$(json_str "$version")" "$(json_str "$(host_name)")" "$(card_info)" "$(admin_json)" "$doctor"
 }
 
 cmd_on() {
@@ -137,6 +206,7 @@ cmd_on() {
     *[!0-9]*|"") die "vexyon-airdrop on: minutes, or forever" ;;
   esac
   [ -n "$OMDROP" ] || die "AirDrop is not installed. Run the Vexyon installer again (on NixOS: rebuild your system)."
+  admin_gate on "$dur"
   prepare || die "AirDrop could not be prepared; the reason is above."
   exec "$OMDROP" on "$dur"
 }
@@ -150,5 +220,7 @@ case "${1:-}" in
   "") die "usage: vexyon-airdrop on [MINUTES|forever] | info | <omdrop command>" ;;
   *)
     [ -n "$OMDROP" ] || die "AirDrop is not installed. Run the Vexyon installer again (on NixOS: rebuild your system)."
+    # The commands that reach omdrop-owl's root helper through pkexec.
+    case "$1" in off|peers|send) admin_gate "$@" ;; esac
     exec "$OMDROP" "$@" ;;
 esac

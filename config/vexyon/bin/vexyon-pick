@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  vexyon-pick — ask the Vexyon file manager for files, a folder or where to
+#  save. The same file ships in both repos.
+#
+#    vexyon-pick folder|file|files|save START_DIR [TITLE] [NAME]
+#        folder, file, save: the chosen path on one line
+#        files:              each chosen path followed by a NUL
+#    vexyon-pick --json OPTIONS     the shell's answer as JSON, for
+#                                   vexyon-portal: {"ok":true,"paths":[…]}
+#                                   OPTIONS: {"mode","dir","title","name",
+#                                   "filters":[{"name","patterns":[…]}],"filter"}
+#  Exit: 0 chosen, 1 cancelled, 2 no Vexyon shell to ask.
+#
+#  The first form is the contract of omdrop's file chooser (pick.py), so
+#  AirDrop uses it through OMDROP_PICKER. How the answer comes back:
+#  services/FilePicker.qml. Nothing stays running: this script waits on its
+#  own FIFO and is gone once the window closes.
+# ============================================================================
+set -u
+
+die() { printf 'vexyon-pick: %s\n' "$*" >&2; exit 2; }
+
+RT=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+QML=${VEXYON_QML_ROOT:-$HOME/.config/vexyon}
+raw=0
+if [ "${1:-}" = --json ]; then
+  raw=1
+  json=${2:-"{}"}
+  mode=$(printf '%s' "$json" | jq -r '.mode // "file"' 2>/dev/null) || die "bad options"
+else
+  mode=${1:-}
+  case "$mode" in folder|file|files|save) ;; *) die "usage: vexyon-pick folder|file|files|save START_DIR [TITLE] [NAME]" ;; esac
+  json=$(jq -cn --arg mode "$mode" --arg dir "${2:-$HOME}" --arg title "${3:-}" --arg name "${4:-}" \
+    '{mode: $mode, dir: $dir, title: $title, name: $name}') || die "jq is missing"
+fi
+
+dir="$RT/vexyon-pick"
+{ [ -d "$dir" ] || mkdir -m 700 "$dir"; } || die "cannot create $dir"
+id="p$$-$(date +%s%N)"
+fifo="$dir/$id"
+out="$dir/$id.ans"
+ipc() { qs -p "$QML/shell.qml" ipc call vexyon "$@" >/dev/null 2>&1; }
+mkfifo -m 600 "$fifo" || die "cannot create $fifo"
+waiter=""
+trap 'rm -f "$fifo" "$out"' EXIT
+# Stopped while waiting (the portal's Close: the app withdrew its request):
+# the window closes without answering.
+trap '[ -n "$waiter" ] && kill "$waiter" 2>/dev/null; ipc unpick "$id"; exit 1' TERM INT HUP
+
+ipc pick "$id" "$json" || die "the Vexyon shell is not running"
+
+# The window answers when it closes. A dialog may stay open as long as the
+# person likes; six hours bounds a shell that died meanwhile. Waiting in the
+# background keeps the traps above immediate (`wait` returns on a signal).
+timeout 6h cat "$fifo" > "$out" &
+waiter=$!
+wait "$waiter" || exit 1
+waiter=""
+ans=$(cat "$out")
+[ "$raw" = 1 ] && { printf '%s\n' "$ans"; [ "$(printf '%s' "$ans" | jq -r '.ok')" = true ] && exit 0; exit 1; }
+[ "$(printf '%s' "$ans" | jq -r '.ok' 2>/dev/null)" = true ] || exit 1
+if [ "$mode" = files ]; then
+  printf '%s' "$ans" | jq -j '.paths[] | ., "\u0000"'
+else
+  printf '%s' "$ans" | jq -r '.paths[0]'
+fi

@@ -1478,7 +1478,7 @@ Singleton {
             "Bluetooth — wakes an iPhone's AirDrop when you send to it": "Bluetooth — despierta el AirDrop de un iPhone cuando le envías algo",
             "The Bluetooth module is off: receiving works the same, but sending to an iPhone may need its share sheet open.": "El módulo Bluetooth está apagado: recibir funciona igual, pero para enviar a un iPhone puede que haga falta tener abierto su menú de compartir.",
             "WHO CAN SEND YOU FILES": "QUIÉN PUEDE ENVIARTE ARCHIVOS",
-            "Contacts Only accepts files only from the people below (the email or phone number of their Apple ID); anyone else is refused before anything is received. Apple devices that are not on the list do not see this computer either.": "Solo contactos acepta archivos solo de las personas de abajo (el correo o el teléfono de su ID de Apple); a cualquier otra se le rechaza antes de recibir nada. Los dispositivos Apple que no están en la lista tampoco ven este ordenador.",
+            "Everyone is the normal choice: any iPhone, iPad or Mac nearby can see this computer and send it files. Contacts Only is optional and needs no Mac or Contacts app: it is a list you keep here of the Apple ID emails or phone numbers allowed to send to you. Anyone else is refused before anything is received, and their devices do not see this computer.": "Todos es lo normal: cualquier iPhone, iPad o Mac cercano ve este ordenador y puede enviarle archivos. Solo contactos es opcional y no necesita un Mac ni la app Contactos: es una lista que llevas aquí con los correos o teléfonos de ID de Apple que pueden enviarte archivos. A cualquier otra persona se la rechaza antes de recibir nada, y sus dispositivos no ven este ordenador.",
             "Add a contact: email or phone number, then Enter": "Añadir un contacto: correo o teléfono, y Intro",
             "RECEIVED FILES": "ARCHIVOS RECIBIDOS",
             "Each received file is also copied to the clipboard and announced in the notification center; click the notification to open it.": "Cada archivo recibido se copia también al portapapeles y se anuncia en el centro de notificaciones; pulsa la notificación para abrirlo.",
@@ -1487,7 +1487,23 @@ Singleton {
             "This computer has no Wi-Fi card AirDrop can use.": "Este ordenador no tiene ninguna tarjeta Wi-Fi que AirDrop pueda usar.",
             "Connect to Wi-Fi first: with this Wi-Fi card, AirDrop shares the channel of your Wi-Fi network.": "Conéctate primero a la Wi-Fi: con esta tarjeta, AirDrop comparte el canal de tu red Wi-Fi.",
             "Your Wi-Fi network is on %1 MHz, but AirDrop can only share channel 6, 44 or 149 with it. Moving the router to one of those channels makes this work.": "Tu red Wi-Fi está en %1 MHz, pero AirDrop solo puede compartir con ella el canal 6, 44 o 149. Si pasas el router a uno de esos canales, funcionará.",
-            "AirDrop has not been tested with this Wi-Fi card (%1) yet, so it stays off for it. To try it anyway: on NixOS set services.omdrop-owl.allowUntested = true and rebuild; on Arch put 1 in /etc/omdrop/allow-untested.": "AirDrop aún no se ha probado con esta tarjeta Wi-Fi (%1), así que sigue desactivado para ella. Para probarlo igualmente: en NixOS pon services.omdrop-owl.allowUntested = true y reconstruye; en Arch escribe 1 en /etc/omdrop/allow-untested."
+            "AirDrop has not been tested with this Wi-Fi card (%1) yet, so it stays off for it. To try it anyway: on NixOS set services.omdrop-owl.allowUntested = true and rebuild; on Arch put 1 in /etc/omdrop/allow-untested.": "AirDrop aún no se ha probado con esta tarjeta Wi-Fi (%1), así que sigue desactivado para ella. Para probarlo igualmente: en NixOS pon services.omdrop-owl.allowUntested = true y reconstruye; en Arch escribe 1 en /etc/omdrop/allow-untested.",
+            // Selector de ficheros del sistema; AirDrop: pkexec, quién puede enviar
+            "Type a file name.": "Escribe un nombre de fichero.",
+            "“%1” already exists. Press Save again to replace it.": "«%1» ya existe. Pulsa Guardar otra vez para reemplazarlo.",
+            "Select a file first.": "Selecciona primero un fichero.",
+            "Select": "Seleccionar",
+            "Save received files to": "Guardar los archivos recibidos en",
+            "Save as": "Guardar como",
+            "Choose files": "Elegir ficheros",
+            "pkexec could not become administrator, so the radio cannot start. Settings → AirDrop shows why.": "pkexec no ha podido obtener permisos de administrador, así que la radio no puede arrancar. Ajustes → AirDrop muestra por qué.",
+            "pkexec was not found. Rebuild your system (NixOS) or run the Vexyon installer again.": "No se encuentra pkexec. Reconstruye el sistema (NixOS) o vuelve a ejecutar el instalador de Vexyon.",
+            "%1 is not setuid root. Rebuild your system (NixOS) or reinstall polkit.": "%1 no es setuid root. Reconstruye el sistema (NixOS) o reinstala polkit.",
+            "%1 is on a file system mounted nosuid, so it cannot become administrator.": "%1 está en un sistema de ficheros montado con nosuid, así que no puede obtener permisos de administrador.",
+            "This session does not allow programs to become administrator (no_new_privs), so pkexec cannot run.": "Esta sesión no permite que los programas obtengan permisos de administrador (no_new_privs), así que pkexec no puede funcionar.",
+            "This session does not allow setuid programs (no_new_privs), so Vexyon starts the radio through systemd instead.": "Esta sesión no permite programas setuid (no_new_privs), así que Vexyon arranca la radio a través de systemd.",
+            "Administrator access for the radio (pkexec)": "Acceso de administrador para la radio (pkexec)",
+            "Only the people on your AirDrop list can send you files (Settings → AirDrop).": "Solo las personas de tu lista de AirDrop pueden enviarte archivos (Ajustes → AirDrop)."
         }
     })
 }

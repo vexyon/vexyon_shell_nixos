@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""vexyon-portal: the Vexyon file manager as the system's file chooser.
+
+An xdg-desktop-portal backend (org.freedesktop.impl.portal.FileChooser,
+bus name org.freedesktop.impl.portal.desktop.vexyon). When an app asks the
+desktop portal for a file (a browser's "Upload", "Save as", a GTK or Qt app
+using portals), xdg-desktop-portal starts this through D-Bus and calls
+OpenFile / SaveFile / SaveFiles; each call runs `vexyon-pick --json`, which
+opens a Vexyon file manager window in pick mode and returns what was chosen.
+No request in flight for 30 s: it exits, and D-Bus starts it again next time.
+With no Vexyon shell to ask, the request goes to xdg-desktop-portal-gtk.
+
+The same file ships in both repos. Installed with vexyon.portal (which
+interfaces it serves) and a D-Bus service file; Vexyon's portal configuration
+puts it first for FileChooser, with xdg-desktop-portal-gtk as the fallback.
+"""
+import json
+import os
+import shutil
+import sys
+from urllib.parse import quote
+
+import gi
+
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+BUS_NAME = "org.freedesktop.impl.portal.desktop.vexyon"
+IFACE_NAME = "org.freedesktop.impl.portal.FileChooser"
+FALLBACK = "org.freedesktop.impl.portal.desktop.gtk"
+OBJ_PATH = "/org/freedesktop/portal/desktop"
+IDLE_EXIT_S = 30
+
+IFACE = """
+<node>
+  <interface name="org.freedesktop.impl.portal.FileChooser">
+    <method name="OpenFile">
+      <arg type="o" name="handle" direction="in"/>
+      <arg type="s" name="app_id" direction="in"/>
+      <arg type="s" name="parent_window" direction="in"/>
+      <arg type="s" name="title" direction="in"/>
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="u" name="response" direction="out"/>
+      <arg type="a{sv}" name="results" direction="out"/>
+    </method>
+    <method name="SaveFile">
+      <arg type="o" name="handle" direction="in"/>
+      <arg type="s" name="app_id" direction="in"/>
+      <arg type="s" name="parent_window" direction="in"/>
+      <arg type="s" name="title" direction="in"/>
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="u" name="response" direction="out"/>
+      <arg type="a{sv}" name="results" direction="out"/>
+    </method>
+    <method name="SaveFiles">
+      <arg type="o" name="handle" direction="in"/>
+      <arg type="s" name="app_id" direction="in"/>
+      <arg type="s" name="parent_window" direction="in"/>
+      <arg type="s" name="title" direction="in"/>
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="u" name="response" direction="out"/>
+      <arg type="a{sv}" name="results" direction="out"/>
+    </method>
+  </interface>
+</node>
+"""
+REQUEST_IFACE = """
+<node>
+  <interface name="org.freedesktop.impl.portal.Request">
+    <method name="Close"/>
+  </interface>
+</node>
+"""
+
+# Portal responses
+OK, CANCELLED, FAILED = 0, 1, 2
+
+
+def find_pick():
+    """vexyon-pick: beside this file (both installs), else on PATH."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    for cand in (os.path.join(here, "vexyon-pick"),
+                 os.path.join(os.environ.get("VEXYON_BIN_DIR", ""), "vexyon-pick"),
+                 shutil.which("vexyon-pick") or "",
+                 os.path.expanduser("~/.config/vexyon/bin/vexyon-pick")):
+        if cand and os.path.isfile(cand):
+            return cand
+    return None
+
+
+def path_bytes(v):
+    """An `ay` option (NUL-terminated path) as str, or None."""
+    if v is None:
+        return None
+    b = bytes(v) if not isinstance(v, (bytes, bytearray)) else bytes(v)
+    b = b.rstrip(b"\0")
+    return os.fsdecode(b) if b else None
+
+
+def export(conn, path, info, method_call):
+    """Register an object; register_object_with_closures2 (GLib >= 2.84)
+    when present, which PyGObject no longer flags as deprecated."""
+    reg = getattr(conn, "register_object_with_closures2", None)
+    if reg is not None:
+        return reg(path, info, method_call, None, None)
+    return conn.register_object(path, info, method_call, None, None)
+
+
+def to_uri(p):
+    return "file://" + quote(p)
+
+
+def filters_of(opts):
+    """a(sa(us)) -> [{name, patterns}] with the glob patterns (type 0).
+    Mime-type entries (type 1) carry no glob; such a filter shows everything."""
+    out = []
+    for name, rules in opts.get("filters", []) or []:
+        out.append({"name": name, "patterns": [pat for kind, pat in rules if kind == 0]})
+    return out
+
+
+class Portal:
+    def __init__(self):
+        self.pick = find_pick()
+        self.active = {}           # handle -> {proc, invocation, reg, fwd}
+        self.loop = GLib.MainLoop()
+        self.conn = None
+        self.idle_id = 0
+        self.req_info = Gio.DBusNodeInfo.new_for_xml(REQUEST_IFACE).interfaces[0]
+
+    # ---- lifetime: exit when nothing has been asked for a while ------------
+    def arm_idle(self):
+        if self.idle_id:
+            GLib.source_remove(self.idle_id)
+        self.idle_id = GLib.timeout_add_seconds(IDLE_EXIT_S, self.idle_check)
+
+    def idle_check(self):
+        self.idle_id = 0
+        if not self.active:
+            self.loop.quit()
+            return GLib.SOURCE_REMOVE
+        self.arm_idle()
+        return GLib.SOURCE_REMOVE
+
+    # ---- D-Bus ---------------------------------------------------------------
+    def on_bus(self, conn, _name):
+        self.conn = conn
+        info = Gio.DBusNodeInfo.new_for_xml(IFACE).interfaces[0]
+        export(conn, OBJ_PATH, info, self.on_call)
+
+    def on_call(self, conn, _sender, _path, _iface, method, params, invocation):
+        handle, app_id, _parent, title, opts = params.unpack()
+        req = {"title": title or ""}
+        if method == "OpenFile":
+            if opts.get("directory"):
+                req["mode"] = "folder"
+            else:
+                req["mode"] = "files" if opts.get("multiple") else "file"
+            folder = path_bytes(opts.get("current_folder"))
+        elif method == "SaveFile":
+            req["mode"] = "save"
+            current = path_bytes(opts.get("current_file"))
+            folder = path_bytes(opts.get("current_folder"))
+            name = opts.get("current_name") or ""
+            if current:
+                folder, name = os.path.dirname(current), os.path.basename(current)
+            req["name"] = name
+        else:  # SaveFiles: a folder; the app's file names go into it
+            req["mode"] = "folder"
+            folder = path_bytes(opts.get("current_folder"))
+        req["dir"] = folder if folder and os.path.isdir(folder) else os.path.expanduser("~")
+        flt = filters_of(opts)
+        if flt and req["mode"] != "folder":
+            req["filters"] = flt
+            cur = opts.get("current_filter")
+            req["filter"] = next((i for i, f in enumerate(flt) if cur and f["name"] == cur[0]), 0)
+
+        state = {"proc": None, "invocation": invocation, "reg": 0, "fwd": False}
+        self.active[handle] = state
+        state["reg"] = export(conn, handle, self.req_info, self.on_close_call(handle))
+        try:
+            if not self.pick:
+                raise GLib.Error("vexyon-pick not found")
+            proc = Gio.Subprocess.new([self.pick, "--json", json.dumps(req)],
+                                      Gio.SubprocessFlags.STDOUT_PIPE)
+        except GLib.Error:
+            self.forward(handle, method, params)
+            return
+        state["proc"] = proc
+
+        def done(p, res):
+            try:
+                _ok, out, _err = p.communicate_utf8_finish(res)
+            except GLib.Error:
+                out = ""
+            if handle not in self.active:
+                return                      # already answered by Close
+            if p.get_if_exited() and p.get_exit_status() == 2:
+                self.forward(handle, method, params)   # no Vexyon shell to ask
+                return
+            self.finish(handle)
+            try:
+                ans = json.loads(out or "{}")
+            except ValueError:
+                ans = {}
+            if not ans.get("ok"):
+                invocation.return_value(GLib.Variant("(ua{sv})", (CANCELLED, {})))
+                return
+            paths = [p for p in ans.get("paths", []) if isinstance(p, str)]
+            if method == "SaveFiles" and paths:
+                names = [os.path.basename(path_bytes(f) or "") for f in opts.get("files", [])]
+                paths = [os.path.join(paths[0], n) for n in names if n]
+            results = {"uris": GLib.Variant("as", [to_uri(p) for p in paths])}
+            invocation.return_value(GLib.Variant("(ua{sv})", (OK, results)))
+
+        proc.communicate_utf8_async(None, None, done)
+
+    def forward(self, handle, method, params):
+        """No Vexyon shell to ask (not running, restarting) or no vexyon-pick:
+        hand the same request to xdg-desktop-portal-gtk, so a dialog still
+        opens instead of the app getting nothing."""
+        state = self.active[handle]
+        state["fwd"] = True
+
+        def got(conn, res):
+            try:
+                reply = conn.call_finish(res)
+            except GLib.Error:
+                reply = GLib.Variant("(ua{sv})", (FAILED, {}))
+            if self.finish(handle) is not None:
+                state["invocation"].return_value(reply)
+
+        self.conn.call(FALLBACK, OBJ_PATH, IFACE_NAME, method, params,
+                       GLib.VariantType.new("(ua{sv})"), Gio.DBusCallFlags.NONE,
+                       GLib.MAXINT32, None, got)
+
+    def finish(self, handle):
+        """Forget a request (unexport its Request object); None if it was gone."""
+        state = self.active.pop(handle, None)
+        if state is None:
+            return None
+        if state["reg"]:
+            self.conn.unregister_object(state["reg"])
+        self.arm_idle()
+        return state
+
+    def on_close_call(self, handle):
+        # The app withdrew the request: stop vexyon-pick (its window closes)
+        # and answer the pending call at once, like xdg-desktop-portal-gtk.
+        def close(_conn, _sender, _path, _iface, _method, _params, invocation):
+            state = self.finish(handle)
+            invocation.return_value(None)
+            if not state:
+                return
+            if state["fwd"]:
+                self.conn.call(FALLBACK, handle, "org.freedesktop.impl.portal.Request", "Close",
+                               None, None, Gio.DBusCallFlags.NONE, -1, None, None)
+            elif state["proc"]:
+                state["proc"].send_signal(15)
+            state["invocation"].return_value(GLib.Variant("(ua{sv})", (2, {})))
+        return close
+
+    def run(self):
+        Gio.bus_own_name(Gio.BusType.SESSION, BUS_NAME, Gio.BusNameOwnerFlags.NONE,
+                         self.on_bus, None, lambda *_: self.loop.quit())
+        self.arm_idle()
+        self.loop.run()
+
+
+if __name__ == "__main__":
+    Portal().run()
+    sys.exit(0)

@@ -8,6 +8,10 @@
 export XDG_CURRENT_DESKTOP=Hyprland
 export XDG_SESSION_TYPE=wayland
 export XDG_SESSION_DESKTOP=Hyprland
+# File choosers through the desktop portal, which Vexyon points at its own
+# file manager (bin/vexyon-portal): GTK 3 apps and Firefox use the portal's
+# chooser only when asked to (Chromium-based browsers already do).
+export GTK_USE_PORTAL=1
 # Make sure a runtime dir exists for a launch outside a DM (bare TTY).
 [ -z "${XDG_RUNTIME_DIR:-}" ] && export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 
@@ -36,6 +40,17 @@ fi
 # wait() on Hyprland the whole time.
 FLAG="$XDG_RUNTIME_DIR/vexyon-gpu-restart"
 rm -f "$FLAG"
+# graphical-session.target: the shell starts vexyon-session.target once it is
+# up (bin/vexyon-session, needed by xdg-desktop-portal >= 1.21); it ends with
+# the compositor, at logout and before a GPU restart, so the portals and
+# whatever else is bound to it never outlive the Wayland display they use.
+# Stopped by name and only when this session started it (`vexyon-session
+# stop` explains why).
+session_end() {
+    systemctl --user is-active --quiet vexyon-session.target 2>/dev/null &&
+        systemctl --user stop --no-block graphical-session.target vexyon-session.target >/dev/null 2>&1
+}
+trap session_end EXIT
 while :; do
     rc=0
     # Hyprland >= 0.51 ships the start-hyprland watchdog wrapper and warns
@@ -50,4 +65,5 @@ while :; do
     fi
     [ -e "$FLAG" ] || exit "$rc"
     rm -f "$FLAG"
+    session_end
 done

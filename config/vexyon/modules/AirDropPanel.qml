@@ -172,23 +172,15 @@ AnchoredPanel {
                 }
             }
 
-            // ---- para quién ----
-            RowLayout {
+            // ---- para quién: se elige en Ajustes → AirDrop (Todos es lo normal;
+            // Solo contactos es una lista opcional de Apple IDs) ----
+            Text {
                 Layout.fillWidth: true
-                visible: AirDrop.installed
+                visible: AirDrop.installed && AirDrop.visibility === "contacts" && AirDrop.senders > 0
+                text: Icons.users + "  " + I18n.t("Only the people on your AirDrop list can send you files (Settings → AirDrop).")
+                color: Theme.subtext0; wrapMode: Text.WordWrap
                 opacity: body.introContent
-                spacing: 6
-                Chip {
-                    label: I18n.t("Everyone")
-                    on: AirDrop.visibility === "everyone"
-                    onClicked: if (!on) AirDrop.setVisibility("everyone")
-                }
-                Chip {
-                    label: Icons.users + "  " + I18n.t("Contacts Only")
-                    on: AirDrop.visibility === "contacts"
-                    onClicked: if (!on) AirDrop.setVisibility("contacts")
-                }
-                Item { Layout.fillWidth: true }
+                font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
             }
             Text {
                 Layout.fillWidth: true
@@ -224,6 +216,7 @@ AnchoredPanel {
                     Layout.fillWidth: true
                     text: I18n.t("Send to a nearby device")
                     color: Theme.text
+                    wrapMode: Text.WordWrap      // en español no cabe en una línea junto al botón
                     font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1
                     font.bold: true
                 }
