@@ -10,6 +10,13 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
 
 ### Fixed
 
+- **Screenshots showed the selector.** The saved image could carry the
+  corner handles, the border and the accent tint of the selection: the
+  overlay was unmapped right before grim ran and Hyprland's layer fade was
+  still drawing it. Now, on Space, the overlay hides everything it draws
+  while staying on screen (fully transparent), waits for that empty frame to
+  be shown, captures, and only then closes. The selection looks the same
+  while dragging. Region recordings start the same clean way.
 - **VMs: the dedicated-GPU button did nothing.** It only moved the
   viewer window to the dGPU, and the VMs the manager creates draw no 3D, so
   nothing changed — and in dGPU-only (MUX) mode it was not even shown. It is

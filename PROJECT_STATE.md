@@ -20,6 +20,61 @@ VEXYON OUT-OF-THE-BOX POLICY Every Vexyon feature must ship together with all re
 
 PERMANENT POLICY: If Vexyon's installation changes, its GitHub README.md MUST be updated in the same development task. No exceptions.
 
+## Session: clean screenshots (no handles, border or tint in the saved image)
+
+### Why (owner's report)
+
+After dragging a region and pressing Space, the saved screenshot showed the
+four corner handles, a bit of the border and the accent-coloured wash of the
+selection. The look while dragging is wanted; the saved image must be the
+bare region.
+
+### Cause
+
+`ScreenshotOverlay.capture()` unmapped the overlay (`Panels.close`) and ran
+`vexyon-screenshot grab`, which slept 0.06 s and ran grim. Hyprland animates
+layer surfaces (`hl.animation({ leaf = "layers", ..., style = "fade" })` in
+the hyprland seed), so an unmapped layer keeps being drawn while it fades —
+grim copied the fading frame, tint, border and handles included.
+
+### What changed (shared files, byte-identical in both repos)
+
+- `modules/ScreenshotOverlay.qml`: new `capturing` state. Space/Enter hides
+  every visual (dim, frame, handles, tint, size pill, hint bar) while the
+  surface stays mapped and fully transparent; a one-shot 120 ms `settle`
+  Timer lets that empty frame reach the screen; then `vexyon-screenshot grab`
+  runs as a `Process` and the overlay closes only when it exits (so the fade
+  that follows animates an empty surface). A one-shot 5 s guard closes it if
+  the grab hangs, so an invisible overlay can never keep the keyboard.
+  Input, Esc and a second Space are ignored while capturing. Record mode
+  (region recording) does the same: hide, settle, then `regionPicked` and
+  close, so the first frames of the recording are clean too. The selection
+  look while dragging is unchanged.
+- `bin/vexyon-screenshot`: `grab` no longer sleeps (the overlay already
+  waited and is transparent); comment updated.
+- No Hyprland rule, no new package, no installation change (README not
+  affected). Both timers are one-shot and only run after Space/Enter; nothing
+  resident.
+
+### Verified
+
+- `bash -n` and `shellcheck` on `vexyon-screenshot`.
+- Lab (headless sway, pixman, Quickshell 0.3.0, grey background): overlay
+  opened on a preselected 400×250 box (tint, border, handles, size pill and
+  hints visible as before), Space pressed with wtype. The saved PNG is
+  pixel-identical to a grim of the same region without the overlay (no
+  accent pixel at all); a full-screen grab 60 ms after Space (overlay still
+  mapped) shows nothing of it; after the grab the overlay is closed. Ran
+  twice in a row: the second open shows the selector normally again.
+- Sync check: the only DIFF lines are the platform-specific files.
+
+### Not verified
+
+- On Hyprland itself (the lab compositor has no layer fade, so the old bug
+  does not reproduce there; the new flow keeps the overlay mapped and
+  transparent during grim, which is what the lab measured).
+- Region recording through the new path (code path reviewed, not run).
+
 ## Session: VM 3D on the GPU, one-sided sound at login, user folders in the shell's language, recorder (system + mic, window, size, fps), Super+R
 
 ### Why (owner's report, NixOS on a Lenovo Legion: Intel iGPU + RTX 5070, supergfxctl Hybrid and dGPU-only)

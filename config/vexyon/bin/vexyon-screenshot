@@ -37,11 +37,11 @@ mode="${1:-region}"
 geom=""
 case "$mode" in
     grab)
-        # Geometry picked by the themed QML overlay. It has already unmapped its
-        # surface; give the compositor a frame to drop it before grim captures.
+        # Geometry picked by the themed QML overlay. It has already hidden all
+        # it draws and waited for that empty frame to be on screen, and it stays
+        # mapped (fully transparent) until we exit, so grim gets a clean region.
         geom="${2:-}"
-        [ -z "$geom" ] && exit 0
-        sleep 0.06 ;;
+        [ -z "$geom" ] && exit 0 ;;
     last)
         [ -f "$STATE" ] && geom="$(cat "$STATE")"
         if [ -z "$geom" ]; then open_overlay; fi ;;

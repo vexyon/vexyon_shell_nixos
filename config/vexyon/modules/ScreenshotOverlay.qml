@@ -13,9 +13,12 @@ import qs.services
 //  size readout — consistent with the rest of the shell, not a bare crosshair.
 //
 //  The actual grab/save/copy/notify is delegated to `vexyon-screenshot grab`
-//  (single source of truth for the file logic); we only unmap ourselves first
-//  so grim never captures the overlay, and pass it the chosen geometry in grim
-//  global coordinates (local + focused-monitor offset). The bash side persists
+//  (single source of truth for the file logic). On capture we first hide every
+//  visual (dim, frame, handles, tint, hints) while staying mapped, wait for that
+//  empty frame to reach the screen, run the grab and only then unmap: unmapping
+//  first left Hyprland's layer fade drawing the frame into the shot. We pass
+//  the chosen geometry in grim global coordinates (local + focused-monitor
+//  offset). The bash side persists
 //  the box to ~/.cache/vexyon/last-crop, which we read back on open so repeated
 //  shots default to the same region until the user drags a new one.
 // ============================================================================
@@ -27,7 +30,12 @@ PanelWindow {
     // grabbing a still; Recorder (only alive with recording enabled) starts.
     readonly property bool recMode: Panels.recordRegion === true
     readonly property bool shown: Panels.screenshot === true || win.recMode
-    function cancel() { Panels.close("screenshot"); Panels.close("recordRegion"); }
+    function cancel() { if (!win.capturing) { Panels.close("screenshot"); Panels.close("recordRegion"); } }
+
+    // true from Space/Enter until the grab is done: everything drawn is hidden
+    // so the surface is fully transparent while grim (or wf-recorder) starts
+    property bool capturing: false
+    property string pendingGeom: ""
 
     // focused Hyprland monitor drives which screen we cover + the global offset
     readonly property var mon: Hyprland.focusedMonitor
@@ -105,6 +113,7 @@ PanelWindow {
 
     onShownChanged: {
         if (shown) {
+            win.capturing = false;
             win.dragging = false; win.moving = false;
             win.hasSel = false;
             win.selX = win.selY = win.selW = win.selH = 0;
@@ -114,27 +123,54 @@ PanelWindow {
     }
 
     function capture() {
-        if (!win.validSel) return;
+        if (!win.validSel || win.capturing) return;
         var gx = Math.round(win.selX + win.offX);
         var gy = Math.round(win.selY + win.offY);
         var gw = Math.round(win.selW);
         var gh = Math.round(win.selH);
-        var geom = gx + "," + gy + " " + gw + "x" + gh;
-        if (win.recMode) {                   // unmap first, then hand it over
-            Panels.close("recordRegion");
-            Panels.regionPicked(geom);
-            return;
+        win.pendingGeom = gx + "," + gy + " " + gw + "x" + gh;
+        win.dragging = false; win.moving = false;
+        win.capturing = true;                // hide everything, stay mapped
+        settle.restart();
+    }
+
+    // The empty frame needs a couple of compositor frames to be on screen
+    // before grim copies it (one-shot, only after Space/Enter).
+    Timer {
+        id: settle
+        interval: 120
+        onTriggered: {
+            if (win.recMode) {               // clean screen first, then hand it over
+                Panels.regionPicked(win.pendingGeom);
+                Panels.close("recordRegion");
+                win.capturing = false;
+                return;
+            }
+            grabProc.running = true;
+            captureGuard.restart();
         }
-        Panels.close("screenshot");          // unmap first so grim skips us
-        // El PATH de qs puede no llevar ~/.local/bin (p.ej. lanzado por
-        // Hyprland con PATH pelado): resolver el script con fallbacks en vez
-        // de fallar en silencio tras habernos desmapeado. geom = solo
-        // "X,Y WxH" (dígitos/coma/espacio/x), seguro entre comillas simples.
-        var home = Quickshell.env("HOME");
-        Quickshell.execDetached(["bash", "-c",
-            "s=$(command -v vexyon-screenshot) || s=" + home + "/.local/bin/vexyon-screenshot; " +
-            "[ -x \"$s\" ] || s=" + home + "/.config/vexyon/bin/vexyon-screenshot; " +
-            "exec \"$s\" grab '" + geom + "'"]);
+    }
+    // El PATH de qs puede no llevar ~/.local/bin (p.ej. lanzado por Hyprland
+    // con PATH pelado): resolver el script con fallbacks. geom = solo
+    // "X,Y WxH" (dígitos/coma/espacio/x), seguro entre comillas simples.
+    Process {
+        id: grabProc
+        command: {
+            var home = Quickshell.env("HOME");
+            return ["bash", "-c",
+                "s=$(command -v vexyon-screenshot) || s=" + home + "/.local/bin/vexyon-screenshot; " +
+                "[ -x \"$s\" ] || s=" + home + "/.config/vexyon/bin/vexyon-screenshot; " +
+                "exec \"$s\" grab '" + win.pendingGeom + "'"];
+        }
+        onRunningChanged: if (!running) win.finishCapture()
+    }
+    // never leave an invisible overlay holding the keyboard if the grab hangs
+    Timer { id: captureGuard; interval: 5000; onTriggered: win.finishCapture() }
+    function finishCapture() {
+        if (!win.capturing) return;
+        captureGuard.stop();
+        Panels.close("screenshot");
+        win.capturing = false;
     }
 
     // ---- dim everything except the selection (four side rectangles) --------
@@ -142,11 +178,11 @@ PanelWindow {
     Rectangle {   // full dim when there is no selection yet
         anchors.fill: parent
         color: win.dimColor
-        visible: !win.hasSel
+        visible: !win.hasSel && !win.capturing
     }
     Item {
         anchors.fill: parent
-        visible: win.hasSel
+        visible: win.hasSel && !win.capturing
         Rectangle { color: win.dimColor; x: 0; y: 0; width: parent.width; height: Math.max(0, win.selY) }
         Rectangle { color: win.dimColor; x: 0; y: win.selY + win.selH
                     width: parent.width; height: Math.max(0, parent.height - (win.selY + win.selH)) }
@@ -158,7 +194,7 @@ PanelWindow {
     // ---- selection frame + handles + size readout --------------------------
     Item {
         id: frame
-        visible: win.hasSel
+        visible: win.hasSel && !win.capturing
         x: win.selX; y: win.selY; width: win.selW; height: win.selH
 
         Rectangle {
@@ -215,6 +251,7 @@ PanelWindow {
         acceptedButtons: Qt.LeftButton | Qt.RightButton
         hoverEnabled: false
         onPressed: function(mouse) {
+            if (win.capturing) return;
             keyItem.forceActiveFocus();
             if (mouse.button === Qt.RightButton) { win.cancel(); return; }
             var inside = win.hasSel && mouse.x >= win.selX && mouse.x <= win.selX + win.selW
@@ -278,6 +315,7 @@ PanelWindow {
 
     // ---- hint bar ----------------------------------------------------------
     Rectangle {
+        visible: !win.capturing
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.bottom: parent.bottom
         anchors.bottomMargin: 48
