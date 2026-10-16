@@ -2,7 +2,9 @@
 # `services.vexyon = { enable; user; }` and checks, across four boots, that a
 # module turned off is gated at the next boot (by every route), that user data
 # survives, that a module shared with other software is never gated, and that
-# turning it back on brings everything back with nothing reinstalled.
+# turning it back on brings everything back with nothing reinstalled. Also
+# that AirDrop (a session module, no service) is installed with its system
+# integration and that nothing of it runs while it is not in use.
 #
 #   nix build .#tests.x86_64-linux.modules-gating           (needs KVM)
 #   nix build .#tests.x86_64-linux.modules-gating.driver    (no KVM: then run
@@ -78,6 +80,27 @@ pkgs.testers.runNixOSTest {
     machine.succeed("virsh -c qemu:///system define ${domXml}")
     # alice is in the libvirtd group (out of the box)
     machine.succeed("id -nG alice | grep -qw libvirtd")
+
+    # ---------------- AirDrop (session module): installed, nothing running ----------------
+    machine.succeed("command -v omdrop awdl-discoverable send-to-peer vexyon-airdrop")
+    machine.succeed("test -f /run/current-system/sw/share/polkit-1/actions/io.github.t4t5.omdrop-owl.policy")
+    machine.succeed("grep -q 'interface-name:awdl0' /etc/NetworkManager/NetworkManager.conf")
+    # the firewall's own start script (iptables-save is not on the VM's PATH)
+    machine.succeed("for f in $(systemctl cat firewall.service | grep -o '/nix/store/[^ ]*'); do "
+                    "[ -f \"$f\" ] && grep 8771 \"$f\" | grep -q awdl0 && exit 0; done; exit 1")
+    # the VM has no Wi-Fi: the radio says so, and nothing of AirDrop runs
+    probe = machine.succeed("awdl-discoverable probe --json")
+    print(probe)
+    assert '"hardware": false' in probe
+    info = machine.succeed("su - alice -c 'vexyon-airdrop info'")
+    print(info)
+    assert '"installed":true' in info and '"helper":true' in info
+    assert "no Wi-Fi interface" in info
+    st = machine.succeed("su - alice -c 'vexyon-airdrop status --json'")
+    print(st)
+    assert '"receiving": false' in st
+    machine.fail("pgrep -f lib/omdrop/owl")
+    machine.fail("pgrep -f airdrop-serve.py")
 
     # a late run (like nixos-rebuild switch) applies nothing mid-session
     machine.succeed("systemctl restart vexyon-modules.service")

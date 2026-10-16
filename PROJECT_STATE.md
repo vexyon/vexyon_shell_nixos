@@ -20,6 +20,167 @@ VEXYON OUT-OF-THE-BOX POLICY Every Vexyon feature must ship together with all re
 
 PERMANENT POLICY: If Vexyon's installation changes, its GitHub README.md MUST be updated in the same development task. No exceptions.
 
+## Session: AirDrop (new optional module "airdrop")
+
+### Why (owner's request)
+
+AirDrop with Apple devices in the shell, using
+[omdrop-owl](https://github.com/t4t5/omdrop-owl); the name Apple devices show
+is the host name; a module like VMs / recording that can be switched on and
+off; a bar widget that is there by default with the module on, goes with the
+module off, and can be moved or removed from the widget settings with the
+module on; everything packaged with the shell on both platforms.
+
+### What omdrop-owl is (read before touching this)
+
+omdrop-owl is only the **radio half** of omdrop: AWDL in userspace through
+OWL (C, built from jedbillyb/owl at a pinned commit + 10 patches) plus a root
+helper, `omdrop-discoverable` (`start N | stop | status | peers | probe`),
+reached through pkexec (polkit action `io.github.t4t5.omdrop-owl.discover`,
+`allow_active=yes`). Its README requires the **omdrop plugin**
+(netmojo-systems/omdrop-plugin, an Omarchy plugin): the `omdrop` CLI, the
+receiver `airdrop-serve.py` (a systemd **user** unit started only for a
+window) and identity handling. Nothing of either is resident: `omdrop on`
+starts the receiver and the radio (OWL + a supervisor loop that re-announces
+`_airdrop._tcp` every 3 s) for the window; omdrop's own transient timer runs
+`omdrop off` at its end. Per Wi-Fi driver, `owl-profiles` decides the mode:
+*shared* (Wi-Fi stays up; the AP must be on channel 6, 44 or 149) or
+*exclusive* / *active-monitor* (Wi-Fi is down while visible — Intel iwlwifi
+cards are all exclusive).
+
+### Design
+
+- **Session module** (like `recorder`), not a system one: there is no service
+  to gate at boot. Off = no bar button, no panel, no Settings page and, if the
+  computer is visible at that moment, `omdrop off --force` (radio and
+  receiver stop). Stored in shell.json `airdrop.enabled` (default true),
+  window length in `airdrop.minutes` (default 10; 0 = until turned off).
+- **One entry point, `bin/vexyon-airdrop`** (shared). Before `on` it makes
+  sure of three things the person never has to do: omdrop's setup (user unit,
+  certificate; re-run when an update moved the plugin), the name = **short
+  host name** (`/proc/sys/kernel/hostname`; set with `omdrop name` when it
+  differs), and the folder = `xdg-user-dir DOWNLOAD` (~/Descargas in Spanish)
+  when none was chosen — omdrop's default ~/Downloads may not exist and its
+  hardened receiver unit fails on a missing ReadWritePaths. `info` = JSON for
+  Settings: installed, version, host, helper, Wi-Fi interface/driver, its
+  owl-profiles line (status, mode), allow-untested, and `omdrop doctor --json`.
+  Everything else is handed to `omdrop`.
+- **`bin/vexyon-omdrop-compat`** (shared): the Omarchy commands omdrop calls
+  — `omarchy-notification-send` (notify-send; with `--exec` it waits up to 15
+  min in a `systemd-run --user` unit for a click on the notification),
+  `omarchy-launch-browser`, `omarchy-default-terminal` — and pacman's
+  `vercmp` (NixOS only). Stand-ins named like that live ONLY in the plugin's
+  own `vexyon/` directory, prepended to its PATH by one line patched into
+  `bin/omdrop` (it re-runs itself from systemd units, so the PATH must live in
+  the script). Nothing named `omarchy-*` reaches the user's PATH.
+- **QML**: `services/AirDrop.qml` (lazy singleton; state from
+  `omdrop status --json`, read when the pill is created, when the panel or
+  Settings opens, after each action, and once at the window's end by a
+  one-shot timer from `remaining`; device lookup `peers --json -n --stream`
+  only while the panel's list is open, re-asked 3 s after each lookup ends,
+  stopped when the panel closes; `send --pick --to MAC` with omdrop's
+  progress sentences), `modules/AirDropPanel.qml` (LazyLoader: exists only
+  while open), Settings → AirDrop page, pill `airdrop` in WidgetView
+  (overlay2 = not visible, accent2Fg = visible, yellow = receiver up but radio
+  not announcing; right click toggles), WidgetRegistry (catalog/barSection
+  hide it with the module off; default layout and shell.json seed have it
+  between memory and notifications), Modules (catalog, `airdropOn`, set();
+  one-time `state.airdropWidget` migration adding the pill to existing
+  layouts — a pill removed later stays removed). The most common radio
+  sentences (no Wi-Fi card, Wi-Fi not connected, wrong channel, untested
+  card) are translated (`AirDrop.say`); anything else shows upstream's
+  English.
+- **Notification center**: a row whose notification has a `default` action
+  now invokes it on click (AirDrop: open the received file). Before, rows had
+  no click at all and the server advertised actions it never ran.
+- **Arch (`install.sh`, section "AirDrop")**: omdrop-owl cloned at commit
+  `1183205` and built with **makepkg -sif** from its own PKGBUILD (pacman owns
+  /usr/lib/omdrop, the polkit action, the NM unmanaged rule and the awdl0
+  .link; the package's post_install reloads NM's conf); rebuilt only when the
+  pinned commit changes (stamp `/usr/local/lib/vexyon/plugins/.omdrop-owl-commit`);
+  skipped when `brcmfmac-awdl-dkms` (the Apple Silicon backend) is installed.
+  omdrop cloned at `95ee625` (release 0.16.4) into
+  `/usr/local/lib/vexyon/plugins/omdrop` (root-owned, swapped in whole),
+  `/usr/local/bin/omdrop`, the compat helper as
+  `/usr/local/lib/vexyon/vexyon-omdrop-compat`. git checks content against the
+  commit ids (the pins). MOD_PKGS += `git base-devel hostapd libheif`; the
+  rest of omdrop-owl's dependencies come through `makepkg -s`. ufw active →
+  omdrop's own rule (TCP 8771 in on awdl0, fe80::/10 both ends); firewalld
+  active → the same as a rich rule (permanent + runtime).
+- **NixOS**: flake input `omdrop-owl` pinned to the same commit with
+  `inputs.nixpkgs.follows = "nixpkgs"` (the repo keeps no flake.lock, so the
+  URL carries the commit); its `nixosModules.default` imported by
+  `nix/module.nix` (now `{ self, omdrop-owl }:`) and
+  `services.omdrop-owl.enable = lib.mkDefault true` (helper, polkit, NM
+  unmanaged, 8771 on awdl0 only, awdl0 .link, the udev rule that stops
+  wpa_supplicant restarts). `nix/omdrop.nix` packages omdrop 0.16.4
+  (`fetchFromGitHub`, hash computed from `git archive` of the pinned commit)
+  as `$out/plugins/omdrop` with the PATH line (its tools, `/run/wrappers/bin`
+  for the setuid pkexec, the stand-ins — plus `heif-convert` → libheif's
+  `heif-dec`), the receiver unit's python and PATH, and libkeyutils by store
+  path. `packages.omdrop` exported.
+
+### Verified
+
+- `bash -n` + shellcheck: vexyon-airdrop, vexyon-omdrop-compat (clean);
+  install.sh (only the pre-existing SC2154).
+- NixOS: `nix-instantiate --parse`; `nix build .#omdrop` (nixpkgs 26.05);
+  full NixOS evaluation of the real module with the real omdrop-owl module
+  (systemPackages carry omdrop-owl 0.2.0 and omdrop 0.16.4; NM unmanaged
+  awdl0/mon0/awdlibss0/awdlap0; firewall 8771 on awdl0; the .link; polkit;
+  bluetooth unchanged); **omdrop-owl built** with nixpkgs 26.05 (OWL + all
+  10 patches compile). The owl and omdrop-awdl source hashes recomputed from
+  git clones match upstream's package.nix exactly — the same method gave the
+  plugin's hash.
+- The CLI end to end against the built radio in the container (no Wi-Fi):
+  `probe --json` → hardware false; `omdrop doctor --json` → "no Wi-Fi
+  interface"; `vexyon-airdrop info` → installed, helper, doctor; as a
+  non-root user, `vexyon-airdrop on 1` ran setup, set the name to the host
+  name and the folder to ~/Descargas (from user-dirs.dirs), created the
+  self-signed certificate and stopped exactly where the container has no
+  user systemd / pkexec.
+- Arch: the installer's pinned-checkout + plugin staging run for real (sudo
+  stubbed, targets under a temp dir): patched PATH line in place, stand-ins,
+  modes kept, idempotent second run, `omdrop version` = 0.16.4.
+- QML in the lab (headless sway, Quickshell 0.3.0) with a fake `omdrop`:
+  pill in the bar between memory and notifications; panel (doctor notice,
+  toggle → `name`, `dir`, `on 10`, "Visible until HH:MM"); device lookup
+  streaming names; send with progress, cancel button and "Sent …"; closing
+  the panel stops the lookup (no process left); right click turns it off;
+  Settings → AirDrop in Spanish; module off → pill gone and page collapsed,
+  on → pill back in place; an old shell.json without AirDrop gets the pill
+  once (before notifications, `state.airdropWidget` set); no QML warnings.
+- **Resource cost** (lab, idle, shell RSS / PSS, two runs each): module on
+  229.6 / 232.4 MB RSS, module off 228.7 / 230.9 MB — ≈ +1.5 MB, within
+  run-to-run noise. Processes spawned in 30 s of idle: 0 with the module on,
+  0 off; one `omdrop status` at startup with it on. While visible (not
+  measurable here, no Wi-Fi radio): OWL and the helper's supervisor (root;
+  the supervisor re-runs a python announcer every 3 s), the receiver (python,
+  user unit) and omdrop's journal watcher — all only for the window.
+- **NixOS VM test** (`modules-gating`, extended, run without KVM): **ALL
+  GATING CHECKS PASSED** across its four boots. New at boot 1, with only
+  `services.vexyon = { enable; user; }`: `omdrop`, `awdl-discoverable`,
+  `send-to-peer`, `vexyon-airdrop` on PATH; omdrop-owl's polkit action
+  installed; NetworkManager has `interface-name:awdl0` unmanaged; the
+  firewall's start script opens 8771 on awdl0; `awdl-discoverable probe`
+  says hardware false (the VM has no Wi-Fi); `vexyon-airdrop info` as alice
+  = installed, helper, the "no Wi-Fi interface" item; `status --json` = not
+  receiving; no OWL and no receiver process.
+
+### Not verified
+
+- **No real AirDrop transfer**: this environment has no Wi-Fi radio and no
+  Apple device. Whether the owner's card works depends on omdrop-owl's
+  table (Intel cards: exclusive mode, Wi-Fi off while visible; MediaTek
+  MT7921/22 opt-in; Qualcomm failing).
+- Arch: `makepkg` of omdrop-owl (no Arch mirrors here) — upstream builds the
+  same PKGBUILD in `archlinux:base-devel` in CI; the ufw/firewalld rules; the
+  receiver's hardened user unit and pkexec on a real session.
+- The notification click → open path (the lab has no session D-Bus).
+- The GitHub tarball hash of omdrop 0.16.4 against GitHub itself (tarballs
+  are blocked here; computed from `git archive`, a method that reproduced
+  upstream's two hashes exactly).
+
 ## Session: clean screenshots (no handles, border or tint in the saved image)
 
 ### Why (owner's report)

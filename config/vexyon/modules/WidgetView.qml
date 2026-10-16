@@ -74,7 +74,7 @@ Item {
         bluetooth:1, microphone:1, power:1, controlcenter:1, weather:1,
         notifications:1, idleinhibitor:1, media:1, clipboard:1, cpu:1, memory:1,
         disk:1, cputemp:1, gputemp:1, vpn:1, keyboardlayout:1, notes:1,
-        colorpicker:1, sysupdate:1, vm:1, recorder:1
+        colorpicker:1, sysupdate:1, vm:1, recorder:1, airdrop:1
     })
     readonly property bool hasPrimaryAction: _primaryTypes[type] === 1
     function primaryAction(button) {
@@ -99,6 +99,11 @@ Item {
         case "vm":            openPanel("vmPanel"); break;
         // Modules primero: con el módulo apagado no se toca Recorder.
         case "recorder":      if (Modules.recorderOn) Recorder.stop(); break;
+        // Clic: su panel. Derecho: visible / no visible, sin abrir nada.
+        // Modules primero: con el módulo apagado AirDrop no se instancia.
+        case "airdrop":       if (!Modules.airdropOn) break;
+                              if (right) AirDrop.toggle(); else openPanel("airdropPanel");
+                              break;
         case "cpu": case "memory": case "disk": case "cputemp": case "gputemp": openPanel("sysMonitor"); break;
         case "keyboardlayout": KeyboardState.cycle(); break;
         case "notes":         Quickshell.execDetached(["bash", "-c", "ghostty -e bash -c '${EDITOR:-nano} ~/notes.md' || true"]); break;
@@ -198,6 +203,7 @@ Item {
             : view.type === "appsdock"       ? cAppsDock
             : view.type === "vm"             ? cVm
             : view.type === "recorder"       ? cRecorder
+            : view.type === "airdrop"        ? cAirdrop
             : view.type === "spacer"         ? cSpacer
             : view.type === "separator"      ? cSeparator
             : cUnknown
@@ -734,6 +740,25 @@ Item {
             // pastilla es únicamente el glifo.
             label: Vm.runningVms.length > 1 ? "" + Vm.runningVms.length : ""
             labelSize: view.wFont - 2
+        }
+    }
+
+    // ---- AirDrop ------------------------------------------------------------
+    //  Solo el glifo, con los roles de Bluetooth: no visible = apagado
+    //  (overlay2), visible para los dispositivos cercanos = activo
+    //  (accent2Fg), encendiendo/apagando = accentFg. Receptor arriba pero la
+    //  radio sin anunciar nada: amarillo.
+    //  El estado se lee al crearse la pastilla y tras cada acción (ver
+    //  AirDrop.qml): ningún Timer de sondeo. La barra solo crea esta pastilla
+    //  con el módulo encendido (WidgetRegistry.barSection).
+    Component { id: cAirdrop
+        Glyph {
+            Component.onCompleted: AirDrop.prime()
+            icon: Icons.airdrop
+            iconColor: AirDrop.busy === "on" || AirDrop.busy === "off" ? Theme.accentFg
+                     : !AirDrop.on ? Theme.overlay2
+                     : AirDrop.radioVisible === false ? Theme.yellow
+                     : Theme.accent2Fg
         }
     }
 

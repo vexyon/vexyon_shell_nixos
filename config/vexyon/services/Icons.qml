@@ -104,4 +104,7 @@ Singleton {
     readonly property string record:      "\uf111"   // fa-circle (screen recording)
     readonly property string stop:        "\uf04d"   // fa-stop (stop recording)
     readonly property string puzzle:      "\uf12e"   // fa-puzzle-piece (Settings → Modules)
+    readonly property string airdrop:     "\u{f0003}" // md-access-point (AirDrop)
+    readonly property string users:       "\uf0c0"   // fa-users (AirDrop: Contacts Only)
+    readonly property string send:        "\uf1d8"   // fa-paper-plane (AirDrop: send)
 }

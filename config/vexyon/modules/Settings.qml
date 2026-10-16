@@ -74,6 +74,9 @@ FloatingWindow {
         { "title": "Recording", "icon": Icons.record, "items": [
             { "id": "recording", "label": "Screen recording", "icon": Icons.record }
         ] },
+        { "title": "AirDrop", "icon": Icons.airdrop, "items": [
+            { "id": "airdrop", "label": "AirDrop", "icon": Icons.airdrop }
+        ] },
         { "title": "System", "icon": Icons.gear, "items": [
             { "id": "modules",  "label": "Modules",            "icon": Icons.puzzle },
             { "id": "audio",    "label": "Audio",              "icon": Icons.volumeHigh },
@@ -132,6 +135,7 @@ FloatingWindow {
                     "behavior": "Behavior",
                     "virtualization": "Virtualization",
                     "recording": "Screen recording",
+                    "airdrop": "AirDrop",
                     "modules": "Modules",
                     "about": "About Vexyon" };
         return I18n.t(map[id] || id);
@@ -1210,6 +1214,7 @@ FloatingWindow {
                                        : win.current === "behavior" ? cmpBehavior
                                        : win.current === "virtualization" ? cmpVirt
                                        : win.current === "recording" ? cmpRec
+                                       : win.current === "airdrop" ? cmpAirdrop
                                        : win.current === "modules" ? cmpModules
                                        : cmpAbout
                     }
@@ -3435,6 +3440,327 @@ FloatingWindow {
                     }
 
                     Item { Layout.fillHeight: true }
+                }
+            }
+        }
+
+        // ==================== AirDrop ====================
+        //  Tarjeta del módulo + estado + qué hay (tarjeta Wi-Fi, radio, Bluetooth)
+        //  + quién puede enviar + dónde se guarda. Lo instala Vexyon (install.sh
+        //  en Arch, el flake en NixOS): aquí no hay pasos de instalación, solo
+        //  qué falta y cómo recuperarlo. Datos: AirDrop.info (vexyon-airdrop
+        //  info = `omdrop doctor` + la tabla de tarjetas de omdrop-owl), leído
+        //  al abrir la página.
+        Component {
+            id: cmpAirdrop
+            Flickable {
+                contentHeight: adCol.implicitHeight
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+
+                ColumnLayout {
+                    id: adCol
+                    width: parent.width
+                    spacing: 12
+
+                    // Módulo de sesión: ningún servicio detrás, se aplica al momento.
+                    ModuleCard { mod: "airdrop"; showLink: false }
+
+                    // Un Loader y no `visible`: estos bindings leen AirDrop, y con
+                    // el módulo apagado el singleton no debe existir.
+                    Loader {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: item ? item.implicitHeight : 0
+                        active: Modules.airdropOn
+                        visible: active
+                        sourceComponent: ColumnLayout {
+                            id: adBody
+                            spacing: 12
+                            Component.onCompleted: {
+                                AirDrop.prime();
+                                AirDrop.refresh();
+                                AirDrop.loadInfo();
+                                AirDrop.loadSenders();
+                            }
+                            readonly property var inf: AirDrop.info
+                            readonly property bool checked: adBody.inf !== null
+                            readonly property bool ready: adBody.checked && adBody.inf.installed === true
+                                && adBody.inf.doctor !== null && AirDrop.problems.length === 0
+                            readonly property string modeText:
+                                  !adBody.checked || adBody.inf.mode === "" ? ""
+                                : adBody.inf.mode === "shared" ? I18n.t("Wi-Fi stays connected while you are visible. Your router has to be on channel 6, 44 or 149.")
+                                : I18n.t("Wi-Fi disconnects while you are visible and comes back when AirDrop turns off.")
+
+                            // ---------- estado global ----------
+                            Rectangle {
+                                Layout.fillWidth: true
+                                implicitHeight: adStRow.implicitHeight + 24
+                                radius: Theme.radius
+                                readonly property color tone: !adBody.checked ? Theme.overlay1 : adBody.ready ? Theme.green : Theme.yellow
+                                color: Qt.rgba(tone.r, tone.g, tone.b, 0.12)
+                                border.width: 1
+                                border.color: tone
+                                RowLayout {
+                                    id: adStRow
+                                    anchors.left: parent.left
+                                    anchors.right: parent.right
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    anchors.leftMargin: 14
+                                    anchors.rightMargin: 12
+                                    spacing: 10
+                                    Text {
+                                        text: adBody.ready ? Icons.check : Icons.info
+                                        color: parent.parent.tone
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize + 4
+                                    }
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: !adBody.checked ? I18n.t("Checking…")
+                                            : adBody.inf.installed !== true ? I18n.t("AirDrop is not installed. Run the Vexyon installer again (on NixOS: rebuild your system).")
+                                            : adBody.ready ? I18n.t("AirDrop is ready. Turn it on from its bar button.")
+                                            : I18n.t("Something is missing. The list below shows exactly what.")
+                                        color: Theme.text
+                                        wrapMode: Text.Wrap
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize - 1
+                                    }
+                                    IconButton { icon: Icons.refresh; onClicked: { AirDrop.loadInfo(); AirDrop.refresh(); } }
+                                }
+                            }
+
+                            // ---------- nombre ----------
+                            SsHeader { text: I18n.t("NAME") }
+                            Text {
+                                Layout.fillWidth: true
+                                text: I18n.t("Apple devices see this computer as “%1”.").arg(AirDrop.hostName)
+                                color: Theme.text
+                                wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize
+                                font.bold: true
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: Modules.nixos
+                                    ? I18n.t("It is this computer's host name. To change it, set networking.hostName in your configuration and rebuild.")
+                                    : I18n.t("It is this computer's host name. To change it, change the host name (for example with hostnamectl).")
+                                color: Theme.subtext0
+                                wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 2
+                            }
+
+                            // ---------- comprobación granular ----------
+                            SsHeader { text: I18n.t("COMPONENTS") }
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                spacing: 9
+                                ReqRow {
+                                    pending: !adBody.checked
+                                    ok: adBody.checked && adBody.inf.installed === true
+                                    label: I18n.t("omdrop — the AirDrop receiver and sender")
+                                         + (adBody.checked && adBody.inf.version ? "  (" + adBody.inf.version + ")" : "")
+                                    note: I18n.t("It runs as you, only while this computer is visible.")
+                                }
+                                ReqRow {
+                                    pending: !adBody.checked
+                                    ok: adBody.checked && adBody.inf.helper === true
+                                    label: I18n.t("omdrop-owl — the AirDrop radio (AWDL), for Wi-Fi cards without Apple's chip")
+                                    note: I18n.t("Its helper runs as administrator, without asking for your password, only while this computer is visible.")
+                                }
+                                ReqRow {
+                                    pending: !adBody.checked
+                                    ok: adBody.checked && adBody.inf.wifi !== "" && adBody.inf.profile !== ""
+                                        && (adBody.inf.profile === "tested" || adBody.inf.allowUntested === true)
+                                    label: !adBody.checked ? I18n.t("Wi-Fi card")
+                                         : adBody.inf.wifi === "" ? I18n.t("No Wi-Fi card found")
+                                         : I18n.t("Wi-Fi card: %1 (driver %2)").arg(adBody.inf.wifi).arg(adBody.inf.driver || "?")
+                                    note: !adBody.checked || adBody.inf.wifi === "" ? ""
+                                        : (adBody.inf.profile === "tested" ? I18n.t("Tested with AirDrop.")
+                                           : I18n.t("Not tested with AirDrop yet."))
+                                          + (adBody.modeText !== "" ? " " + adBody.modeText : "")
+                                }
+                                ReqRow {
+                                    pending: !Modules.ready
+                                    ok: Modules.bluetoothOn
+                                    optional: true
+                                    label: I18n.t("Bluetooth — wakes an iPhone's AirDrop when you send to it")
+                                    note: Modules.bluetoothOn ? ""
+                                        : I18n.t("The Bluetooth module is off: receiving works the same, but sending to an iPhone may need its share sheet open.")
+                                }
+                                // Lo que dice `omdrop doctor`, tal cual (una frase cada uno).
+                                Repeater {
+                                    model: AirDrop.problems
+                                    delegate: ReqRow {
+                                        required property var modelData
+                                        ok: false
+                                        label: modelData.say
+                                    }
+                                }
+                            }
+
+                            // ---------- quién puede enviar ----------
+                            SsHeader { text: I18n.t("WHO CAN SEND YOU FILES") }
+                            Flow {
+                                Layout.fillWidth: true
+                                spacing: 6
+                                Repeater {
+                                    model: [ { v: "everyone", l: I18n.t("Everyone") },
+                                             { v: "contacts", l: I18n.t("Contacts Only") } ]
+                                    delegate: Rectangle {
+                                        required property var modelData
+                                        readonly property bool sel: AirDrop.visibility === modelData.v
+                                        width: visTxt.implicitWidth + 24; height: 32
+                                        radius: Theme.radius
+                                        color: sel ? Theme.accent : (visMa.containsMouse ? Theme.surface2 : Theme.surface0)
+                                        border.width: sel ? 0 : 1
+                                        border.color: Theme.surface2
+                                        Text {
+                                            id: visTxt
+                                            anchors.centerIn: parent
+                                            text: modelData.l
+                                            color: parent.sel ? Theme.onAccent : Theme.text
+                                            font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
+                                        }
+                                        MouseArea {
+                                            id: visMa; anchors.fill: parent; hoverEnabled: true
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: if (!parent.sel) AirDrop.setVisibility(modelData.v)
+                                        }
+                                    }
+                                }
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: I18n.t("Contacts Only accepts files only from the people below (the email or phone number of their Apple ID); anyone else is refused before anything is received. Apple devices that are not on the list do not see this computer either.")
+                                color: Theme.subtext0
+                                wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 2
+                            }
+                            Repeater {
+                                model: AirDrop.senderList
+                                delegate: RowLayout {
+                                    required property var modelData
+                                    Layout.fillWidth: true
+                                    spacing: 8
+                                    Text {
+                                        text: Icons.users; color: Theme.subtext0
+                                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
+                                    }
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: modelData
+                                        color: Theme.text; elide: Text.ElideRight
+                                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1
+                                    }
+                                    IconButton {
+                                        icon: Icons.close; iconSize: Theme.fontSize - 2
+                                        implicitWidth: 24; implicitHeight: 24
+                                        onClicked: AirDrop.removeSender(modelData)
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: 34
+                                radius: Theme.radius - 2
+                                color: Theme.mantle
+                                border.width: 1; border.color: senderIn.activeFocus ? Theme.accent : Theme.surface2
+                                TextInput {
+                                    id: senderIn
+                                    anchors.fill: parent; anchors.leftMargin: 10; anchors.rightMargin: 10
+                                    verticalAlignment: TextInput.AlignVCenter
+                                    clip: true
+                                    color: Theme.text
+                                    selectionColor: Theme.accent
+                                    font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1
+                                    onAccepted: {
+                                        var v = text.trim();
+                                        if (v !== "") { AirDrop.addSender(v); text = ""; }
+                                    }
+                                    Text {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        visible: senderIn.text === ""
+                                        text: I18n.t("Add a contact: email or phone number, then Enter")
+                                        color: Theme.overlay1
+                                        font: senderIn.font
+                                    }
+                                }
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                visible: AirDrop.error !== ""
+                                text: AirDrop.error
+                                color: Theme.red
+                                wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 2
+                            }
+
+                            // ---------- dónde se guarda ----------
+                            SsHeader { text: I18n.t("RECEIVED FILES") }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 8
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: AirDrop.dir !== "" ? AirDrop.dir : "…"
+                                    color: Theme.text; elide: Text.ElideMiddle
+                                    font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1
+                                }
+                                Rectangle {
+                                    implicitWidth: chgTxt.implicitWidth + 24; implicitHeight: 32
+                                    radius: Theme.radius
+                                    color: chgMa.containsMouse ? Theme.surface2 : Theme.surface0
+                                    border.width: 1; border.color: Theme.surface2
+                                    Text {
+                                        id: chgTxt
+                                        anchors.centerIn: parent
+                                        text: I18n.t("Change")
+                                        color: Theme.text
+                                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
+                                    }
+                                    MouseArea {
+                                        id: chgMa; anchors.fill: parent; hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: AirDrop.pickDir()
+                                    }
+                                }
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: I18n.t("Each received file is also copied to the clipboard and announced in the notification center; click the notification to open it.")
+                                color: Theme.subtext0
+                                wrapMode: Text.Wrap
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 2
+                            }
+
+                            // ---------- si falta algo ----------
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                visible: adBody.checked && (adBody.inf.installed !== true || adBody.inf.helper !== true)
+                                spacing: 6
+                                SsHeader { text: I18n.t("IF SOMETHING IS MISSING") }
+                                PartLabel {
+                                    visible: Modules.nixos
+                                    tag: "NixOS"
+                                    tone: Theme.blue
+                                    title: I18n.t("Rebuild your system")
+                                    body: I18n.t("Vexyon's NixOS module installs AirDrop (omdrop and omdrop-owl). If it is missing, this system was built with an older Vexyon, or your configuration sets services.omdrop-owl.enable = false: update the Vexyon flake input, remove that line and rebuild.")
+                                }
+                                PartLabel {
+                                    visible: !Modules.nixos
+                                    tag: "Arch"
+                                    tone: Theme.blue
+                                    title: I18n.t("Run the Vexyon installer again")
+                                    body: I18n.t("It builds and installs only what is missing and keeps all your settings. Run ./install.sh from the vexyon_shell folder, then press the refresh button above.")
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

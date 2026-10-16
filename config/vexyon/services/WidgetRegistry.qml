@@ -65,6 +65,9 @@ Singleton {
         // mientras se graba. Mismo trato que "vm": solo en el catálogo con el
         // módulo «Screen recording» encendido.
         { type: "recorder",      name: I18n.t("Screen recording"), desc: I18n.t("Elapsed time and stop button, only while recording"), icon: Icons.record, group: "Sistema" },
+        // AirDrop: abre su panel; clic derecho = visible / no visible. Solo en
+        // el catálogo (y en la barra) con el módulo «AirDrop» encendido.
+        { type: "airdrop",       name: "AirDrop",                desc: I18n.t("Send and receive files with nearby Apple devices"), icon: Icons.airdrop, group: "Sistema" },
         { type: "spacer",        name: I18n.t("Spacer"),             desc: I18n.t("Configurable empty space"),              icon: Icons.arrowsH,     group: I18n.t("Layout") },
         { type: "separator",     name: I18n.t("Separator"),              desc: I18n.t("Visual divider between widgets"),            icon: Icons.dragHandle,  group: I18n.t("Layout") }
     ]
@@ -75,8 +78,10 @@ Singleton {
     readonly property var visibleCatalog: {
         var vmOn = Modules.vmOn;
         var recOn = Modules.recorderOn;
+        var adOn = Modules.airdropOn;
         return root.catalog.filter(function(e) {
-            return (e.type !== "vm" || vmOn) && (e.type !== "recorder" || recOn);
+            return (e.type !== "vm" || vmOn) && (e.type !== "recorder" || recOn)
+                && (e.type !== "airdrop" || adOn);
         });
     }
 
@@ -173,6 +178,7 @@ Singleton {
                     { type: "clipboard" },
                     { type: "cpu" },
                     { type: "memory" },
+                    { type: "airdrop" },
                     { type: "notifications" },
                     { type: "battery" },
                     { type: "controlcenter" } ]
@@ -208,14 +214,26 @@ Singleton {
     }
 
     // What the BAR draws for a section: section() minus the recording
-    // indicator while Screen recording is switched off, so with the switch off
-    // that pill is not even created (its slot in shell.json is kept, and it
-    // comes back in place when the switch goes on). Only the bar uses this;
-    // the widget manager edits the full section().
+    // indicator and the AirDrop button while their modules are switched off,
+    // so with the switch off those pills are not even created (their slots in
+    // shell.json are kept, and they come back in place when the switch goes
+    // on). A group keeps its other children. Only the bar uses this; the
+    // widget manager edits the full section().
     function barSection(name) {
         var list = section(name);
-        if (Modules.recorderOn) return list;
-        return list.filter(function(e) { return e.type !== "recorder"; });
+        var off = [];
+        if (!Modules.recorderOn) off.push("recorder");
+        if (!Modules.airdropOn) off.push("airdrop");
+        if (off.length === 0) return list;
+        var out = [];
+        for (var i = 0; i < list.length; i++) {
+            var e = list[i];
+            if (off.indexOf(e.type) !== -1) continue;
+            if (e.type === "group" && e.children)
+                e.children = e.children.filter(function(c) { return off.indexOf(c.type) === -1; });
+            out.push(e);
+        }
+        return out;
     }
 
     // Persist the whole widgets object after mutating one section.

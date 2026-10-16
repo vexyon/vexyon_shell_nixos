@@ -53,6 +53,27 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
 
 ### Added
 
+- **AirDrop** (new optional module, Settings → Modules → AirDrop, on by
+  default). Send and receive files with nearby iPhones, iPads and Macs from a
+  new bar button (left click: its panel; right click: visible / not
+  visible): visible for 10 minutes, 30 minutes, an hour or until turned off,
+  to Everyone or Contacts Only, under this computer's **host name**. The
+  panel finds nearby devices (names arrive as they answer) and sends files
+  picked in the desktop's file chooser, with progress and cancel. Received
+  files go to the Downloads folder in the shell's language, onto the
+  clipboard and into the notification center. Settings → AirDrop shows the
+  Wi-Fi card and how AirDrop runs on it, what is missing, the Contacts Only
+  list and the folder. Built on two upstream projects, pinned and installed
+  by Vexyon: omdrop-owl (the AWDL radio, through OWL, for Wi-Fi cards
+  without Apple's chip) and omdrop 0.16.4 (command and receiver). A session
+  module: nothing runs until AirDrop is turned on, and only while visible.
+  Its bar button is in the default layout and added once to existing ones;
+  it can be moved or removed like any widget, and disappears with the
+  module off.
+- **Notification center: clicking a notification runs its default action**
+  (for example, opening a file AirDrop received). Notifications without one
+  behave as before.
+
 - **VMs: Start with 3D acceleration.** A Linux guest's graphics are drawn
   on the dedicated GPU of a hybrid laptop, or on the main GPU when it already
   is the dedicated one (MUX in dGPU mode, desktop with one NVIDIA):

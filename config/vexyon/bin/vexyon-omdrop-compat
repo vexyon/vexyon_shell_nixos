@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  vexyon-omdrop-compat — the few Omarchy commands that omdrop (the AirDrop
+#  command Vexyon ships, github.com/netmojo-systems/omdrop-plugin) calls,
+#  done the Vexyon way. The same file ships in both repos.
+#
+#    vexyon-omdrop-compat notification-send [-t MS] [-u LEVEL] [--image FILE]
+#                                           TITLE [BODY] [--exec CMD ARG...]
+#    vexyon-omdrop-compat launch-browser URL
+#    vexyon-omdrop-compat default-terminal
+#    vexyon-omdrop-compat vercmp A B          (pacman's vercmp; NixOS only)
+#
+#  Nobody calls it by these names: the installer (Arch) and the Nix package
+#  put one-line stand-ins called omarchy-notification-send,
+#  omarchy-launch-browser and omarchy-default-terminal (and vercmp on NixOS)
+#  in the omdrop plugin's own vexyon/ directory, which only omdrop's PATH
+#  sees. Nothing named omarchy-* ever lands on the user's PATH.
+# ============================================================================
+set -u
+
+# A received file's notification: clicking it in the notification center
+# runs --exec (omdrop opens the file). notify-send has to stay alive to hear
+# the click, so it waits in a unit of its own (the AirDrop watcher's unit is
+# stopped when the window ends, and would take it along), and for 15 minutes
+# at most: Vexyon keeps notifications until they are dismissed, and a click
+# that late is not worth a process kept that long.
+notification_send() {
+  local args=(-a AirDrop) title="" body="" have_title=0 cmd=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -t|--expire-time) args+=(-t "${2:-0}"); shift 2 ;;
+      -u|--urgency) args+=(-u "${2:-normal}"); shift 2 ;;
+      -i|--icon|--image) [ -n "${2:-}" ] && args+=(-i "$2"); shift 2 ;;
+      --exec) shift; cmd=("$@"); break ;;
+      --) shift ;;
+      -*) shift ;;
+      *)
+        if [ "$have_title" = 0 ]; then title=$1; have_title=1; else body=$1; fi
+        shift ;;
+    esac
+  done
+  if [ ${#cmd[@]} -eq 0 ]; then
+    exec notify-send "${args[@]}" -- "$title" "$body"
+  fi
+  # The first NSARGS arguments are notify-send's, the rest is the command.
+  # shellcheck disable=SC2016  # expanded by the inner bash, not here
+  local waiter='a=$(timeout 900 notify-send "${@:1:NSARGS}") || exit 0
+    [ "$a" = default ] || exit 0
+    shift "$NSARGS"; exec "$@"'
+  local ns=("${args[@]}" --wait --action=default=Open -- "$title" "$body")
+  if command -v systemd-run >/dev/null 2>&1 &&
+     systemd-run --user --quiet --collect --setenv=NSARGS="${#ns[@]}" -- \
+       bash -c "$waiter" _ "${ns[@]}" "${cmd[@]}" >/dev/null 2>&1; then
+    return 0
+  fi
+  NSARGS=${#ns[@]} bash -c "$waiter" _ "${ns[@]}" "${cmd[@]}" >/dev/null 2>&1 &
+}
+
+# Only web links: omdrop already refuses anything else before it gets here.
+launch_browser() {
+  case "${1:-}" in
+    http://*|https://*) exec xdg-open "$1" ;;
+    *) echo "vexyon-omdrop-compat: not a web link: ${1:-}" >&2; exit 1 ;;
+  esac
+}
+
+# The terminal Vexyon uses (the same one its keybinds start).
+default_terminal() {
+  if command -v ghostty >/dev/null 2>&1; then echo ghostty; else echo "${TERMINAL:-xterm}"; fi
+}
+
+# pacman's vercmp, for omdrop's version checks: -1, 0 or 1.
+vercmp() {
+  local a=${1:-} b=${2:-}
+  if [ "$a" = "$b" ]; then echo 0
+  elif [ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | head -n 1)" = "$a" ]; then echo -1
+  else echo 1
+  fi
+}
+
+sub=${1:-}
+[ $# -gt 0 ] && shift
+case "$sub" in
+  notification-send) notification_send "$@" ;;
+  launch-browser) launch_browser "$@" ;;
+  default-terminal) default_terminal ;;
+  vercmp) vercmp "$@" ;;
+  *) echo "usage: vexyon-omdrop-compat notification-send|launch-browser|default-terminal|vercmp ..." >&2; exit 2 ;;
+esac

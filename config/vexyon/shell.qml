@@ -179,6 +179,12 @@ ShellRoot {
         active: Panels.recorder && Modules.recorderOn
         RecorderPanel {}
     }
+    // AirDrop: el panel solo existe mientras está abierto, y nunca con el
+    // módulo apagado (Modules.airdropOn, no el singleton AirDrop).
+    LazyLoader {
+        active: Panels.airdropPanel && Modules.airdropOn
+        AirDropPanel {}
+    }
     ScreenshotOverlay {}
     MonitorRevertDialog {}
     OsdOverlay {}

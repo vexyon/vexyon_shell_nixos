@@ -1,4 +1,4 @@
-self:
+{ self, omdrop-owl }:
 {
   config,
   lib,
@@ -10,6 +10,9 @@ let
   cfg = config.services.vexyon;
   vexyon = cfg.package;
   stateDir = vexyon.greeterStateDir; # /var/lib/vexyon-greeter
+  # AirDrop: el comando omdrop y su receptor (nix/omdrop.nix). La radio,
+  # omdrop-owl, la trae su propio módulo (imports, abajo).
+  omdrop = pkgs.callPackage ./omdrop.nix { inherit vexyon; };
 
   # Agente polkit y portal: son libexec, no están en el PATH, y sus rutas
   # llevan el hash del store. hyprland.lua las lee del entorno (con la ruta de
@@ -203,6 +206,10 @@ let
   '';
 in
 {
+  # La radio de AirDrop (Ajustes → Módulos → AirDrop): opciones
+  # services.omdrop-owl.*. Inerte salvo que se active, y se activa abajo.
+  imports = [ omdrop-owl.nixosModules.default ];
+
   options.services.vexyon = {
     enable = lib.mkEnableOption "the Vexyon desktop shell";
 
@@ -257,6 +264,8 @@ in
       vexyon
       sessionDesktop
     ]
+    # AirDrop: el comando omdrop (sin la radio de omdrop-owl no hace nada).
+    ++ lib.optional config.services.omdrop-owl.enable omdrop
     ++ (with pkgs; [
       quickshell
       jq
@@ -387,6 +396,22 @@ in
     # Bluetooth. bluetoothd solo arranca si hay adaptador (condición propia
     # de su unidad).
     hardware.bluetooth.enable = lib.mkDefault true;
+
+    # AirDrop (módulo de SESIÓN, como la grabación: sin ningún servicio). Lo
+    # que se instala aquí no corre nunca solo:
+    #   omdrop-owl  la radio (AWDL por OWL). Su ayudante corre como root vía
+    #               pkexec (acción io.github.t4t5.omdrop-owl.discover, sin
+    #               contraseña desde la sesión activa) SOLO mientras el equipo
+    #               está visible. Su módulo deja a NetworkManager fuera de las
+    #               interfaces de OWL, abre TCP 8771 solo en awdl0, fija la MAC
+    #               de awdl0 y evita que udev reinicie wpa_supplicant cuando
+    #               OWL crea o quita una interfaz.
+    #   omdrop      el comando y el receptor; el receptor es una unidad de
+    #               usuario transitoria que solo vive mientras se está visible.
+    # El nombre que ven los Apple es el hostname (networking.hostName): lo
+    # fija vexyon-airdrop antes de cada ventana. mkDefault: quien no quiera
+    # AirDrop en absoluto pone services.omdrop-owl.enable = false.
+    services.omdrop-owl.enable = lib.mkDefault true;
 
     systemd.services = lib.mkMerge [
       {

@@ -18,16 +18,17 @@ import qs.services
 //               what the next boot will run (`desired`). The UI follows
 //               `active` until the restart: turning a module off never pulls
 //               a running VM or a connected headset out from under the user.
-//   * session — no service at all (screen recording). Stored in shell.json,
-//               applies at once.
+//   * session — no service at all (screen recording, AirDrop). Stored in
+//               shell.json, applies at once.
 //
 //  Cost: ONE short `vexyon-modules status` run when the shell starts, and
 //  again only after a change or when Settings → Modules opens. No timer, no
 //  watcher, no daemon.
 //
-//  ⚠️ Feature singletons (Vm, Recorder) stay lazy: everything that must not
-//  build them while a module is off asks HERE (`vmOn`, `recorderOn`), never
-//  `Vm.enabled` / `Recorder.enabled` — asking those would create them.
+//  ⚠️ Feature singletons (Vm, Recorder, AirDrop) stay lazy: everything that
+//  must not build them while a module is off asks HERE (`vmOn`, `recorderOn`,
+//  `airdropOn`), never `Vm.enabled` / `Recorder.enabled` / `AirDrop.*` —
+//  asking those would create them.
 //
 //  Fail-open, like the boot gating: if the helper is missing or broken, a
 //  system module reads as on, exactly as before modules existed.
@@ -47,7 +48,10 @@ Singleton {
           desc: "Headphones, keyboards, mice and other Bluetooth devices, and the Bluetooth controls in the panels. Turning it off stops the Bluetooth service at boot; paired devices are remembered." },
         { id: "recorder", scope: "session", icon: Icons.record, page: "recording",
           name: "Screen recording",
-          desc: "The screen recorder and its bar indicator. Nothing of it runs until you record." }
+          desc: "The screen recorder and its bar indicator. Nothing of it runs until you record." },
+        { id: "airdrop", scope: "session", icon: Icons.airdrop, page: "airdrop",
+          name: "AirDrop",
+          desc: "Send and receive files with nearby iPhones, iPads and Macs, and its bar button. Nothing of it runs until you turn it on." }
     ]
 
     function meta(id) {
@@ -80,11 +84,13 @@ Singleton {
     // Default ON: new installs get every module; an older shell.json keeps the
     // value it already has.
     readonly property bool recorderOn: Config.ready && Config.get("recording", "enabled", true) === true
+    readonly property bool airdropOn: Config.ready && Config.get("airdrop", "enabled", true) === true
 
     // On THIS session. Before the first answer a system module reads as off,
     // so nothing optional is built just to be torn down a moment later.
     function active(id) {
         if (id === "recorder") return root.recorderOn;
+        if (id === "airdrop") return root.airdropOn;
         if (!root.ready) return false;
         var s = root.sys[id];
         return s ? s.applied : true;
@@ -92,6 +98,7 @@ Singleton {
     // What the next boot (system) or this session (session) will have.
     function desired(id) {
         if (id === "recorder") return root.recorderOn;
+        if (id === "airdrop") return root.airdropOn;
         var s = root.sys[id];
         return s ? s.desired : true;
     }
@@ -120,12 +127,47 @@ Singleton {
                 WidgetRegistry.addWidgetAt("right", "recorder", 0);
             return;
         }
+        if (id === "airdrop") {
+            Config.set("airdrop", "enabled", on === true);
+            // On: its bar button comes back (put back if it was removed; the
+            // widget manager moves or removes it like any other). Off: the bar
+            // stops drawing it (WidgetRegistry.barSection), and if this
+            // computer is visible right now, the radio and the receiver stop
+            // — nothing of a module that is off keeps running.
+            if (on) root.addAirdropWidget();
+            else Quickshell.execDetached(["bash", "-c",
+                "[ -e /sys/class/net/awdl0 ] && exec bash \"$0\" off --force", root.airdropBin]);
+            return;
+        }
         if (root.scopeOf(id) !== "system") return;
         root.busy = id;
         root.busyTo = on === true;
         setProc.target = id;
         setProc.command = ["bash", root.bin, "set", id, on ? "on" : "off"];
         setProc.running = true;
+    }
+
+    // AirDrop's bar button, beside the notifications if they are on the bar.
+    function addAirdropWidget() {
+        if (WidgetRegistry.hasWidget("airdrop")) return;
+        var right = WidgetRegistry.section("right"), at = 0;
+        for (var i = 0; i < right.length; i++) if (right[i].type === "notifications") { at = i; break; }
+        WidgetRegistry.addWidgetAt("right", "airdrop", at);
+    }
+    readonly property string airdropBin: root.bin.replace(/vexyon-modules$/, "vexyon-airdrop")
+
+    // Once per shell.json: configs from before AirDrop existed get its bar
+    // button too (the module is on by default; new configs have it in the
+    // seed). Never again: a button the user removed stays removed.
+    // (callLater: writing shell.json from inside the binding's own change
+    // handler would re-evaluate it mid-change.)
+    readonly property bool _airdropSeedDue: Config.ready && Config.get("state", "airdropWidget", false) !== true
+    on_AirdropSeedDueChanged: if (_airdropSeedDue) Qt.callLater(root._seedAirdrop)
+    Component.onCompleted: if (_airdropSeedDue) Qt.callLater(root._seedAirdrop)
+    function _seedAirdrop() {
+        if (Config.get("state", "airdropWidget", false) === true) return;
+        if (root.airdropOn) root.addAirdropWidget();
+        Config.set("state", "airdropWidget", true);
     }
 
     function refresh() {

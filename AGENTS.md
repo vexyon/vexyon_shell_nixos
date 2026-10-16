@@ -81,8 +81,10 @@ Classification — every feature is one of:
   power-profiles-daemon), udisks2, GPU pinning, the bridge.
 - **Optional module**: a substantial feature, usually with its own
   background services. Today: `vm` (libvirt/QEMU), `bluetooth` (BlueZ) —
-  system scope, applied at the next boot — and `recorder` (screen recording) —
-  session scope, applied at once, no service.
+  system scope, applied at the next boot — and `recorder` (screen recording)
+  and `airdrop` (AirDrop: omdrop-owl + omdrop, pinned upstream projects whose
+  radio and receiver run only while visible) — session scope, applied at
+  once, no service.
 - **On demand**: runs only while used, nothing resident (calculator,
   screenshots, color picker, file transfers, OVA import/export, weather
   fetch, `wf-recorder` while recording).
@@ -109,8 +111,9 @@ module works (read `config/vexyon/bin/vexyon-modules` first):
   NetworkManager, PipeWire, systemd-machined, firewalls, `dnsmasq.service`).
 - Failure means "on": no snapshot, no helper → nothing is gated.
 - In QML, ask `Modules` (`Modules.vmOn`, `Modules.bluetoothOn`,
-  `Modules.recorderOn`), never the feature singleton (`Vm.enabled`,
-  `Recorder.enabled`): asking the singleton instantiates it.
+  `Modules.recorderOn`, `Modules.airdropOn`), never the feature singleton
+  (`Vm.enabled`, `Recorder.enabled`, `AirDrop.*`): asking the singleton
+  instantiates it.
 
 Adding a new optional module means ALL of: a `catalog` entry in
 `services/Modules.qml`; for a system module, the id in `MODULES`,

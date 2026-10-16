@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  vexyon-airdrop — the AirDrop module's one entry point (Settings → Modules →
+#  AirDrop). Everything the shell does with AirDrop goes through here. The
+#  same file ships in both repos.
+#
+#  AirDrop itself is two upstream projects that the installer (Arch) and the
+#  flake (NixOS) install, pinned:
+#    omdrop-owl  (github.com/t4t5/omdrop-owl)  the radio: AWDL in userspace
+#                through OWL, on Wi-Fi cards without Apple's chip. Its helper
+#                runs as root through pkexec, ONLY while this computer is
+#                visible (polkit action io.github.t4t5.omdrop-owl.discover).
+#    omdrop      (github.com/netmojo-systems/omdrop-plugin)  the `omdrop`
+#                command and the receiver, which runs as the user, ONLY while
+#                visible (a transient user unit). Nothing is resident.
+#
+#    vexyon-airdrop on [MINUTES|forever]   become visible (default 10). Before
+#                                          that: the name Apple devices show is
+#                                          this computer's host name, received
+#                                          files go to the Downloads folder in
+#                                          the user's language, first-use setup.
+#    vexyon-airdrop info                   JSON for Settings and the panel:
+#                                          installed, host name, Wi-Fi card and
+#                                          how omdrop-owl runs on it, and what
+#                                          `omdrop doctor` says is missing.
+#    vexyon-airdrop <anything else>        handed to `omdrop` unchanged
+#                                          (off, status --json, peers, send,
+#                                          dir, visibility, senders, limit…).
+# ============================================================================
+set -u
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+# The omdrop command: on PATH (NixOS: the system profile; Arch: /usr/local/bin),
+# else where the Arch installer puts the plugin.
+OMDROP=${VEXYON_OMDROP:-}
+[ -n "$OMDROP" ] || OMDROP=$(command -v omdrop 2>/dev/null || true)
+[ -n "$OMDROP" ] || { [ -x /usr/local/lib/vexyon/plugins/omdrop/bin/omdrop ] && OMDROP=/usr/local/lib/vexyon/plugins/omdrop/bin/omdrop; }
+
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/airdrop/config.toml"
+UNIT_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/airdrop-receiver.service"
+
+host_name() {
+  local h
+  h=$(cat /proc/sys/kernel/hostname 2>/dev/null || hostname 2>/dev/null || echo vexyon)
+  printf '%s\n' "${h%%.*}"
+}
+
+json_str() {  # a JSON string literal
+  local s=${1//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/ }
+  s=${s//$'\t'/ }
+  printf '"%s"' "$s"
+}
+
+# What omdrop needs before its first window, done here so the person never
+# runs a command: its own setup (the receiver's user unit, the certificate),
+# the name and the folder.
+prepare() {
+  local short want link target
+  # setup once; and again when an update moved the plugin (NixOS store path):
+  # its ~/.local/bin/omdrop link would point at the old one.
+  link="${XDG_BIN_HOME:-$HOME/.local/bin}/omdrop"
+  target=$(readlink -f "$OMDROP" 2>/dev/null || echo "$OMDROP")
+  if [ ! -e "$UNIT_FILE" ] ||
+     { [ -L "$link" ] && [ "$(readlink -f "$link" 2>/dev/null)" != "$target" ] &&
+       case "$(readlink "$link")" in */plugins/*/bin/omdrop) true ;; *) false ;; esac; }; then
+    "$OMDROP" setup >/dev/null 2>&1 || true
+  fi
+  # The name Apple devices show: always this computer's host name.
+  short=$(host_name)
+  if ! grep -qxF "name = \"$short\"" "$CONFIG" 2>/dev/null; then
+    "$OMDROP" name "$short" >/dev/null || return 1
+  fi
+  # Received files: the Downloads folder as user-dirs.dirs names it (it is
+  # ~/Descargas in Spanish), unless one was chosen. omdrop's default,
+  # ~/Downloads, may not exist, and its receiver refuses a folder that does
+  # not exist.
+  if ! grep -q '^download_dir *=' "$CONFIG" 2>/dev/null; then
+    want=$(xdg-user-dir DOWNLOAD 2>/dev/null || true)
+    { [ -z "$want" ] || [ "$want" = "$HOME" ]; } && want="$HOME/Downloads"
+    mkdir -p "$want" 2>/dev/null || true
+    "$OMDROP" dir "$want" >/dev/null || return 1
+  fi
+}
+
+# The Wi-Fi card omdrop-owl would use, and the line of its hardware table
+# that applies (owl-profiles: driver status mode ...). Read-only, no root.
+card_info() {
+  local helper lib sta="" d n drv="" line="" status="" mode="" tables=() forced
+  helper=/usr/lib/omdrop/omdrop-discoverable
+  [ -x "$helper" ] || helper=$(command -v awdl-discoverable 2>/dev/null || true)
+  [ -n "$helper" ] && helper=$(readlink -f "$helper")
+  lib=${helper%/*}
+  forced=$(head -n 1 /etc/omdrop/infra-iface 2>/dev/null | tr -d '[:space:]')
+  if [ -n "$forced" ]; then sta=$forced
+  else
+    for d in /sys/class/net/*/phy80211; do
+      [ -e "$d" ] || continue
+      n=$(basename "$(dirname "$d")")
+      case "$n" in awdl0|mon0|awdlibss0|awdlap0) continue ;; esac
+      sta=$n; break
+    done
+  fi
+  [ -n "$sta" ] && drv=$(basename "$(readlink -f "/sys/class/net/$sta/device/driver" 2>/dev/null)" 2>/dev/null)
+  [ -r /etc/omdrop/owl-profiles ] && tables+=(/etc/omdrop/owl-profiles)
+  [ -n "$helper" ] && [ -r "$lib/owl-profiles" ] && tables+=("$lib/owl-profiles")
+  if [ -n "$drv" ] && [ ${#tables[@]} -gt 0 ]; then
+    line=$(awk -v d="$drv" '!/^#/ && NF >= 6 && $1 == d {print; exit}' "${tables[@]}")
+    [ -n "$line" ] || line=$(awk '!/^#/ && NF >= 6 && $1 == "*" {print; exit}' "${tables[@]}")
+    read -r _ status mode _ <<< "$line"
+  fi
+  printf '"helper":%s,"wifi":%s,"driver":%s,"profile":%s,"mode":%s,"allowUntested":%s' \
+    "$( [ -n "$helper" ] && [ -x "$helper" ] && echo true || echo false)" \
+    "$(json_str "$sta")" "$(json_str "$drv")" "$(json_str "$status")" "$(json_str "$mode")" \
+    "$( [ "$(head -n 1 /etc/omdrop/allow-untested 2>/dev/null | tr -d '[:space:]')" = 1 ] && echo true || echo false)"
+}
+
+cmd_info() {
+  local doctor version
+  if [ -z "$OMDROP" ]; then
+    printf '{"installed":false,"host":%s,%s,"doctor":null}\n' "$(json_str "$(host_name)")" "$(card_info)"
+    return 0
+  fi
+  version=$("$OMDROP" version 2>/dev/null | awk '{print $2; exit}')
+  doctor=$(timeout 15 "$OMDROP" doctor --json 2>/dev/null)
+  [ -n "$doctor" ] || doctor=null
+  printf '{"installed":true,"version":%s,"host":%s,%s,"doctor":%s}\n' \
+    "$(json_str "$version")" "$(json_str "$(host_name)")" "$(card_info)" "$doctor"
+}
+
+cmd_on() {
+  local dur=${1:-10}
+  case "$dur" in
+    forever|once) ;;
+    *[!0-9]*|"") die "vexyon-airdrop on: minutes, or forever" ;;
+  esac
+  [ -n "$OMDROP" ] || die "AirDrop is not installed. Run the Vexyon installer again (on NixOS: rebuild your system)."
+  prepare || die "AirDrop could not be prepared; the reason is above."
+  exec "$OMDROP" on "$dur"
+}
+
+case "${1:-}" in
+  info) cmd_info ;;
+  on) shift; cmd_on "$@" ;;
+  status)
+    if [ -z "$OMDROP" ]; then echo '{"installed":false}'; exit 0; fi
+    exec "$OMDROP" "$@" ;;
+  "") die "usage: vexyon-airdrop on [MINUTES|forever] | info | <omdrop command>" ;;
+  *)
+    [ -n "$OMDROP" ] || die "AirDrop is not installed. Run the Vexyon installer again (on NixOS: rebuild your system)."
+    exec "$OMDROP" "$@" ;;
+esac

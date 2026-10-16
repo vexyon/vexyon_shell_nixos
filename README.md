@@ -67,7 +67,8 @@ Vexyon is a complete desktop shell built from scratch in QML on [Quickshell](htt
 - **Virtual machines** — a built-in VM manager (Super+V) on libvirt/QEMU: create, start, stop, snapshots, shared folders, TPM for Windows 11, OVA import/export, NAT/host-only/internal networks and a graphical display window. **Start with 3D acceleration** renders a Linux guest's graphics on the dedicated GPU (hybrid laptops) or on the main one when it already is the NVIDIA (MUX in dGPU mode, desktops): virtio-gpu with virgl, for that start only — the VM's saved definition is not changed. Windows guests have no 3D driver for it.
 - **Screen recording (Super+R)** — record a whole screen (whatever workspace it shows), one window or a region; with system sound, the microphone, or both in one track; at native size or scaled to 1440p/1080p/720p, at the screen's rate or a fixed 60/30 fps.
 - **Calculator (Super+Shift+C)** — a quick calculator on the focused screen; nothing runs while it is closed.
-- **Optional modules, switched from Settings** — virtual machines, Bluetooth and screen recording are installed and on by default; turn off what you don't use in **Settings → Modules** and its background services stop starting, with no rebuild. [More below](#optional-modules).
+- **AirDrop** — send and receive files with nearby iPhones, iPads and Macs, from a bar button: visible for 10 minutes, an hour or until you turn it off, to Everyone or Contacts Only; Apple devices see this computer under its **host name** (`networking.hostName`). Received files land in your Downloads folder, go to the clipboard and show up in the notification center. Built on [omdrop-owl](https://github.com/t4t5/omdrop-owl) (AWDL through OWL, for Wi-Fi cards without Apple's chip) and [omdrop](https://github.com/netmojo-systems/omdrop-plugin); which Wi-Fi cards work is in [omdrop-owl's table](https://github.com/t4t5/omdrop-owl#supported-hardware), and Settings → AirDrop tells you about yours. Nothing of it runs until you turn it on.
+- **Optional modules, switched from Settings** — virtual machines, Bluetooth, screen recording and AirDrop are installed and on by default; turn off what you don't use in **Settings → Modules** and its background services stop starting, with no rebuild. [More below](#optional-modules).
 - **Lightweight by design** — event-driven services, timers that only run when their widget is on screen, minimal external dependencies.
 
 ## Requirements
@@ -153,6 +154,7 @@ The optional pieces (libvirt, Bluetooth, NetworkManager, PipeWire, the power ser
 - **Virtual machines:** `virtualisation.libvirtd` with `qemu_kvm`, swtpm (TPM for Windows 11) and virtiofsd (shared folders), `virt-viewer`, your user in the `libvirtd` group, and narrow firewall exceptions for libvirt's bridges (`virbr*`) in whichever firewall you use (iptables or nftables) so VMs get DHCP, DNS and NAT. The rest of your firewall is untouched. With the NVIDIA driver (`services.xserver.videoDrivers = [ "nvidia" ]`), `virtualisation.libvirtd.qemu.verbatimConfig` also lets QEMU open the NVIDIA device nodes (`cgroup_device_acl`), which 3D-accelerated VMs need; it is a `mkDefault`, so a `verbatimConfig` of your own wins.
 - **Bluetooth:** `hardware.bluetooth` (bluetoothd only runs when an adapter is present).
 - **Screen recording and the rest:** `wf-recorder`, `hyprpicker`, `pactl` (from `pulseaudio`, no daemon), `fuser` (`psmisc`) and `xdg-user-dirs` (the file manager's user folders).
+- **AirDrop:** omdrop-owl's own NixOS module, which this flake brings as an input pinned to a commit and built with this flake's `nixpkgs` — you add nothing to your `flake.nix`. `services.omdrop-owl.enable` (a `mkDefault`): its root helper and polkit action (no password from your own session, only while visible), NetworkManager kept off its interfaces, TCP 8771 opened **only on `awdl0`**, `awdl0`'s MAC fixed, and no `wpa_supplicant` restart when it adds or removes an interface. Plus `omdrop` 0.16.4 (pinned), the command and receiver.
 - **Settings → Modules:** a boot unit (`vexyon-modules.service`), a start condition on every service of a module, and a polkit action for the one privileged operation the shell can ask for — see [Optional modules](#optional-modules).
 
 If your configuration already sets one of these itself (for example `virtualisation.libvirtd.enable = true` from Vexyon 2.x's old setup instructions), nothing breaks: your value is used. You can delete those old lines now; the module covers them.
@@ -168,6 +170,8 @@ That's the whole option surface — everything else is configured at runtime fro
 | `services.vexyon.greeter.enable` | bool | `true` | greetd + the Vexyon greeter as the login screen. Set to `false` to leave login to whatever else you have enabled (the equivalent of the Arch installer's `VEXYON_GREETER=0`). |
 | `services.vexyon.gpu.pin` | bool | `true` | Install the udev rules that pin the session to the integrated GPU on hybrid machines and react to display hotplug. Harmless on single-GPU systems — nothing is elected and no symlink is created. |
 | `services.vexyon.package` | package | the flake's `vexyon-shell` | Escape hatch to substitute your own build. |
+
+AirDrop's radio has omdrop-owl's own options, all optional: `services.omdrop-owl.enable` (`true` with Vexyon; `false` leaves AirDrop out entirely), `interface` (which Wi-Fi card, e.g. a USB adapter), `channels`, `allowUntested` (try a card nobody has tested yet) and `openFirewall`. See [its README](https://github.com/t4t5/omdrop-owl#readme).
 
 ### Building without the module
 
@@ -193,6 +197,7 @@ nix build .#tests.x86_64-linux.modules-gating   # VM test of Settings → Module
 - **Your login shell is not changed.** The module enables `programs.fish` because the shell themes it, but it does not set your shell. If you want fish as your login shell: `users.users.yourname.shell = pkgs.fish;`
 - **Code lives in the Nix store, state lives in your home.** Unlike the Arch version — where `~/.config/vexyon` holds both the QML and your settings — here only mutable state is in `$HOME`. The QML, helpers and bridge come from the store, so a `nixos-rebuild` updates the shell without touching your config.
 - **Greeter state is in `/var/lib/vexyon-greeter`**, not `/etc`. It has to be writable: the bridge rewrites the greeter's theme snapshot on every theme change, and the GPU hotplug handler rewrites the pin there. It is owned by `services.vexyon.user` so none of that needs privilege escalation.
+- **AirDrop's name is your host name** (`networking.hostName`). The plugin's files are in the store, so they update with every rebuild; your AirDrop settings (folder, Contacts Only list) are in `~/.config/airdrop` and `~/.config/omdrop`, and this computer's AirDrop identity in `~/.omdrop`.
 - **Module choices live in `/var/lib/vexyon/modules`**, root-owned, written only by the `vexyon-modules` helper through polkit. They survive rebuilds, updates and generation switches; a file there means "off from the next boot".
 - **The Arch/CachyOS installer (`install.sh`) lives in the [vexyon_shell](https://github.com/vexyon/vexyon_shell) repository** and is not used here.
 
@@ -211,6 +216,7 @@ nix build .#tests.x86_64-linux.modules-gating   # VM test of Settings → Module
 | **Virtual machines** | The VM manager and its bar widget are gone, and libvirt's services (`libvirtd`, `libvirtd-config`, `virtlogd`, `virtlockd`, `libvirt-guests` and their sockets) no longer start. | at the next restart |
 | **Bluetooth** | The Bluetooth controls are gone and `bluetooth.service` no longer starts, so Bluetooth devices do not connect. | at the next restart |
 | **Screen recording** | The recorder, its launcher entry and bar indicator are gone. It has no background service. | immediately |
+| **AirDrop** | Its bar button, panel and Settings page are gone, and if this computer was visible the radio and the receiver stop. It has no background service: even on, nothing runs until you turn AirDrop on, and only for as long as you stay visible. | immediately |
 
 - **Turning a module off never removes anything.** Packages stay in your system; VMs, disks, networks, snapshots and Bluetooth pairings are kept. Turning it back on needs no rebuild and no command — just the restart.
 - **Nothing is stopped mid-session.** A module with services changes at the next boot, so a running VM or a connected headset is never pulled away. A `nixos-rebuild switch` does not apply pending choices either; only a boot does.

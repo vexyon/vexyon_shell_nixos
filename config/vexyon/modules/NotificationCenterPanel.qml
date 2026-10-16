@@ -73,7 +73,29 @@ AnchoredPanel {
                         required property var modelData
                         Layout.fillWidth: true
                         implicitHeight: Math.max(56, nrowCol.implicitHeight + 20)
-                        radius: Theme.radius; color: Theme.surface0
+                        radius: Theme.radius
+                        color: nrowMa.enabled && nrowMa.containsMouse ? Theme.surface1 : Theme.surface0
+                        // Clic en una notificación con acción por defecto (la
+                        // que la app ofrece al pulsarla, p.ej. AirDrop: abrir
+                        // el fichero recibido) = ejecutarla; Quickshell la
+                        // descarta después si no es residente. Sin acción por
+                        // defecto la fila no hace nada al pulsarla, como antes.
+                        readonly property var defaultAction: {
+                            var a = nrow.modelData.actions || [];
+                            for (var i = 0; i < a.length; i++) if (a[i] && a[i].identifier === "default") return a[i];
+                            return null;
+                        }
+                        MouseArea {
+                            id: nrowMa
+                            anchors.fill: parent
+                            enabled: nrow.defaultAction !== null
+                            hoverEnabled: enabled
+                            cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                            onClicked: {
+                                nrow.defaultAction.invoke();
+                                Panels.close("notifCenter");
+                            }
+                        }
                         RowLayout {
                             anchors.fill: parent; anchors.margins: 10; spacing: 10
                             // app image / icon

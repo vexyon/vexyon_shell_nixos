@@ -90,6 +90,10 @@
           "id": "memory-a"
         },
         {
+          "type": "airdrop",
+          "id": "airdrop-a"
+        },
+        {
           "type": "notifications",
           "id": "notifications-a"
         },
@@ -567,5 +571,9 @@
   "virtualization": {},
   "recording": {
     "enabled": true
+  },
+  "airdrop": {
+    "enabled": true,
+    "minutes": 10
   }
 }

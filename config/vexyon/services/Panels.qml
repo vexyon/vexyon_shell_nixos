@@ -46,6 +46,9 @@ Singleton {
     property bool recorder: false
     property bool recordRegion: false
     signal regionPicked(string geom)
+    // AirDrop: panel anclado a su pastilla. shell.qml lo carga con un
+    // LazyLoader atado a esta propiedad Y al módulo (Modules.airdropOn).
+    property bool airdropPanel: false
 
     // pestaña inicial que el widget pide antes de abrir (ilyamiro: toggle
     // volume / toggle network wifi|bt)
@@ -194,7 +197,7 @@ Singleton {
     readonly property var anchoredPanels: [
         "weatherPanel", "quickSettings", "notifCenter", "sysMonitor", "mediaPlayer",
         "volumePanel", "networkPanel", "batteryPanel", "calendarPanel",
-        "clipboardPanel", "themeQuick", "vmPanel"
+        "clipboardPanel", "themeQuick", "vmPanel", "airdropPanel"
     ]
 
     // Abre/cierra un panel anclado desde un atajo de teclado (sin widget que
@@ -289,6 +292,7 @@ Singleton {
         root.clipboardPanel = false;
         root.themeQuick = false;
         root.vmPanel = false;
+        root.airdropPanel = false;
         root.calculator = false;
         root.recorder = false;
         // vmManager NO se cierra aquí: es una ventana toplevel como Ajustes,
