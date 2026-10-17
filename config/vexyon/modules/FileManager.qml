@@ -74,9 +74,26 @@ FloatingWindow {
     }
 
     // ---- papelera ----------------------------------------------------------
+    //  "Papelera" es la de TODAS las unidades montadas, como en Nautilus: lo que
+    //  se borra en otro disco va, por la especificación freedesktop, a la
+    //  papelera de ese disco ($montaje/.Trash-UID o $montaje/.Trash/UID), y la
+    //  vista de la papelera (trashDir) lista todas juntas. Restaurar, borrar y
+    //  vaciar funcionan en cada una. En un disco EXTERNO (USB) no se usa
+    //  papelera: se pregunta y se borra definitivamente (trashPaths).
     readonly property string trashRoot: home + "/.local/share/Trash"
     readonly property string trashDir: trashRoot + "/files"
     readonly property bool inTrash: cwd === trashDir || cwd.indexOf(trashDir + "/") === 0
+                                    || /\/\.Trash(-\d+|\/\d+)\/files(\/|$)/.test(cwd)
+    function isTrashFilesDir(d) { return d === fm.trashDir || /\/\.Trash(-\d+|\/\d+)\/files$/.test(d); }
+    // bash: `roots` imprime la carpeta files/ de cada papelera existente.
+    // /proc/self/mounts escapa los espacios como \040; printf %b los deshace.
+    readonly property string trashRootsSh:
+        'roots() { { printf "%s\\n" ' + shq(fm.trashDir) + '; uid=$(id -u); ' +
+        'while read -r _ m t _; do case "$t" in proc|sysfs|devtmpfs|devpts|tmpfs|cgroup|cgroup2|securityfs|pstore|bpf|' +
+        'debugfs|tracefs|mqueue|hugetlbfs|configfs|fusectl|efivarfs|autofs|ramfs|nsfs|overlay|squashfs|binfmt_misc|' +
+        'rpc_pipefs) continue;; esac; m=$(printf "%b" "$m"); ' +
+        'for d in "$m/.Trash-$uid" "$m/.Trash/$uid"; do [ -d "$d/files" ] && printf "%s\\n" "$d/files"; done; ' +
+        'done < /proc/self/mounts; } | sort -u; }; '
 
     function navigate(path, pushHistory) {
         if (pushHistory === undefined) pushHistory = true;
@@ -101,17 +118,18 @@ FloatingWindow {
         navigate(p, false);
     }
     function goUp() {
+        if (fm.cwd === fm.trashDir) return;
         var p = fm.cwd.replace(/\/+$/, "");
         var parent = p.substring(0, p.lastIndexOf("/"));
         if (parent === "") parent = "/";
-        navigate(parent);
+        navigate(fm.isTrashFilesDir(parent) ? fm.trashDir : parent);   // la papelera de otro disco: a la vista común
     }
     function refresh() { lister.running = true; }
 
     // Acciones del menú contextual. Vive en el ROOT (no en el delegate del
     // menú) para que la acción sobreviva a la destrucción del delegate que
     // la disparó — ver el comentario del onClicked del menú.
-    function ctxAction(act, e, sel, side) {
+    function ctxAction(act, e, sel, side, drv) {
         switch (act) {
         case "open":       fm.open(e); break;
         case "rename":     fm.startRename(); break;
@@ -129,6 +147,16 @@ FloatingWindow {
         case "bmup":       Places.move(side.path, side.index - 1); break;
         case "bmdown":     Places.move(side.path, side.index + 1); break;
         case "bmremove":   Places.remove(side.path); break;
+        // dispositivos
+        case "drvopen":
+            if (drv.mount !== "") fm.navigate(drv.mount);
+            else Drives.mount(drv.dev, drv.obj, function(mp) { fm.navigate(mp); });
+            break;
+        case "drvunmount":
+            if (Drives.contains(fm.cwd) && Drives.deviceFor(fm.cwd).dev === drv.dev) fm.navigate(fm.home);
+            Drives.unmount(drv.dev);
+            break;
+        case "drvformat":  fm.openFormat(drv.disk, drv.label); break;
         case "extract":    fm.extract(e.path); break;
         case "compress":   fm.compress(e.path); break;
         case "trash":      fm.trashPaths(sel.length ? sel : [e.path]); break;
@@ -136,6 +164,7 @@ FloatingWindow {
         case "delforever": fm.deleteForeverPaths(sel.length ? sel : [e.path]); break;
         case "emptytrash": fm.emptyArmed = true; fm.emptyTrash(); break;
         case "newfolder":  fm.newFolder(); break;
+        case "newfile":    fm.newFile(); break;
         case "selectall":  fm.selectAll(); break;
         case "togglehidden": fm.showHidden = !fm.showHidden; fm.refresh(); break;
         case "props":      fm.showProperties(sel.length ? sel : (e ? [e.path] : [])); break;
@@ -150,14 +179,17 @@ FloatingWindow {
     Process {
         id: opProc
         property var after: null          // callback opcional de runOp, al terminar
-        onExited: {
+        // `after(code, out, err)`: quien lo necesite (crear, borrar) ve cómo
+        // acabó; el resto lo ignora.
+        onExited: function(code) {
             var f = opProc.after;
             opProc.after = null;
             fm.refresh();
-            if (f) f();
+            if (f) f(code, opOut.text, opErr.text);
         }
-        stdout: StdioCollector {}
+        stdout: StdioCollector { id: opOut }
         stderr: StdioCollector {
+            id: opErr
             onStreamFinished: if (this.text.trim() !== "") console.warn("[FileManager] op:", this.text.trim())
         }
     }
@@ -384,15 +416,60 @@ FloatingWindow {
 
     // Enviar a la papelera. SOLO gio trash (nada de fallback a rm: si gio
     // falla, mejor no borrar nada que borrar definitivamente en silencio).
+    // Lo que gio no puede llevar a ninguna papelera (un disco sin una en la
+    // que se pueda escribir) se ofrece borrar definitivamente, preguntando.
+    // Lo que está en un disco externo (USB) no va a la papelera: se pregunta
+    // y se borra definitivamente.
     function trashPaths(paths) {
         if (!paths.length) return;
-        var cmd = "gio trash";
-        for (var i = 0; i < paths.length; i++) cmd += " " + shq(paths[i]);
+        var ext = [], local = [], drive = "";
+        for (var i = 0; i < paths.length; i++) {
+            var d = Drives.deviceFor(paths[i]);
+            if (d) { ext.push(paths[i]); if (drive === "") drive = d.label; }
+            else local.push(paths[i]);
+        }
         fm.clearSelection();
-        runOp(cmd);
+        if (local.length) {
+            var script = "set --";
+            for (var j = 0; j < local.length; j++) script += " " + shq(local[j]);
+            script += '; i=0; for p in "$@"; do gio trash -- "$p" 2>/dev/null || echo "@@NOTRASH $i"; i=$((i+1)); done';
+            runOp(script, function(code, out) {
+                var failed = [], lines = out.split("\n");
+                for (var k = 0; k < lines.length; k++) {
+                    var m = lines[k].match(/^@@NOTRASH (\d+)$/);
+                    if (m && local[+m[1]] !== undefined) failed.push(local[+m[1]]);
+                }
+                if (failed.length) fm.askDeleteForever(failed, "notrash", "");
+            });
+        }
+        if (ext.length) fm.askDeleteForever(ext, "external", drive);
     }
+
+    // ---- borrar definitivamente, preguntando --------------------------------
+    property bool delOpen: false
+    property var delPaths: []
+    property string delReason: ""       // "external" | "notrash" | "shift"
+    property string delDrive: ""
+    function askDeleteForever(paths, reason, drive) {
+        if (fm.delOpen) { fm.delPaths = fm.delPaths.concat(paths); return; }   // ya preguntando: se suman
+        fm.delPaths = paths;
+        fm.delReason = reason;
+        fm.delDrive = drive;
+        fm.delOpen = true;
+    }
+    function confirmDeleteForever() {
+        var script = "";
+        for (var i = 0; i < fm.delPaths.length; i++) script += "rm -rf -- " + shq(fm.delPaths[i]) + "; ";
+        fm.delOpen = false;
+        fm.delPaths = [];
+        fm.clearSelection();
+        if (script !== "") runOp(script);
+    }
+    onDelOpenChanged: if (!delOpen) fmKeys.forceActiveFocus()
+
     // Borrado definitivo desde la vista de papelera: quita files/NOMBRE y su
-    // info/NOMBRE.trashinfo. Más adentro de un dir trasheado: rm normal.
+    // info/NOMBRE.trashinfo, en la papelera de la unidad que sea. Más adentro
+    // de un dir trasheado: rm normal.
     function deleteForeverPaths(paths) {
         if (!paths.length) return;
         var script = "";
@@ -400,37 +477,47 @@ FloatingWindow {
             var p = paths[i];
             var parent = p.substring(0, p.lastIndexOf("/"));
             script += "rm -rf -- " + shq(p) + "; ";
-            if (parent === fm.trashDir)
-                script += "rm -f -- " + shq(fm.trashRoot + "/info/" + basename(p) + ".trashinfo") + "; ";
+            if (fm.isTrashFilesDir(parent))
+                script += "rm -f -- " + shq(parent.replace(/\/files$/, "") + "/info/" + basename(p) + ".trashinfo") + "; ";
         }
         fm.clearSelection();
         runOp(script);
     }
     // Restaurar: lee Path= del .trashinfo (URL-encoded), lo decodifica y mueve
     // de vuelta sin machacar (sufijo .restaurado-N si el destino ya existe).
+    // En la papelera de otro disco Path= es relativo a la raíz de ese disco.
     function restorePaths(paths) {
         if (!paths.length) return;
-        var script = 'T=' + shq(fm.trashRoot) + '\n' +
+        var script =
             'restore_one() {\n' +
-            '  name="$1"; info="$T/info/$name.trashinfo"\n' +
+            '  F="$1"; name="$2"; T="${F%/files}"; info="$T/info/$name.trashinfo"\n' +
             '  [ -f "$info" ] || return 0\n' +
             '  enc="$(grep -m1 \'^Path=\' "$info" | cut -d= -f2-)"\n' +
             '  orig="$(printf \'%b\' "${enc//\\%/\\\\x}")"\n' +
-            '  case "$orig" in /*) : ;; *) orig="/$orig" ;; esac\n' +
+            '  case "$orig" in\n' +
+            '    /*) : ;;\n' +
+            '    *) case "$T" in\n' +
+            '         */.Trash-[0-9]*) orig="${T%/.Trash-*}/$orig" ;;\n' +
+            '         */.Trash/[0-9]*) orig="${T%/.Trash/*}/$orig" ;;\n' +
+            '         *) orig="/$orig" ;;\n' +
+            '       esac ;;\n' +
+            '  esac\n' +
             '  mkdir -p "$(dirname "$orig")"\n' +
             '  dest="$orig"; n=1\n' +
             '  while [ -e "$dest" ]; do dest="$orig.restaurado-$n"; n=$((n+1)); done\n' +
-            '  mv -- "$T/files/$name" "$dest" && rm -f -- "$info"\n' +
+            '  mv -- "$F/$name" "$dest" && rm -f -- "$info"\n' +
             '}\n';
         for (var i = 0; i < paths.length; i++) {
             var p = paths[i];
-            if (p.substring(0, p.lastIndexOf("/")) !== fm.trashDir) continue; // solo primer nivel
-            script += "restore_one " + shq(basename(p)) + "\n";
+            var parent = p.substring(0, p.lastIndexOf("/"));
+            if (!fm.isTrashFilesDir(parent)) continue;                     // solo primer nivel
+            script += "restore_one " + shq(parent) + " " + shq(basename(p)) + "\n";
         }
         fm.clearSelection();
         runOp(script);
     }
     // Vaciar papelera con confirmación en dos clicks (el segundo antes de 3s).
+    // Vacía las de todas las unidades montadas, como la vista las enseña.
     property bool emptyArmed: false
     Timer { id: emptyArmTimer; interval: 3000; onTriggered: fm.emptyArmed = false }
     function emptyTrash() {
@@ -440,8 +527,9 @@ FloatingWindow {
         // NO `gio trash --empty`: el backend trash: de gio necesita gvfsd
         // (falla con "Operation not supported" sin él). Vaciar a mano files/
         // + info/ es el layout estándar de freedesktop y no depende de gvfs.
-        runOp('T=' + shq(fm.trashRoot) + '; ' +
-              'find "$T/files" "$T/info" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null; true');
+        runOp(fm.trashRootsSh +
+              'roots | while IFS= read -r F; do ' +
+              'find "$F" "${F%/files}/info" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null; done; true');
     }
 
     // Mover (drag-and-drop). Nunca machaca un destino existente: lo salta y lo
@@ -483,25 +571,51 @@ FloatingWindow {
         });
     }
 
-    // ---- renombrar ---------------------------------------------------------
+    // ---- diálogo de nombre: renombrar, carpeta nueva, fichero nuevo -------
     property bool renameOpen: false
-    property string renamePath: ""
+    property string nameMode: "rename"   // "rename" | "newfolder" | "newfile"
+    property string renamePath: ""       // rename: el elemento; new*: la carpeta donde crear
     property string renameText: ""
+    property string nameError: ""
+    property string pendingSelect: ""    // seleccionar en cuanto el listado lo traiga
+    function openNameDialog(mode, path, text) {
+        fm.nameMode = mode;
+        fm.renamePath = path;
+        fm.renameText = text;
+        fm.nameError = "";
+        fm.renameOpen = true;
+    }
     function startRename() {
         var l = selectedList();
         if (l.length !== 1) return;
-        fm.renamePath = l[0];
-        fm.renameText = basename(l[0]);
-        fm.renameOpen = true;
+        fm.openNameDialog("rename", l[0], basename(l[0]));
     }
     function submitRename() {
         var t = fm.renameText.trim();
-        if (t === "" || t.indexOf("/") !== -1 || t === basename(fm.renamePath)) { fm.renameOpen = false; return; }
-        var dir = fm.renamePath.substring(0, fm.renamePath.lastIndexOf("/"));
-        var from = fm.renamePath, to = dir + "/" + t;
-        runOp("mv -n -- " + shq(from) + " " + shq(to), function() { fm.followMove(from, to); });
+        var renaming = fm.nameMode === "rename";
+        if (renaming && t === basename(fm.renamePath)) { fm.renameOpen = false; return; }
+        if (t === "") { fm.nameError = I18n.t("Type a name."); return; }
+        if (t.indexOf("/") !== -1 || t === "." || t === "..") { fm.nameError = I18n.t("A name cannot contain “/” or be “.” or “..”."); return; }
+        var dir = renaming ? fm.renamePath.substring(0, fm.renamePath.lastIndexOf("/")) : fm.renamePath;
+        if (dir === fm.cwd && fm.cwdNames[t] === true) { fm.nameError = I18n.t("“%1” already exists here.").arg(t); return; }
+        var to = (dir === "/" ? "" : dir) + "/" + t;
         fm.renameOpen = false;
         fm.clearSelection();
+        if (renaming) {
+            var from = fm.renamePath;
+            runOp("mv -n -- " + shq(from) + " " + shq(to), function() { fm.followMove(from, to); });
+            return;
+        }
+        // mkdir sin -p y `set -C` (noclobber): si algo apareció con ese nombre
+        // entretanto, falla en vez de pisarlo.
+        var script = fm.nameMode === "newfolder" ? "mkdir -- " + shq(to) : "set -C; : > " + shq(to);
+        fm.pendingSelect = to;
+        runOp(script, function(code, out, err) {
+            if (code !== 0) {
+                fm.pendingSelect = "";
+                fm.notice(I18n.t("Could not create “%1”: %2").arg(t).arg(err.trim().split("\n").pop() || code), true);
+            }
+        });
     }
     onRenameOpenChanged: if (!renameOpen) fmKeys.forceActiveFocus()
 
@@ -563,9 +677,21 @@ FloatingWindow {
     function extract(path) {
         runOp("cd " + shq(fm.cwd) + " && unzip -o " + shq(path) + " -d " + shq(path.replace(/\.zip$/i, "")));
     }
+    // Crear carpeta / fichero: primero se pide el nombre (el mismo diálogo de
+    // renombrar), con uno libre propuesto y seleccionado. Nada se crea con un
+    // nombre por defecto que luego haya que ir a buscar.
+    function freeName(base, ext) {
+        var n = base + ext, i = 2;
+        while (fm.cwdNames[n] === true) { n = base + " " + i + ext; i++; }
+        return n;
+    }
     function newFolder() {
-        runOp('d=' + shq(fm.cwd) + '; n=' + shq(I18n.t("New folder")) + '; t="$d/$n"; i=2; ' +
-              'while [ -e "$t" ]; do t="$d/$n $i"; i=$((i+1)); done; mkdir -p "$t"');
+        if (fm.inTrash) return;
+        fm.openNameDialog("newfolder", fm.cwd, fm.freeName(I18n.t("New folder"), ""));
+    }
+    function newFile() {
+        if (fm.inTrash) return;
+        fm.openNameDialog("newfile", fm.cwd, fm.freeName(I18n.t("New document"), ".txt"));
     }
 
     //  %D:%i (dispositivo:inodo) de cada carpeta: si alguien la renombró o
@@ -573,8 +699,11 @@ FloatingWindow {
     //  (FolderIcons.adopt). Sale del mismo `find`, sin coste extra.
     Process {
         id: lister
-        command: ["bash", "-c",
-            "find " + fm.shq(fm.cwd) + " -maxdepth 1 -mindepth 1 -printf '%y\\t%D:%i\\t%f\\n' 2>/dev/null | sort -t$'\\t' -k1,1 -k3,3f"]
+        // En la vista de la papelera: las de todas las unidades, con la carpeta
+        // real de cada elemento como 4.º campo.
+        command: ["bash", "-c", fm.cwd === fm.trashDir
+            ? fm.trashRootsSh + "roots | while IFS= read -r r; do find \"$r\" -maxdepth 1 -mindepth 1 -printf '%y\\t%D:%i\\t%f\\t%h\\n'; done 2>/dev/null | sort -t$'\\t' -k1,1 -k3,3f"
+            : "find " + fm.shq(fm.cwd) + " -maxdepth 1 -mindepth 1 -printf '%y\\t%D:%i\\t%f\\n' 2>/dev/null | sort -t$'\\t' -k1,1 -k3,3f"]
         stdout: StdioCollector {
             onStreamFinished: {
                 var out = [], names = {};
@@ -587,17 +716,32 @@ FloatingWindow {
                     var tab2 = tab < 0 ? -1 : l.indexOf("\t", tab + 1);
                     if (tab2 < 0) continue;
                     var type = l.substring(0, tab);
-                    var name = l.substring(tab2 + 1);
+                    var name = l.substring(tab2 + 1), dir = base;
+                    if (fm.cwd === fm.trashDir) {                       // papelera común: 4.º campo = carpeta
+                        var tab3 = l.indexOf("\t", tab2 + 1);
+                        if (tab3 > 0) { name = l.substring(tab2 + 1, tab3); dir = l.substring(tab3 + 1); }
+                    }
                     names[name] = true;
                     if (name.charAt(0) === "." && !fm.showHidden) continue; // hide dotfiles
                     var isDir = (type === "d");
                     if (!fm.pickShows(name, isDir)) continue;            // selector: filtro / solo carpetas
-                    out.push({ name: name, isDir: isDir, path: base + "/" + name,
+                    out.push({ name: name, isDir: isDir, path: dir + "/" + name,
                                id: isDir ? l.substring(tab + 1, tab2) : "" });
                 }
                 fm.entries = out;
                 fm.cwdNames = names;
                 FolderIcons.adopt(out);
+                if (fm.pendingSelect !== "") {
+                    for (var k = 0; k < out.length; k++) {
+                        if (out[k].path !== fm.pendingSelect) continue;
+                        fm.setSelectionPaths([out[k].path]);
+                        fm.anchorIndex = k;
+                        listView.positionViewAtIndex(k, ListView.Contain);
+                        gridView.positionViewAtIndex(k, GridView.Contain);
+                        break;
+                    }
+                    fm.pendingSelect = "";
+                }
             }
         }
     }
@@ -815,14 +959,45 @@ FloatingWindow {
     property real ctxY: 0
     property var ctxEntry: null   // null => menú de fondo (área vacía)
     property var ctxSide: null    // fila de la barra lateral: { path, bookmark, index, missing }
+    property var ctxDrive: null   // dispositivo de la barra lateral: { dev, obj, disk, mount }
     function showCtx(x, y, entry) {
-        fm.ctxSide = null; fm.ctxEntry = entry; fm.ctxX = x; fm.ctxY = y; fm.ctxOpen = true;
+        fm.ctxSide = null; fm.ctxDrive = null;
+        fm.ctxEntry = entry; fm.ctxX = x; fm.ctxY = y; fm.ctxOpen = true;
         FileClipboard.probe();    // ¿hay algo que pegar? (puede venir de otro programa)
     }
     function showSideCtx(x, y, path, isBookmark, index, missing) {
-        fm.ctxEntry = null;
+        fm.ctxEntry = null; fm.ctxDrive = null;
         fm.ctxSide = { path: path, bookmark: isBookmark, index: index, missing: missing };
         fm.ctxX = x; fm.ctxY = y; fm.ctxOpen = true;
+    }
+    function showDriveCtx(x, y, d) {
+        fm.ctxEntry = null; fm.ctxSide = null;
+        fm.ctxDrive = { dev: d.dev || "", obj: d.obj || "", disk: d.disk, mount: d.mount || "", label: d.fsLabel || "" };
+        fm.ctxX = x; fm.ctxY = y; fm.ctxOpen = true;
+    }
+
+    // ---- formatear una unidad externa (DriveFormatDialog + vexyon-format) ----
+    readonly property var rawDrives: Drives.drives.filter(function(d) { return !d.readable; })
+    property bool fmtOpen: false
+    property string fmtDisk: ""
+    property string fmtLabel: ""
+    function openFormat(disk, label) {
+        fm.fmtDisk = disk;
+        fm.fmtLabel = label || "";
+        fm.fmtOpen = true;
+    }
+    onFmtOpenChanged: if (!fmtOpen) fmKeys.forceActiveFocus()
+    //  Antes de borrar: salir de la unidad si esta ventana está dentro (las
+    //  demás ventanas salen solas cuando Drives deja de verla montada).
+    function leaveDisk(disk) {
+        var d = Drives.deviceFor(fm.cwd);
+        if (d && d.disk === disk) fm.navigate(fm.home);
+    }
+    function driveFormatted(dev, obj, label) {
+        fm.fmtOpen = false;
+        var dr = Drives.driveOf(fm.fmtDisk);
+        fm.notice(I18n.t("“%1” is formatted and ready.").arg(label !== "" ? label : (dr ? dr.name : dev)), false);
+        if (dev !== "" && obj !== "") Drives.mount(dev, obj, function(mp) { fm.navigate(mp); });
     }
 
     // ---- marcadores de la barra lateral ------------------------------------
@@ -1291,7 +1466,7 @@ FloatingWindow {
                         // Mismo delegado visual que Volumes; añade botón de expulsar y,
                         // si no está montado, el click monta y entra.
                         Text {
-                            visible: Drives.devices.length > 0
+                            visible: Drives.devices.length > 0 || fm.rawDrives.length > 0
                             text: I18n.t("Devices")
                             color: Theme.overlay2
                             font.family: Theme.fontFamily
@@ -1375,12 +1550,80 @@ FloatingWindow {
                                     id: dvm
                                     anchors.fill: parent
                                     hoverEnabled: true
+                                    acceptedButtons: Qt.LeftButton | Qt.RightButton
                                     cursorShape: Qt.PointingHandCursor
                                     z: -1
-                                    onClicked: {
+                                    onClicked: function(mouse) {
+                                        if (mouse.button === Qt.RightButton) {
+                                            var pt = dvm.mapToItem(null, mouse.x, mouse.y);
+                                            fm.showDriveCtx(pt.x, pt.y, devRow.modelData);
+                                            return;
+                                        }
                                         if (devRow.mounted) fm.navigate(modelData.mount);
                                         else Drives.mount(modelData.dev, modelData.obj,
                                         function(mp) { fm.navigate(mp); });
+                                    }
+                                }
+                            }
+                        }
+                        // Unidades sin nada que abrir (sin formato, cifradas, un
+                        // sistema de ficheros desconocido): el clic ofrece formatearlas.
+                        Repeater {
+                            model: fm.rawDrives
+                            delegate: Rectangle {
+                                id: rawRow
+                                required property var modelData
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: 40
+                                radius: Theme.radius
+                                color: rawMa.containsMouse ? Theme.surface1 : "transparent"
+                                Behavior on color { ColorAnimation { duration: Theme.dur(100) } }
+                                RowLayout {
+                                    anchors.fill: parent
+                                    anchors.leftMargin: 10
+                                    anchors.rightMargin: 8
+                                    spacing: 10
+                                    Text {
+                                        text: Icons.drive
+                                        color: Theme.yellow
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize + 1
+                                        Layout.preferredWidth: 18
+                                    }
+                                    ColumnLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 0
+                                        Text {
+                                            Layout.fillWidth: true
+                                            text: rawRow.modelData.name
+                                            color: Theme.text
+                                            font.family: Theme.fontFamily
+                                            font.pixelSize: Theme.fontSize - 1
+                                            elide: Text.ElideRight
+                                        }
+                                        Text {
+                                            Layout.fillWidth: true
+                                            text: rawRow.modelData.size + " · " + I18n.t("Not readable")
+                                            color: Theme.overlay2
+                                            font.family: Theme.fontFamily
+                                            font.pixelSize: Theme.fontSize - 4
+                                            elide: Text.ElideRight
+                                        }
+                                    }
+                                }
+                                MouseArea {
+                                    id: rawMa
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    acceptedButtons: Qt.LeftButton | Qt.RightButton
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: function(mouse) {
+                                        if (mouse.button === Qt.RightButton) {
+                                            var pt = rawMa.mapToItem(null, mouse.x, mouse.y);
+                                            fm.showDriveCtx(pt.x, pt.y, { disk: rawRow.modelData.obj });
+                                            return;
+                                        }
+                                        fm.openFormat(rawRow.modelData.obj, "");
                                     }
                                 }
                             }
@@ -1560,7 +1803,7 @@ FloatingWindow {
                             anchors.fill: parent
                             anchors.leftMargin: 12
                             verticalAlignment: Text.AlignVCenter
-                            text: fm.cwd.replace(fm.home, "~")
+                            text: fm.cwd === fm.trashDir ? I18n.t("Trash") : fm.cwd.replace(fm.home, "~")
                             color: Theme.subtext1
                             font.family: Theme.fontFamily
                             font.pixelSize: Theme.fontSize - 1
@@ -2484,7 +2727,7 @@ FloatingWindow {
         id: fmKeys
         focus: true
         Keys.onPressed: function(event) {
-            if (fm.remoteFormOpen || fm.renameOpen || fm.iconPickOpen) return;
+            if (fm.remoteFormOpen || fm.renameOpen || fm.iconPickOpen || fm.delOpen || fm.fmtOpen) return;
             if (fm.propOpen) {
                 if (event.key === Qt.Key_Escape || event.key === Qt.Key_Return) { fm.propOpen = false; event.accepted = true; }
                 return;
@@ -2507,12 +2750,18 @@ FloatingWindow {
                 event.accepted = true;
             } else if (event.key === Qt.Key_Delete) {
                 var l = fm.selectedList();
-                if (l.length) { fm.inTrash ? fm.deleteForeverPaths(l) : fm.trashPaths(l); }
+                if (l.length) {
+                    if (fm.inTrash) fm.deleteForeverPaths(l);
+                    else if (event.modifiers & Qt.ShiftModifier) { fm.clearSelection(); fm.askDeleteForever(l, "shift", ""); }  // Mayús+Supr (Nautilus)
+                    else fm.trashPaths(l);
+                }
                 event.accepted = true;
             } else if (event.key === Qt.Key_F2) {
                 fm.startRename(); event.accepted = true;
             } else if (event.key === Qt.Key_Backspace) {
                 fm.goBack(); event.accepted = true;
+            } else if (ctrl && (event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_N) {
+                fm.newFolder(); event.accepted = true;            // Ctrl+Shift+N (Nautilus)
             } else if (ctrl && event.key === Qt.Key_A) {
                 fm.selectAll(); event.accepted = true;
             } else if (ctrl && event.key === Qt.Key_H) {
@@ -2576,6 +2825,16 @@ FloatingWindow {
                     var suf = n > 1 ? " (" + n + ")" : "";
                     var clipN = FileClipboard.paths.length;
                     var pasteLabel = clipN ? I18n.t("Paste (") + clipN + ")" : I18n.t("Paste");
+                    // dispositivo de la barra lateral
+                    if (fm.ctxDrive) {
+                        var dv = [];
+                        if (fm.ctxDrive.dev !== "") {
+                            dv.push({ label: I18n.t("Open"), act: "drvopen" });
+                            if (fm.ctxDrive.mount !== "") dv.push({ label: I18n.t("Unmount"), act: "drvunmount" });
+                        }
+                        dv.push({ label: I18n.t("Format drive…"), act: "drvformat", danger: true });
+                        return dv;
+                    }
                     // fila de la barra lateral
                     if (fm.ctxSide) {
                         var sd = fm.ctxSide, side = [];
@@ -2598,7 +2857,8 @@ FloatingWindow {
                         return [{ label: I18n.t("Empty trash"), act: "emptytrash", danger: true }];
                     }
                     if (!fm.ctxEntry) {
-                        var bg = [{ label: I18n.t("New folder"), act: "newfolder" }];
+                        var bg = [{ label: I18n.t("New folder"), act: "newfolder" },
+                                  { label: I18n.t("New file"), act: "newfile" }];
                         bg.push({ label: pasteLabel, act: "paste", disabled: clipN === 0 });
                         bg.push({ label: I18n.t("Select all"), act: "selectall" });
                         bg.push({ label: fm.showHidden ? I18n.t("Hide hidden files") : I18n.t("Show hidden files"), act: "togglehidden" });
@@ -2631,7 +2891,9 @@ FloatingWindow {
                         items.push({ label: I18n.t("Add to Sidebar") + suf, act: "bookmark" });
                     }
                     items.push({ label: I18n.t("Properties") + suf, act: "props" });
-                    items.push({ label: I18n.t("Move to Trash") + suf, act: "trash", danger: true });
+                    var allExt = true, tgt = fm.selCount > 0 ? fm.selectedList() : [fm.ctxEntry.path];
+                    for (var x = 0; x < tgt.length; x++) if (!Drives.contains(tgt[x])) allExt = false;
+                    items.push({ label: (allExt ? I18n.t("Delete permanently") : I18n.t("Move to Trash")) + suf, act: "trash", danger: true });
                     return items;
                 }
                 delegate: Rectangle {
@@ -2669,9 +2931,10 @@ FloatingWindow {
                             var act = modelData.act;
                             var e = fm.ctxEntry;
                             var side = fm.ctxSide;
+                            var drv = fm.ctxDrive;
                             var sel = fm.selectedList();
                             fm.ctxOpen = false;
-                            Qt.callLater(function() { fm.ctxAction(act, e, sel, side); });
+                            Qt.callLater(function() { fm.ctxAction(act, e, sel, side, drv); });
                         }
                     }
                 }
@@ -2733,8 +2996,15 @@ FloatingWindow {
 
                 RowLayout {
                     Layout.fillWidth: true
-                    Text { text: Icons.pencil; color: Theme.accent; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize + 3 }
-                    Text { Layout.fillWidth: true; text: I18n.t("Rename"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize + 2; font.bold: true }
+                    Text {
+                        text: fm.nameMode === "newfolder" ? Icons.folder : fm.nameMode === "newfile" ? Icons.file : Icons.pencil
+                        color: Theme.accent; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize + 3
+                    }
+                    Text {
+                        Layout.fillWidth: true
+                        text: fm.nameMode === "newfolder" ? I18n.t("New folder") : fm.nameMode === "newfile" ? I18n.t("New file") : I18n.t("Rename")
+                        color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize + 2; font.bold: true
+                    }
                     IconButton { icon: Icons.close; onClicked: fm.renameOpen = false }
                 }
 
@@ -2757,18 +3027,27 @@ FloatingWindow {
                         font.pixelSize: Theme.fontSize
                         selectionColor: Theme.accent
                         text: fm.renameText
-                        onTextChanged: fm.renameText = text
+                        onTextChanged: { fm.renameText = text; fm.nameError = ""; }
                         Keys.onPressed: function(ev) {
                             if (ev.key === Qt.Key_Escape) { fm.renameOpen = false; ev.accepted = true; }
                         }
                         onAccepted: fm.submitRename()
                         Component.onCompleted: {
                             forceActiveFocus();
-                            // preselecciona el nombre sin la extensión
-                            var dot = text.lastIndexOf(".");
+                            // preselecciona el nombre sin la extensión (una carpeta, entero)
+                            var dot = fm.nameMode === "newfolder" ? -1 : text.lastIndexOf(".");
                             select(0, dot > 0 ? dot : text.length);
                         }
                     }
+                }
+                Text {
+                    Layout.fillWidth: true
+                    visible: fm.nameError !== ""
+                    text: fm.nameError
+                    color: Theme.red
+                    wrapMode: Text.WordWrap
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fontSize - 2
                 }
 
                 RowLayout {
@@ -2786,11 +3065,127 @@ FloatingWindow {
                         Layout.preferredWidth: 110; Layout.preferredHeight: 36
                         radius: Theme.radius
                         color: renOkMa.containsMouse ? Theme.accent2 : Theme.accent
-                        Text { anchors.centerIn: parent; text: I18n.t("Rename"); color: Theme.onAccent; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1; font.bold: true }
+                        Text { anchors.centerIn: parent; text: fm.nameMode === "rename" ? I18n.t("Rename") : I18n.t("Create"); color: Theme.onAccent; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1; font.bold: true }
                         MouseArea { id: renOkMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: fm.submitRename() }
                     }
                 }
             }
+        }
+    }
+
+    // ---- diálogo de borrar definitivamente ----
+    Rectangle {
+        anchors.fill: parent
+        visible: fm.delOpen
+        color: "#000000"
+        opacity: fm.delOpen ? 0.5 : 0
+        Behavior on opacity { NumberAnimation { duration: Theme.dur(120) } }
+        MouseArea { anchors.fill: parent; onClicked: fm.delOpen = false }
+    }
+    Loader {
+        anchors.centerIn: parent
+        active: fm.delOpen
+        sourceComponent: delCmp
+        z: 210
+    }
+    Component {
+        id: delCmp
+        Card {
+            width: 420
+            implicitHeight: delCol.implicitHeight + 40
+            color: Theme.base
+            radius: Theme.radius + 4
+            MouseArea { anchors.fill: parent }  // swallow clicks
+            // Intro borra, Esc cancela
+            focus: true
+            Component.onCompleted: forceActiveFocus()
+            Keys.onPressed: function(ev) {
+                if (ev.key === Qt.Key_Escape) { fm.delOpen = false; ev.accepted = true; }
+                else if (ev.key === Qt.Key_Return || ev.key === Qt.Key_Enter) { fm.confirmDeleteForever(); ev.accepted = true; }
+            }
+
+            ColumnLayout {
+                id: delCol
+                anchors.fill: parent
+                anchors.margins: 20
+                spacing: 12
+                readonly property int n: fm.delPaths.length
+                readonly property string one: n === 1 ? "“" + fm.basename(fm.delPaths[0]) + "”" : ""
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    Text { text: Icons.trash; color: Theme.red; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize + 3 }
+                    Text { Layout.fillWidth: true; text: I18n.t("Delete permanently?"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize + 2; font.bold: true }
+                    IconButton { icon: Icons.close; onClicked: fm.delOpen = false }
+                }
+                Text {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    color: Theme.text
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fontSize - 1
+                    text: fm.delReason === "external"
+                          ? (delCol.n === 1
+                             ? I18n.t("%1 is on an external drive (%2). Files deleted there do not go to the Trash: they are deleted permanently.").arg(delCol.one).arg(fm.delDrive)
+                             : I18n.t("%1 items are on an external drive (%2). Files deleted there do not go to the Trash: they are deleted permanently.").arg(delCol.n).arg(fm.delDrive))
+                        : fm.delReason === "notrash"
+                          ? (delCol.n === 1
+                             ? I18n.t("%1 cannot be moved to the Trash: its drive has no trash folder you can use. Delete it permanently?").arg(delCol.one)
+                             : I18n.t("%1 items cannot be moved to the Trash: their drive has no trash folder you can use. Delete them permanently?").arg(delCol.n))
+                        : (delCol.n === 1
+                           ? I18n.t("%1 will be deleted permanently.").arg(delCol.one)
+                           : I18n.t("%1 items will be deleted permanently.").arg(delCol.n))
+                }
+                Text {
+                    Layout.fillWidth: true
+                    text: I18n.t("This cannot be undone.")
+                    color: Theme.red
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fontSize - 2
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+                    Item { Layout.fillWidth: true }
+                    Rectangle {
+                        Layout.preferredWidth: 100; Layout.preferredHeight: 36
+                        radius: Theme.radius
+                        color: delCancelMa.containsMouse ? Theme.surface2 : Theme.surface1
+                        Text { anchors.centerIn: parent; text: I18n.t("Cancel"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1 }
+                        MouseArea { id: delCancelMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: fm.delOpen = false }
+                    }
+                    Rectangle {
+                        Layout.preferredWidth: delOkTxt.implicitWidth + 28; Layout.preferredHeight: 36
+                        radius: Theme.radius
+                        color: delOkMa.containsMouse ? Qt.lighter(Theme.red, 1.15) : Theme.red
+                        Text { id: delOkTxt; anchors.centerIn: parent; text: I18n.t("Delete permanently"); color: Theme.onAccent; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1; font.bold: true }
+                        MouseArea { id: delOkMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: fm.confirmDeleteForever() }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- diálogo de formatear una unidad ----
+    Rectangle {
+        anchors.fill: parent
+        visible: fm.fmtOpen
+        color: "#000000"
+        opacity: fm.fmtOpen ? 0.5 : 0
+        Behavior on opacity { NumberAnimation { duration: Theme.dur(120) } }
+        MouseArea { anchors.fill: parent; onClicked: if (fmtLoader.item) fmtLoader.item.close() }
+    }
+    Loader {
+        id: fmtLoader
+        anchors.centerIn: parent
+        active: fm.fmtOpen
+        z: 210
+        sourceComponent: DriveFormatDialog {
+            disk: fm.fmtDisk
+            startLabel: fm.fmtLabel
+            onCloseRequested: fm.fmtOpen = false
+            onStarting: fm.leaveDisk(fm.fmtDisk)
+            onFormatted: function(dev, obj, label) { fm.driveFormatted(dev, obj, label); }
         }
     }
 

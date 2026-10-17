@@ -89,6 +89,22 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
 
 ### Added
 
+- **Format a USB drive from the file manager.** Right-click a USB stick or
+  disk under *Devices* → *Format drive…*; a drive with nothing readable on it
+  (blank, encrypted, an unknown file system) is listed there as *Not
+  readable* and opens the same dialog. A name and a format — exFAT (default),
+  FAT32, NTFS or ext4, each with one line on where it works — and *Erase and
+  format*, pressed twice. `vexyon-format` does it through udisks2: a new
+  partition table (MBR up to 2 TiB, GPT above) and one partition, then the
+  drive is mounted and opened. It refuses anything that is not a USB or
+  removable drive, or that holds a system mount or active swap. udisks'
+  `tear-down` option is not used — it asks for the administrator password
+  even with nothing in fstab — so what is mounted or unlocked on the drive
+  is unmounted and locked first, as you; formatting then needs only
+  `modify-device`, which the active session has without a password. Arch:
+  `install.sh` installs `exfatprogs`, `dosfstools` and `ntfsprogs` (each only
+  if its `mkfs` is missing; `ntfs-3g` on mirrors from before the split). NixOS:
+  udisks already carries its own `mkfs` tools.
 - **The Vexyon file manager is the file chooser of every app.** A browser's
   *Upload* or *Save as*, GTK apps and Flatpaks get a Vexyon file manager
   window in pick mode (open one or several files, choose a folder, save with
@@ -162,6 +178,20 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
 
 ### Changed
 
+- **New folder / new file ask for the name.** They used to create "New
+  folder" and leave you to find it and rename it. Now a dialog asks first
+  (a free name is suggested and selected), says when the name exists or is
+  not valid, and the new item is selected and scrolled to. The background
+  menu gained *New file*; Ctrl+Shift+N makes a folder.
+- **One Trash for every drive.** Files deleted on another internal drive go,
+  as before, to that drive's own trash folder (`.Trash-UID`: moving them home
+  would copy them), but **Trash** now lists all of them together with the
+  home trash; *Restore* puts each one back on its drive and *Empty trash*
+  empties them all. On an external drive (USB) deleting no longer drops the
+  file into a hidden `.Trash-1000` on the stick: the file manager says it
+  will be deleted permanently and asks first. When a drive has no usable
+  trash, it asks before deleting permanently instead of failing. Shift+Delete
+  deletes permanently, after asking.
 - **AirDrop: who can send is chosen in Settings only.** The panel lost its
   Everyone / Contacts Only chips (it shows one line while Contacts Only is
   on). Settings explains that Contacts Only is optional and needs no Mac or

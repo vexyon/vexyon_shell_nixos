@@ -28,8 +28,15 @@ import Quickshell.Io
 Singleton {
     id: root
 
-    // [{ obj, dev, label, size, mount, ejectable }] — solo extraíbles montables
+    // [{ obj, dev, label, fsLabel, size, mount, ejectable, disk }] — solo
+    // extraíbles montables; `fsLabel` es la etiqueta del sistema de ficheros
+    // (o "") y `disk` el objeto udisks del disco entero que lo contiene.
     property var devices: []
+    // [{ obj, dev, name, size, bytes, readable }] — los discos extraíbles/USB
+    // enteros, también los que no tienen nada montable (sin formato, cifrados,
+    // un sistema de ficheros desconocido): `readable` es false para esos. Es lo
+    // que se puede formatear (vexyon-format).
+    property var drives: []
     property string lastError: ""
     // Recalculada la lista (enchufe/extracción/montaje). El gestor la escucha
     // para salir de un directorio cuyo dispositivo ha desaparecido.
@@ -51,6 +58,19 @@ Singleton {
         for (var i = 0; i < root.devices.length; i++)
             if (root.devices[i].mount === path) return true;
         return false;
+    }
+    // El dispositivo montado que contiene `p`, o null.
+    function deviceFor(p) {
+        for (var i = 0; i < root.devices.length; i++) {
+            var m = root.devices[i].mount;
+            if (m !== "" && (p === m || p.indexOf(m + "/") === 0)) return root.devices[i];
+        }
+        return null;
+    }
+    function driveOf(disk) {
+        for (var i = 0; i < root.drives.length; i++)
+            if (root.drives[i].obj === disk) return root.drives[i];
+        return null;
     }
     // ¿`p` está dentro de algún dispositivo todavía montado?
     function contains(p) {
@@ -120,14 +140,11 @@ Singleton {
                 name: ((prop(d, "Vendor") || "") + " " + (prop(d, "Model") || "")).trim()
             };
         }
-        var out = [];
+        var out = [], whole = [], readable = {};
         for (var q in objs) {
             var o = objs[q];
             var b = o["org.freedesktop.UDisks2.Block"];
-            var f = o["org.freedesktop.UDisks2.Filesystem"];
-            // Sin interfaz Filesystem no hay nada que montar (discos enteros con
-            // tabla de particiones, swap, zram... quedan fuera solos).
-            if (!b || !f) continue;
+            if (!b) continue;
             if (prop(b, "HintIgnore") === true) continue;
             if (prop(b, "HintSystem") === true) continue;
             var dr = drives[prop(b, "Drive") || ""];
@@ -135,6 +152,19 @@ Singleton {
             if (!dr.removable && dr.bus !== "usb") continue;
 
             var dev = ayToString(b.Device);
+            var part = o["org.freedesktop.UDisks2.Partition"];
+            // El disco entero (sin interfaz Partition): lo que se formatea. Un
+            // lector de tarjetas vacío tiene tamaño 0 y no cuenta.
+            if (!part && (prop(b, "Size") || 0) > 0)
+                whole.push({ obj: q, dev: dev, name: dr.name || dev.split("/").pop(),
+                             size: fmtSize(prop(b, "Size")), bytes: prop(b, "Size") });
+
+            var f = o["org.freedesktop.UDisks2.Filesystem"];
+            // Sin interfaz Filesystem no hay nada que montar (discos enteros con
+            // tabla de particiones, swap, LUKS... quedan fuera solos).
+            if (!f) continue;
+            var disk = part ? (prop(part, "Table") || q) : q;
+            readable[disk] = true;
             var mps = (f.MountPoints && f.MountPoints.data) || [];
             var label = prop(b, "IdLabel") || prop(b, "HintName") || dr.name
                         || dev.split("/").pop();
@@ -142,13 +172,17 @@ Singleton {
                 obj: q,
                 dev: dev,
                 label: label,
+                fsLabel: prop(b, "IdLabel") || "",
                 size: fmtSize(prop(b, "Size")),
                 mount: mps.length > 0 ? ayToString({ data: mps[0] }) : "",
-                ejectable: dr.ejectable
+                ejectable: dr.ejectable,
+                disk: disk
             });
         }
         out.sort(function(a, b2) { return a.dev < b2.dev ? -1 : 1; });
-        return out;
+        for (var w = 0; w < whole.length; w++) whole[w].readable = readable[whole[w].obj] === true;
+        whole.sort(function(a, b2) { return a.dev < b2.dev ? -1 : 1; });
+        return { devices: out, drives: whole };
     }
 
     Process {
@@ -158,11 +192,15 @@ Singleton {
                   "org.freedesktop.DBus.ObjectManager", "GetManagedObjects"]
         stdout: StdioCollector {
             onStreamFinished: {
-                try { root.devices = root.parseObjects(this.text); }
-                catch (e) {
+                try {
+                    var r = root.parseObjects(this.text);
+                    root.devices = r.devices;
+                    root.drives = r.drives;
+                } catch (e) {
                     // udisks2 ausente o respuesta inesperada: lista vacía, sin ruido
                     // repetido y sin reintentos en bucle.
                     root.devices = [];
+                    root.drives = [];
                     console.warn("[Drives] udisks2 enumerate failed:", e);
                 }
                 root.changed();

@@ -20,6 +20,158 @@ VEXYON OUT-OF-THE-BOX POLICY Every Vexyon feature must ship together with all re
 
 PERMANENT POLICY: If Vexyon's installation changes, its GitHub README.md MUST be updated in the same development task. No exceptions.
 
+## Session: file manager — name when creating, one Trash for every drive, formatting USB drives
+
+### Why
+
+The owner asked for three things in the built-in file manager:
+
+1. Creating a folder or a file made "New folder" / a default name straight
+   away and left them to find it and rename it. It must ask for the name.
+2. Deleting on another drive (internal or external) left the file in that
+   drive's `.Trash-1000`, not in "my Trash". It must show in the Trash, or —
+   on an external drive — be deleted for good.
+3. A USB stick or disk (USB-A or USB-C) must be formattable from the shell.
+
+### What changed
+
+- **Name first** (`modules/FileManager.qml`). *New folder*, *New file* (new
+  in the background menu), the toolbar **+** and Ctrl+Shift+N open the
+  rename dialog in "create" mode with a free name suggested and selected
+  ("New folder 2", "New document.txt" without the extension selected). It
+  refuses an empty name, `/`, `.` and `..`, and a name already in the folder
+  (checked against every entry, hidden and filtered ones too), then runs
+  `mkdir --` or `set -C; : >` (never overwrites) and selects the new item and
+  scrolls to it. A failure is shown as a notice with the reason.
+- **One Trash** (`modules/FileManager.qml`, `services/Drives.qml`). The
+  Trash view lists the home trash and every mounted drive's `.Trash-UID/files`
+  and `.Trash/UID/files` (from `/proc/self/mounts`, pseudo file systems
+  skipped, `\040` decoded), read when the view is opened — nothing watches.
+  Restore resolves a drive trash's relative `Path=` against that drive's top
+  directory (the freedesktop rule); *Delete permanently* and *Empty trash*
+  work per trash. Deleting on an **external** drive (`Drives.deviceFor`: a
+  removable/USB device udisks mounted) no longer calls `gio trash`: a dialog
+  says the file will be deleted permanently and asks. A local `gio trash`
+  that fails (no usable trash on that drive) asks the same instead of just
+  failing. Shift+Delete asks and deletes permanently. Internal drives keep
+  their own trash folder on purpose: moving a file home would copy it
+  across file systems.
+- **Formatting** (new `bin/vexyon-format`, new `modules/DriveFormatDialog.qml`,
+  `services/Drives.qml`, `modules/FileManager.qml`).
+  - `Drives` now also lists whole USB/removable drives (`drives`, with
+    `readable` false when nothing on them can be mounted) and gives each
+    device its whole-disk object (`disk`) and its file-system label
+    (`fsLabel`). Still one `GetManagedObjects` per udisks event while a file
+    manager window is open; nothing new runs.
+  - Sidebar: right-click on a device → Open / Unmount / **Format drive…**; a
+    drive with nothing readable is listed as "Not readable" and a click opens
+    the format dialog.
+  - Dialog: drive name, size and device; "Everything on this drive will be
+    erased."; name (length limit per format: exFAT 15, FAT32 11 bytes, NTFS
+    32, ext4 16 bytes; FAT32 names upper-cased and stripped of the
+    characters FAT refuses); exFAT (default) / FAT32 / NTFS / ext4 with one
+    line each; formats udisks cannot make here are shown as unavailable with
+    the missing tool and "re-run the installer / rebuild" (`vexyon-format
+    --can`, asked once per dialog). *Erase and format* must be pressed twice
+    within 4 s (a one-shot Timer, not a poll). While it runs the dialog
+    cannot be closed. On success: notice, mount, open. The window leaves the
+    drive first if it is inside it.
+  - `vexyon-format BLOCK TYPE LABEL` (udisks2 over `busctl`, same file in
+    both repos): refuses a malformed object path, a partition, a drive that
+    is neither removable nor USB, `HintSystem`, active swap, or a mount of
+    `/`, `/boot*`, `/efi`, `/home*`, `/nix*`, `/usr*`, `/var*`, `/etc`,
+    `/opt`, `/srv`, `/root`. Unmounts every mounted file system on the drive
+    (also inside unlocked LUKS) and locks the LUKS containers, then
+    `Block.Format` (MBR ≤ 2 TiB, GPT above) and
+    `PartitionTable.CreatePartitionAndFormat` (ext4 with `take-ownership`).
+    It prints the new partition's device and object.
+  - **Why not udisks' `tear-down`:** the first VM run showed that
+    `Format(…, tear-down=true)` makes udisks ask polkit for
+    `org.freedesktop.udisks2.modify-system-configuration` (auth_admin_keep —
+    the admin password) even with nothing in fstab/crypttab. Without it,
+    formatting asks only `modify-device`, which is `allow_active=yes`.
+- **Packages.** Arch `install.sh`: `exfatprogs`, `dosfstools`, and
+  `ntfsprogs` (Arch moved `mkfs.ntfs` out of `ntfs-3g` into `ntfsprogs` in
+  May 2026; `ntfs-3g` on a mirror without `ntfsprogs`), each only if its
+  `mkfs` is missing: `exfat-utils` and a pre-split `ntfs-3g` own the same
+  files and `pacman --noconfirm` would refuse the replacement, failing the
+  whole transaction. NixOS: nothing to add — nixpkgs' udisks runs with a
+  fixed PATH that already has `dosfstools`, `exfat`, `ntfs3g`, `e2fsprogs`.
+- I18n: every new string in Spanish, including the helper's reasons.
+- READMEs (both): the three features; Arch: the new packages. CHANGELOG.
+
+### Verified
+
+- **NixOS VM test with emulated USB mass storage** (ad-hoc
+  `runNixOSTest`, our 26.05 nixpkgs snapshot, the shell package and module
+  from this tree, stock udisks 2.11.2; a 1 GiB removable USB stick, a 3 TiB
+  sparse USB disk and an internal virtio disk; `vexyon-format` run as the
+  user through `systemd-run --user`; a polkit rule stands in for the active
+  seat and logs every udisks action asked):
+  - `--can`: all four formats available with nixpkgs' udisks (its own
+    `exfat`, `dosfstools`, `ntfs3g`, `e2fsprogs`).
+  - exFAT, FAT32, NTFS, ext4 in turn on the stick: exit 0, the new
+    partition's device printed, `TYPE=`/`LABEL=` as asked, mounted by the
+    user with `udisksctl`, a file written, owner the user (ext4 through
+    `take-ownership`).
+  - Formatting while the stick was mounted (FAT32 step): unmounted first.
+  - A stick with a mounted FAT partition and an unlocked LUKS partition with
+    a mounted ext4 inside: both unmounted, LUKS locked, then formatted
+    (ext4) — udisks logged "Locked device /dev/sdb2".
+  - Refusals, each exit 1 with its message and the disk untouched: the
+    internal virtio disk ("Only external drives…"), the root disk, a
+    partition path, a FAT32 name over 11 bytes, a malformed object path.
+  - The 3 TiB disk: GPT and an exFAT partition of 3 T.
+  - Polkit actions asked: only `modify-device` and `filesystem-mount`
+    (their `-other-seat` variants, no seat in a VM) — no
+    `modify-system-configuration`. The first run, with udisks'
+    `tear-down`, was refused exactly there; that is why the helper now
+    unmounts and locks by itself.
+  The final run asserts all of the above (types via `blkid` after `udevadm
+  settle`, writes, refusals, GPT): passed, exit 0 (592 s, TCG, no KVM).
+- **Lab** (headless sway, the real Quickshell 0.3.0 and this tree's QML, a
+  stub `vexyon-format` and injected `Drives` data): right-click on an
+  unmounted device → Open / Format drive…; on a mounted one → Open /
+  Unmount / Format drive…; the dialog (drive line, warning, name with the
+  label preset, four formats with NTFS shown unavailable when `--can` says
+  so); FAT32 + "mi pendrive" → the helper got `vfat MI PENDRIVE`; first
+  press arms ("Press again to erase it"), second runs ("Formatting… Do not
+  unplug the drive.", no close button), success → notice "“MI PENDRIVE” is
+  formatted and ready."; Enter twice works the same; a failing run shows
+  "A program is still using the drive. Close it and try again."; a window
+  inside the stick goes home before erasing; a drive with nothing readable
+  shows "28.7 GB · Not readable" and opens the dialog; Spanish
+  (Formatear unidad, Borrar y formatear, No legible…). No QML warnings.
+- Name dialog and Trash (lab, earlier in this task): new folder/new file
+  dialogs, "already exists" error, Ctrl+Shift+N, creation + selection; the
+  Trash view with a home item and a drive's `.Trash-0` item together,
+  restore to the drive's relative path, *Empty trash* on both; external
+  delete dialog, "no trash" dialog (fake `gio`), Shift+Delete dialog.
+- `bash -n` + shellcheck: `vexyon-format` clean; `install.sh` only the
+  existing SC2154 note. The helper's jq selection also checked offline
+  against a fake object tree (mounted partition + unlocked LUKS → what to
+  unmount and lock; system disk flagged).
+- I18n checker: 0 missing keys. Shared files byte-identical across the two
+  repos except the allowed platform files.
+
+### Not verified
+
+- On real hardware: no physical USB stick was formatted (the VM uses QEMU's
+  emulated USB mass storage), and nothing ran on the owner's machine.
+- That the polkit action on a real seat is the plain `modify-device`
+  (`allow_active=yes`, no password): in the VM the user has no seat, so
+  udisks asked the `-other-seat` variant, which the test's rule allowed. A
+  USB port and a greetd session on seat0 are the same seat, which is what
+  udisks checks, but this was not run on a desktop.
+- Arch: `install.sh` only through `bash -n` / shellcheck; the package
+  names come from archlinux.org (`exfatprogs` in extra, the
+  `ntfs-3g`/`ntfsprogs` split todo); `mkfs.ntfs` being in `ntfsprogs`
+  follows from that split and the ArchWiki, not from a file list I could
+  open (the Arch sites were not reachable from this session).
+- The Trash and name-dialog changes were tested in the lab (headless sway,
+  real Quickshell, a fake `gio` for the "no trash" case and fake devices),
+  not with a real second drive.
+
 ## Session: NixOS without the setuid pkexec (owner's screenshot)
 
 ### Why

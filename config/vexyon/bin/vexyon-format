@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  vexyon-format — erase an external drive (USB stick, USB disk) and leave it
+#  with one partition, formatted. The file manager's "Format drive…" runs it.
+#  The same file ships in both repos.
+#
+#    vexyon-format BLOCK TYPE LABEL   BLOCK: the drive's whole-disk udisks
+#                                     object (/org/freedesktop/UDisks2/
+#                                     block_devices/sdb); TYPE: exfat | vfat |
+#                                     ntfs | ext4. Prints the new partition's
+#                                     device (/dev/sdb1) and object path.
+#    vexyon-format --can              which TYPEs udisks can make here, JSON:
+#                                     {"exfat":{"ok":true,"need":""},…}
+#  Exit: 0 done, 1 refused or failed (the reason on stderr), 2 usage.
+#
+#  Everything goes through udisks2 (D-Bus, `busctl`), the same service Disks
+#  and Dolphin use: a new partition table (MBR up to 2 TiB, GPT above) and one
+#  partition with the file system. Its polkit action for a drive that is not
+#  part of the system (org.freedesktop.udisks2.modify-device) is allowed for
+#  the active session without a password; the file manager asks twice before
+#  calling this. udisks' own "tear-down" is NOT used: it also asks for
+#  modify-system-configuration (the admin password, even with nothing in
+#  fstab), so what is mounted or unlocked on the drive is unmounted and
+#  locked here first, as the user. This script refuses anything that is not a
+#  removable or USB drive, or that holds a mounted system path or active swap,
+#  whatever the caller passes.
+# ============================================================================
+set -u
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+UD=org.freedesktop.UDisks2
+
+can_format() {
+  local t out first=1
+  printf '{'
+  for t in exfat vfat ntfs ext4; do
+    out=$(busctl --system call "$UD" /org/freedesktop/UDisks2/Manager "$UD.Manager" CanFormat s "$t" 2>/dev/null)
+    # (bs) true ""   |   (bs) false "mkfs.exfat"
+    local ok=false need=""
+    case "$out" in "(bs) true"*) ok=true ;; "(bs) false"*) need=$(printf '%s' "$out" | sed -n 's/^(bs) false "\(.*\)"$/\1/p') ;; *) need=udisks2 ;; esac
+    [ "$first" = 1 ] || printf ','
+    first=0
+    printf '"%s":{"ok":%s,"need":"%s"}' "$t" "$ok" "$need"
+  done
+  printf '}\n'
+}
+
+if [ "${1:-}" = --can ]; then can_format; exit 0; fi
+[ $# -eq 3 ] || { echo "usage: vexyon-format BLOCK exfat|vfat|ntfs|ext4 LABEL | --can" >&2; exit 2; }
+BLOCK=$1 FS=$2 LABEL=$3
+
+[[ "$BLOCK" =~ ^/org/freedesktop/UDisks2/block_devices/[A-Za-z0-9_]+$ ]] || die "Not a udisks drive: $BLOCK"
+# Label limits: FAT32 and ext4 count bytes, exFAT and NTFS characters.
+case "$FS" in
+  exfat) max=15 len=${#LABEL} ;;
+  vfat)  max=11 len=$(printf '%s' "$LABEL" | wc -c) ;;
+  ntfs)  max=32 len=${#LABEL} ;;
+  ext4)  max=16 len=$(printf '%s' "$LABEL" | wc -c) ;;
+  *) echo "vexyon-format: unknown type $FS" >&2; exit 2 ;;
+esac
+[ "$len" -le "$max" ] || die "The name is too long for this format ($max characters at most)."
+if ! command -v busctl >/dev/null || ! command -v jq >/dev/null; then die "busctl and jq are needed."; fi
+
+# ---- what udisks knows about this block and its drive ----------------------
+objs=$(busctl --system --json=short call "$UD" /org/freedesktop/UDisks2 \
+         org.freedesktop.DBus.ObjectManager GetManagedObjects 2>/dev/null) \
+  || die "udisks2 is not available."
+info=$(printf '%s' "$objs" | jq -c --arg b "$BLOCK" '
+  .data[0] as $o
+  | ($o[$b] // {}) as $blk
+  | ($blk["org.freedesktop.UDisks2.Block"] // null) as $B
+  | if $B == null then {missing: true} else
+    ($o[$B.Drive.data] // {})["org.freedesktop.UDisks2.Drive"] as $D
+    # this block and every partition of its table, plus what is unlocked
+    # from them (LUKS)
+    | [ $o | to_entries[]
+        | select(.key == $b or (.value["org.freedesktop.UDisks2.Partition"].Table.data // "") == $b) ] as $own
+    | [ $own[].key ] as $ownk
+    | ($own + [ $o | to_entries[]
+        | select((.value["org.freedesktop.UDisks2.Block"].CryptoBackingDevice.data // "/") as $c | $ownk | index($c)) ]) as $parts
+    | {
+        missing: false,
+        partition: ($blk["org.freedesktop.UDisks2.Partition"] != null),
+        system: ($B.HintSystem.data == true),
+        size: $B.Size.data,
+        removable: ($D != null and ($D.Removable.data == true or $D.ConnectionBus.data == "usb")),
+        mounts: [ $parts[].value["org.freedesktop.UDisks2.Filesystem"].MountPoints.data // [] | .[]
+                  | map(select(. != 0)) | implode ],
+        swap: ([ $parts[].value["org.freedesktop.UDisks2.Swapspace"].Active.data // false ] | any),
+        # to unmount (mounted file systems) and to lock (unlocked LUKS)
+        mounted: [ $parts[] | select((.value["org.freedesktop.UDisks2.Filesystem"].MountPoints.data // []) | length > 0) | .key ],
+        unlocked: [ $parts[] | select((.value["org.freedesktop.UDisks2.Encrypted"].CleartextDevice.data // "/") != "/") | .key ]
+      }
+    end')
+[ "$(jq -r .missing <<<"$info")" = false ] || die "This drive is no longer connected."
+[ "$(jq -r .partition <<<"$info")" = false ] || die "Pass the whole drive, not one of its partitions."
+[ "$(jq -r .removable <<<"$info")" = true ] || die "Only external drives (USB, removable) can be formatted here."
+[ "$(jq -r .system <<<"$info")" = false ] || die "This drive is part of the system; it is not formatted here."
+[ "$(jq -r .swap <<<"$info")" = false ] || die "This drive holds active swap space."
+while IFS= read -r m; do
+  case "$m" in
+    /|/boot|/boot/*|/efi|/home|/home/*|/nix|/nix/*|/usr|/usr/*|/var|/var/*|/etc|/opt|/srv|/root)
+      die "This drive holds $m, which the system is using." ;;
+  esac
+done < <(jq -r '.mounts[]' <<<"$info")
+
+size=$(jq -r .size <<<"$info")
+# MBR addresses up to 2 TiB; above that GPT. Both are read by Windows, macOS
+# and Linux.
+if [ "$size" -gt $((2 * 1024 * 1024 * 1024 * 1024)) ]; then
+  table=gpt
+  case "$FS" in ext4) ptype=0fc63daf-8483-4772-8e79-3d69d8477de4 ;; *) ptype=ebd0a0a2-b9e5-4433-87c0-68b6b72699c7 ;; esac
+else
+  table=dos
+  case "$FS" in vfat) ptype=0x0c ;; ext4) ptype=0x83 ;; *) ptype=0x07 ;; esac
+fi
+
+# ---- let go of the drive: unmount, then lock -------------------------------
+while IFS= read -r o; do
+  [ -n "$o" ] || continue
+  err=$(busctl --system --timeout=120 call "$UD" "$o" "$UD.Filesystem" Unmount 'a{sv}' 0 2>&1 >/dev/null) \
+    || die "Could not erase the drive: ${err#Call failed: }"
+done < <(jq -r '.mounted[]' <<<"$info")
+while IFS= read -r o; do
+  [ -n "$o" ] || continue
+  err=$(busctl --system --timeout=120 call "$UD" "$o" "$UD.Encrypted" Lock 'a{sv}' 0 2>&1 >/dev/null) \
+    || die "Could not erase the drive: ${err#Call failed: }"
+done < <(jq -r '.unlocked[]' <<<"$info")
+
+# ---- erase: a new, empty partition table -----------------------------------
+err=$(busctl --system --timeout=600 call "$UD" "$BLOCK" "$UD.Block" Format 'sa{sv}' \
+        "$table" 0 2>&1 >/dev/null) \
+  || die "Could not erase the drive: ${err#Call failed: }"
+
+# ---- one partition with the file system ------------------------------------
+# ext4 is owned by root unless asked otherwise; take-ownership hands it to you.
+opts=(1 label s "$LABEL")
+[ "$FS" = ext4 ] && opts=(2 label s "$LABEL" take-ownership b true)
+out=$(busctl --system --timeout=600 call "$UD" "$BLOCK" "$UD.PartitionTable" CreatePartitionAndFormat \
+        'ttssa{sv}sa{sv}' 0 0 "$ptype" "" 0 "$FS" "${opts[@]}" 2>&1) \
+  || die "Could not create the file system: ${out#Call failed: }"
+part=$(printf '%s' "$out" | sed -n 's/^o "\(.*\)"$/\1/p')
+[ -n "$part" ] || die "udisks did not say which partition it created."
+dev=$(busctl --system --json=short get-property "$UD" "$part" "$UD.Block" Device 2>/dev/null \
+        | jq -r '.data | map(select(. != 0)) | implode' 2>/dev/null)
+printf '%s\n%s\n' "${dev:-}" "$part"
