@@ -946,10 +946,12 @@ Singleton {
             "Move to Trash": "Mover a la papelera",
             "My server": "Mi servidor",
             "Host": "Host",
+            "Desktop": "Escritorio",
             "Documents": "Documentos",
             "Downloads": "Descargas",
             "Pictures": "Imágenes",
             "Music": "Música",
+            "Videos": "Vídeos",
             " items": " elementos",
             " item": " elemento",
             " shortcuts": " atajos",
@@ -1420,7 +1422,7 @@ Singleton {
             "Wi-Fi is off": "La Wi-Fi está apagada",
             "Wi-Fi/Ethernet network status": "Estado de red Wi-Fi/Ethernet",
             "Widget transparency": "Transparencia de los widgets",
-            "Will revert to the previous configuration in ": "Se revertirá a la configuración anterior en ",
+            "Goes back to the previous configuration in %1 s unless you keep it.": "Vuelve a la configuración anterior en %1 s si no la mantienes.",
             "Window rounding (Hyprland)": "Redondeo de ventanas (Hyprland)",
             "Workspace": "Espacio de trabajo",
             "Workspace indicator": "Indicador de espacios de trabajo",
@@ -1550,7 +1552,9 @@ Singleton {
             "Only external drives (USB, removable) can be formatted here.": "Aquí solo se pueden formatear unidades externas (USB, extraíbles).",
             "This drive is part of the system; it is not formatted here.": "Esta unidad forma parte del sistema; aquí no se formatea.",
             "This drive holds active swap space.": "Esta unidad contiene espacio de intercambio (swap) en uso.",
-            "udisks did not say which partition it created.": "udisks no ha dicho qué partición ha creado."
+            "udisks did not say which partition it created.": "udisks no ha dicho qué partición ha creado.",
+            // Ajustes → Pantallas
+            "At least one monitor has to stay on.": "Al menos un monitor tiene que quedarse encendido."
         }
     })
 }

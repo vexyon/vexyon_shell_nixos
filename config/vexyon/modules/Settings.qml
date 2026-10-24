@@ -2370,7 +2370,9 @@ FloatingWindow {
                         border.width: 1; border.color: Theme.surface2
                         clip: true
 
-                        readonly property var mons: Displays.monitors
+                        // solo los encendidos: uno apagado no ocupa sitio en el escritorio
+                        // (y uno apagado desde el arranque ni tiene tamaño, 0x0)
+                        readonly property var mons: Displays.monitors.filter(function(m) { return !m.disabled; })
                         readonly property int pad: 16
                         // `hyprctl monitors -j` da width/height del MODO del panel, SIN
                         // aplicar la rotación: un monitor a 90°/270° sigue diciendo
@@ -2506,6 +2508,7 @@ FloatingWindow {
                             readonly property var c: Displays.monCfg(modelData.name) || ({})
                             property bool expanded: false
                             property bool compExpanded: false
+                            property bool lastOnHint: false   // quiso apagar el único encendido
                             Layout.fillWidth: true
                             Layout.preferredHeight: cardCol.implicitHeight + 24
                             radius: Theme.radius + 2
@@ -2534,20 +2537,40 @@ FloatingWindow {
                                         Text { text: Displays.displayLabel(monCard.modelData); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize + 1; font.bold: true }
                                         Text {
                                             text: (monCard.modelData.make !== "" ? monCard.modelData.make + " · " : "")
-                                                  + monCard.c.resolution + "@" + monCard.c.refresh + " · " + monCard.c.scale + "×"
+                                                  + (monCard.c.enabled === false ? I18n.t("Off")
+                                                     : monCard.c.resolution + "@" + monCard.c.refresh + " · " + monCard.c.scale + "×")
                                             color: Theme.subtext0; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
                                         }
                                     }
                                     // enable toggle
                                     Toggle {
+                                        id: monToggle
                                         checked: monCard.c.enabled !== false
-                                        onToggled: function(v) { Displays.setMonitorField(monCard.modelData.name, "enabled", v); }
+                                        onToggled: function(v) {
+                                            if (!v && !Displays.canDisable(monCard.modelData.name)) {
+                                                monCard.lastOnHint = true;
+                                                monToggle.checked = Qt.binding(function() { return monCard.c.enabled !== false; });
+                                                return;
+                                            }
+                                            monCard.lastOnHint = false;
+                                            Displays.setMonitorField(monCard.modelData.name, "enabled", v);
+                                        }
                                     }
                                     IconButton {
                                         icon: monCard.expanded ? Icons.chevronDown : Icons.chevronRight
                                         iconSize: Theme.fontSize; implicitWidth: 30; implicitHeight: 30
                                         onClicked: monCard.expanded = !monCard.expanded
                                     }
+                                }
+
+                                Text {
+                                    Layout.fillWidth: true
+                                    visible: monCard.lastOnHint
+                                    text: I18n.t("At least one monitor has to stay on.")
+                                    color: Theme.red
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: Theme.fontSize - 3
+                                    wrapMode: Text.WordWrap
                                 }
 
                                 // expanded controls

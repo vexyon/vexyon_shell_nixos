@@ -20,6 +20,82 @@ VEXYON OUT-OF-THE-BOX POLICY Every Vexyon feature must ship together with all re
 
 PERMANENT POLICY: If Vexyon's installation changes, its GitHub README.md MUST be updated in the same development task. No exceptions.
 
+## Session: a monitor turned off could not come back; English shell showing Spanish
+
+### Why
+
+The owner (three monitors, DP-1/DP-2/DP-3) turned DP-1 off in Settings →
+Displays: it disappeared from the page, the profile stopped matching, and
+DP-1 lit up only at the login screen, going dark once logged in, with no
+way to turn it back on. Also: with the shell in English, the file manager's
+sidebar showed the user folders in Spanish.
+
+### Root causes
+
+- `services/Displays.qml` listed monitors with `hyprctl monitors -j`, which
+  iterates only enabled monitors (`m_monitors`); `hyprctl monitors all`
+  iterates `m_realMonitors` (checked in Hyprland's `HyprCtl.cpp`). A monitor
+  turned off left the list (no card, no switch), the fingerprint became
+  DP-2|DP-3 against the profile's DP-1|DP-2|DP-3, and the bridge kept
+  writing `disabled = true` for DP-1 into `vexyon-monitors.lua`, so it went
+  off after each login (the greeter does not use the profile).
+- `applyProfile()` called `applyLive()` once per monitor on ONE Process:
+  every call after the first found it running and was lost, so applying a
+  profile — and the 10 s revert — applied only one monitor.
+- `Places.builtin` labelled the XDG folders with the folder's basename
+  (`~/Escritorio` → "Escritorio") whatever the shell language.
+- `MonitorRevertDialog.qml` glued an English key to a hard-coded Spanish
+  tail ("… s si no confirmas.").
+
+### What changed
+
+- Displays: `hyprctl monitors all -j`, skipping Hyprland's `FALLBACK`
+  output. Arrangement draws only monitors that are on; a card for one that
+  is off says "Off". Turning one on with no usable saved mode (0x0, never
+  set this session) picks its largest mode at its highest refresh and
+  places it right of the monitors that are on (rotation and scale taken
+  into account). `canDisable()`: the last monitor that is on cannot be
+  turned off (the switch stays on, the card says why). Live calls go
+  through `_eval()`: several monitors in one `hyprctl eval`, later calls
+  queued while one runs. `monCall()` and the bridge's `lua_monitor_call()`
+  (both repos) ask for `preferred` when the saved mode is not WxH@R.
+- Places: user folders named by role through `I18n.t` (Desktop, Documents,
+  Downloads, Pictures, Music, Videos); the folders on disk are untouched.
+  New Spanish keys "Desktop", "Videos".
+- Revert dialog: one sentence per language with `%1`.
+
+### Verified
+
+- Lab (headless sway, real Quickshell 0.3.0, this tree's QML) with a
+  stateful fake `hyprctl` modelled on Hyprland's output: three monitors,
+  DP-1 off since login (0x0), DP-2 rotated, plus a disabled `FALLBACK`;
+  the owner's situation as profile (DP-1 saved off).
+  - Before any click: DP-1 listed with its switch off and "Off", "Matches
+    profile: Default", the profile applied in ONE eval with all three.
+  - DP-1 on → `hl.monitor({ output = "DP-1", mode = "1920x1080@180",
+    position = "0x0", … })`; the revert dialog in English; letting it run
+    out re-applied all three monitors in one call (DP-1 off again).
+  - Profile without DP-1 saved: turning it on → `1920x1080@180` at
+    `5560x0` (right of DP-2 at 4480, 1080 wide rotated).
+  - DP-1 and DP-3 off, then DP-2 (last on): refused, switch stays on,
+    "At least one monitor has to stay on."; no `hyprctl` call sent.
+  - File manager sidebar over `~/Escritorio`, `~/Vídeos`…: English shell →
+    Desktop … Videos; switched live to Spanish → Escritorio … Vídeos.
+  - No QML warnings from the changed files.
+- Bridge `lua_monitor_call()` (both repos): a valid mode, a 0x0 one
+  (→ `preferred`), a disabled one — expected Lua. `py_compile` OK.
+- I18n checker 0 missing; shared files byte-identical except the allowed
+  platform files; NixOS package builds.
+
+### Not verified
+
+- On real Hyprland and the owner's monitors: only the fake `hyprctl`. That
+  Hyprland reports a monitor off since login as 0x0 comes from its source
+  (`m_pixelSize` never set), not from a run.
+- The folders on disk keep their names (an English shell over
+  `~/Escritorio` still shows that folder name in Home and the path bar);
+  renaming them is not done automatically.
+
 ## Session: file manager — name when creating, one Trash for every drive, formatting USB drives
 
 ### Why

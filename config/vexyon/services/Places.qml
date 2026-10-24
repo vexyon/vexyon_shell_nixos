@@ -49,15 +49,29 @@ Singleton {
         return m;
     }
 
-    //  Built-in sidebar rows: Home, then the user folders that exist.
+    //  Built-in sidebar rows: Home, then the user folders that exist. Named by
+    //  what they are, in the shell's language — not by the folder's name on
+    //  disk: an English shell over ~/Escritorio still says "Desktop", and a
+    //  Spanish one over ~/Desktop says "Escritorio".
     readonly property var builtin: {
         var out = [{ key: "HOME", path: root.home, label: I18n.t("Home"), exists: true }];
         for (var i = 0; i < root.sidebarKeys.length; i++) {
             var d = root.dirs[root.sidebarKeys[i]];
             if (d && d.exists)
-                out.push({ key: root.sidebarKeys[i], path: d.path, label: root.basename(d.path), exists: true });
+                out.push({ key: root.sidebarKeys[i], path: d.path, label: root.xdgLabel(root.sidebarKeys[i], d.path), exists: true });
         }
         return out;
+    }
+    function xdgLabel(key, path) {
+        switch (key) {
+        case "DESKTOP":   return I18n.t("Desktop");
+        case "DOCUMENTS": return I18n.t("Documents");
+        case "DOWNLOAD":  return I18n.t("Downloads");
+        case "PICTURES":  return I18n.t("Pictures");
+        case "MUSIC":     return I18n.t("Music");
+        case "VIDEOS":    return I18n.t("Videos");
+        }
+        return root.basename(path);
     }
 
     function basename(p) { var s = p.replace(/\/+$/, ""); return s.substring(s.lastIndexOf("/") + 1) || "/"; }

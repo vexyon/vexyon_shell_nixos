@@ -77,8 +77,7 @@ PanelWindow {
 
             Text {
                 Layout.fillWidth: true
-                text: I18n.t("Will revert to the previous configuration in ")
-                      + Displays.revertSeconds + " s si no confirmas."
+                text: I18n.t("Goes back to the previous configuration in %1 s unless you keep it.").arg(Displays.revertSeconds)
                 color: Theme.subtext0
                 font.family: Theme.fontFamily
                 font.pixelSize: Theme.fontSize - 1

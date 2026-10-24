@@ -10,6 +10,28 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
 
 ### Fixed
 
+- **Settings → Displays: a monitor turned off vanished and could not be
+  turned back on.** The page read `hyprctl monitors -j`, which lists only
+  enabled monitors, so the switched-off one left the list, its profile
+  stopped matching ("The connected hardware doesn't match any saved
+  profile"), and since the profile kept it off it went dark after every
+  login (on at the login screen, off once logged in). It now reads
+  `hyprctl monitors all -j` (Hyprland's own `FALLBACK` output hidden): a
+  monitor that is off stays listed, says "Off" and has its switch. Turning
+  on a monitor with no saved mode (off since login, reported as 0x0) gives
+  it its largest mode at its highest refresh, to the right of the others.
+  The last monitor that is on can no longer be turned off. Applying a
+  profile, and the 10-second revert, applied only its first monitor (one
+  `hyprctl` at a time, the rest were dropped); all of them now go in one
+  call. A saved mode that makes no sense is asked for as `preferred`, in
+  the shell and in the bridge's `vexyon-monitors.lua`.
+- **English shell, Spanish words.** The file manager's sidebar named the
+  user folders after the folder on disk, so an English shell over
+  `~/Escritorio` showed "Escritorio". They are named by what they are, in
+  the shell's language (Desktop/Escritorio, Documents/Documentos…); the
+  folders themselves are not renamed. The display-change dialog said
+  "…in 8 s si no confirmas" in English; it now has a proper sentence in
+  each language.
 - **NixOS: "pkexec must be setuid root" (AirDrop, Settings → Modules).**
   Recent nixpkgs no longer installs `/run/wrappers/bin/pkexec` unless
   `security.polkit.enablePkexecWrapper` is set; only the store's pkexec,

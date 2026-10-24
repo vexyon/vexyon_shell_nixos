@@ -8,7 +8,7 @@ import qs.services
 // ============================================================================
 //  Displays — monitor topology + saved display profiles.
 //
-//  Reads live monitor state from `hyprctl monitors -j`, and the saved profiles
+//  Reads live monitor state from `hyprctl monitors all -j`, and the saved profiles
 //  from shell.json `displays`. A profile bundles a per-monitor config map keyed
 //  by connector name. Changes apply live (`hyprctl eval 'hl.monitor({…})'`) AND
 //  persist to Config so the bridge writes them into vexyon-monitors.lua (they
@@ -46,9 +46,15 @@ Singleton {
     readonly property var bitdepths: [ { v: 8, l: "8 bits (SDR)" }, { v: 10, l: "10 bits (HDR/WCG)" } ]
 
     // ======================= live monitor reading ==========================
+    //  `all`: the monitors that are switched off too. Plain `monitors` lists
+    //  only the enabled ones, so a monitor turned off here vanished from
+    //  Settings with no way to turn it back on, and the hardware fingerprint
+    //  stopped matching its profile. A monitor off since login reports 0x0
+    //  (Hyprland never set a mode on it); see _fillForEnable(). FALLBACK is
+    //  Hyprland's own headless output for when no monitor is left, not a screen.
     Process {
         id: lister
-        command: ["bash", "-c", "hyprctl monitors -j"]
+        command: ["hyprctl", "monitors", "all", "-j"]
         stdout: StdioCollector {
             onStreamFinished: {
                 try {
@@ -56,6 +62,7 @@ Singleton {
                     var out = [];
                     for (var i = 0; i < arr.length; i++) {
                         var m = arr[i];
+                        if (m.name === "FALLBACK") continue;
                         var modes = [];
                         var am = m.availableModes || [];
                         for (var j = 0; j < am.length; j++) {
@@ -251,8 +258,11 @@ Singleton {
     function monCall(name, c) {
         if (c.enabled === false)
             return 'hl.monitor({ output = "' + name + '", disabled = true })';
+        // un modo sin sentido (0x0 de un monitor apagado desde el arranque)
+        // se pide como "preferred" en vez de mandar a Hyprland un modo roto
+        var mode = root.validRes(c.resolution) && Number(c.refresh) > 0 ? c.resolution + "@" + c.refresh : "preferred";
         var s = 'hl.monitor({ output = "' + name + '"'
-              + ', mode = "' + c.resolution + "@" + c.refresh + '"'
+              + ', mode = "' + mode + '"'
               + ', position = "' + (c.x || 0) + "x" + (c.y || 0) + '"'
               + ', scale = "' + root.fmtScale(c.scale) + '"'
               + ", transform = " + (c.transform || 0)
@@ -273,11 +283,27 @@ Singleton {
     //  hasta reabrir la página. Es por EVENTO — se dispara al terminar el
     //  hyprctl, no hay sondeo. autoApply() está guardado por fingerprint, así
     //  que este refresh no puede realimentarse.
-    Process { id: applier; onExited: root.refresh() }
-    function applyLive(name, c) {
-        applier.command = ["hyprctl", "eval", root.monCall(name, c)];
+    //  Varias llamadas van en UN `hyprctl eval`, y lo que llega mientras otro
+    //  está en marcha espera a que acabe: un Process solo corre un comando a la
+    //  vez, y aplicar un perfil (un applyLive() por monitor seguido) aplicaba
+    //  solo el primer monitor — los demás lo encontraban ocupado y se perdían.
+    property var _queued: []
+    Process {
+        id: applier
+        onExited: {
+            if (root._queued.length === 0) { root.refresh(); return; }
+            var q = root._queued;
+            root._queued = [];
+            root._eval(q);
+        }
+    }
+    function _eval(calls) {
+        if (calls.length === 0) return;
+        if (applier.running) { root._queued = root._queued.concat(calls); return; }
+        applier.command = ["hyprctl", "eval", calls.join(" ")];
         applier.running = true;
     }
+    function applyLive(name, c) { root._eval([root.monCall(name, c)]); }
 
     // ======================= profile mutation ==============================
     function _writeProfiles(ps) { Config.set("displays", "profiles", ps); }
@@ -387,6 +413,7 @@ Singleton {
             if (!p.monitors) p.monitors = {};
             if (!p.monitors[monName]) p.monitors[monName] = root.monCfg(monName) || {};
             for (var key in fields) p.monitors[monName][key] = fields[key];
+            if (fields.enabled === true) root._fillForEnable(monName, p.monitors[monName], p);
             ps[i] = p;
             root._writeProfiles(ps);
             root.applyLive(monName, p.monitors[monName]);
@@ -394,11 +421,57 @@ Singleton {
         }
     }
 
-    // apply every monitor in a profile live
+    //  Turning a monitor on needs a real mode and a place. One that has been
+    //  off since login has neither (0x0 at 0,0, or nothing saved): it gets
+    //  its largest mode at its highest refresh, and goes to the right of the
+    //  monitors that are on. A monitor with a saved mode keeps it and its place.
+    function validRes(r) { return /^[1-9][0-9]*x[1-9][0-9]*$/.test(String(r || "")); }
+    function _fillForEnable(name, c, p) {
+        if (root.validRes(c.resolution) && Number(c.refresh) > 0) return;
+        var m = root.monitorByName(name), best = null;
+        var ms = m ? m.modes : [];
+        for (var i = 0; i < ms.length; i++) {
+            var wh = ms[i].res.split("x"), area = Number(wh[0]) * Number(wh[1]);
+            if (!best || area > best.area || (area === best.area && ms[i].refresh > best.refresh))
+                best = { res: ms[i].res, refresh: ms[i].refresh, area: area };
+        }
+        if (!best) return;
+        c.resolution = best.res;
+        c.refresh = best.refresh;
+        if (!(Number(c.scale) > 0)) c.scale = 1;
+        var right = 0;
+        for (var k = 0; k < root.monitors.length; k++) {
+            var on = root.monitors[k].name;
+            if (on === name) continue;
+            var o = (p.monitors && p.monitors[on]) || root.monCfg(on);
+            if (!o || o.enabled === false || !root.validRes(o.resolution)) continue;
+            var d = String(o.resolution).split("x");
+            var w = ((o.transform || 0) % 2 === 1 ? Number(d[1]) : Number(d[0])) / (Number(o.scale) || 1);
+            right = Math.max(right, (o.x || 0) + Math.round(w));
+        }
+        c.x = right;
+        c.y = 0;
+    }
+
+    //  Turning off the last monitor that is on would leave no screen to turn
+    //  any of them back on from.
+    function canDisable(name) {
+        for (var i = 0; i < root.monitors.length; i++) {
+            var n = root.monitors[i].name;
+            if (n === name) continue;
+            var c = root.monCfg(n);
+            if (c && c.enabled !== false) return true;
+        }
+        return false;
+    }
+
+    // apply every monitor in a profile live, in one hyprctl eval
     function applyProfile(name) {
         var p = root.getProfile(name);
         if (!p || !p.monitors) return;
-        for (var mn in p.monitors) root.applyLive(mn, p.monitors[mn]);
+        var calls = [];
+        for (var mn in p.monitors) calls.push(root.monCall(mn, p.monitors[mn]));
+        root._eval(calls);
     }
 
     // auto-apply the profile matching current hardware (once per fingerprint)

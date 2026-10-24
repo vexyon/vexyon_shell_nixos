@@ -22,6 +22,7 @@ Usage:
 
 import json
 import os
+import re
 import sys
 import time
 import shutil
@@ -353,7 +354,17 @@ def lua_monitor_call(name, c):
     config agree field by field."""
     if c.get("enabled") is False:
         return f"hl.monitor({{ output = {lua_str(name)}, disabled = true }})"
-    mode = f"{c.get('resolution', 'preferred')}@{c.get('refresh', 60)}"
+    # A mode that makes no sense (0x0, from a monitor off since login) is
+    # asked for as "preferred" rather than handed to Hyprland broken.
+    res = str(c.get("resolution") or "")
+    try:
+        refresh = float(c.get("refresh", 60))
+    except (TypeError, ValueError):
+        refresh = 0
+    if re.fullmatch(r"[1-9][0-9]*x[1-9][0-9]*", res) and refresh > 0:
+        mode = f"{res}@{c.get('refresh', 60)}"
+    else:
+        mode = "preferred"
     pos = f"{int(c.get('x', 0))}x{int(c.get('y', 0))}"
     fields = [
         f"output = {lua_str(name)}",
