@@ -7,7 +7,7 @@
   # cards without Apple's chip. Pinned to a commit (this repo keeps no
   # flake.lock), built with this flake's nixpkgs.
   inputs.omdrop-owl = {
-    url = "github:t4t5/omdrop-owl/118320566d780240267552f1ea025641751fd443";
+    url = "github:t4t5/omdrop-owl/8213aee9f018ffd78a3fc71863a364fcddd938cd"; # release 0.3.0
     inputs.nixpkgs.follows = "nixpkgs";
   };
 

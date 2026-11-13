@@ -77,13 +77,13 @@ let
 in
 stdenvNoCC.mkDerivation {
   pname = "omdrop";
-  version = "0.16.4";
+  version = "0.18.12";
 
   src = fetchFromGitHub {
     owner = "netmojo-systems";
     repo = "omdrop-plugin";
-    rev = "95ee625fd63e0eb9061f1d08c8116231d0f2a303"; # release 0.16.4
-    hash = "sha256-zMiALreWLVTM7OIUITuZAgH+R+AoJOIyngCK0vNT+FE=";
+    rev = "ee475b2977c88fa9d2d6ef29068a3c5e4800b0ee"; # release 0.18.12
+    hash = "sha256-5eK3ct7Lg4lWpnkXskHTVTaeCqgBAZTIE7cexzMz3AY=";
   };
 
   # patchShebangs gives the .py helpers this python.
@@ -114,9 +114,11 @@ stdenvNoCC.mkDerivation {
 'PROJ="$(cd "$(dirname "$SELF")/.." && pwd)"
 # Vexyon (NixOS): its tools, the setuid pkexec, and the Omarchy stand-ins.
 export PATH="$PROJ/vexyon:/run/wrappers/bin:${runtimePath}:$PATH"
-export GI_TYPELIB_PATH="${glib.out}/lib/girepository-1.0''${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"' \
-      --replace-fail '[[ -e /usr/lib/libkeyutils.so.1 ]]' \
-                     '[[ -e ${keyutils.lib}/lib/libkeyutils.so.1 ]]'
+export GI_TYPELIB_PATH="${glib.out}/lib/girepository-1.0''${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
+# the interpreter its receiver check asks (0.18: /usr/bin/python3 by default)
+export OMDROP_RECEIVER_PYTHON="''${OMDROP_RECEIVER_PYTHON:-${python}/bin/python3}"' \
+      --replace-fail 'ctypes.CDLL("libkeyutils.so.1")' \
+                     'ctypes.CDLL("${keyutils.lib}/lib/libkeyutils.so.1")'
 
     substituteInPlace $plugin/bin/identity.py \
       --replace-fail "ctypes.CDLL('libkeyutils.so.1'" \

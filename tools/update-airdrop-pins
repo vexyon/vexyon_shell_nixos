@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# update-airdrop-pins — move AirDrop's two upstream pins to their newest
+# compatible releases, then prove the result builds. NixOS repository.
+#
+#   tools/update-airdrop-pins          update flake.nix + nix/omdrop.nix, build
+#   tools/update-airdrop-pins --check  only say whether newer releases exist
+#
+# The pins stay pins: flake.nix names omdrop-owl by commit and nix/omdrop.nix
+# names omdrop by commit + hash, so every build of a given Vexyon commit is
+# the same (this repository keeps no flake.lock). This script is how they
+# move forward: run it, read what it prints, commit the change. Nothing
+# updates by itself on a user's machine.
+#
+# omdrop-owl is held below 0.4.0: from 0.4.0 upstream is "Owly", a Rust
+# rewrite with its own system service, NixOS option (services.owly), D-Bus
+# names and interfaces. Moving there is a migration of Vexyon's integration,
+# not a pin bump, so the script says when such a release exists and stops
+# short of it. Raise OWL_BELOW once that migration is done.
+set -euo pipefail
+
+OWL_URL=https://github.com/t4t5/omdrop-owl
+OMDROP_URL=https://github.com/netmojo-systems/omdrop-plugin
+OWL_BELOW=0.4.0
+NIXPKGS=${VEXYON_NIXPKGS:-https://channels.nixos.org/nixos-26.05/nixexprs.tar.xz}
+
+cd "$(dirname "$0")/.."
+check=0; [ "${1:-}" = "--check" ] && check=1
+
+# newest vX.Y.Z tag of a repository (optionally below a version): "tag commit"
+newest() {   # <url> [below]
+  git ls-remote --tags "$1" 'v*' | awk '{ sub("refs/tags/", "", $2); print $2, $1 }' |
+    { if [ -n "${2:-}" ]; then awk -v below="$2" '
+        function n(v,  a) { sub(/^v/, "", v); split(v, a, "."); return a[1]*1e6 + a[2]*1e3 + a[3] }
+        n($1) < n(below)'; else cat; fi; } |
+    awk '{ t=$1; sub(/\^\{\}$/, "", t); c[t]=$2 } END { for (t in c) print t, c[t] }' |
+    grep -E '^v[0-9]+\.[0-9]+\.[0-9]+ ' | sort -V | tail -n 1
+}
+
+cur_owl=$(sed -n 's|.*github:t4t5/omdrop-owl/\([0-9a-f]\{40\}\)".*|\1|p' flake.nix)
+cur_om=$(sed -n 's|.*rev = "\([0-9a-f]\{40\}\)";.*|\1|p' nix/omdrop.nix)
+read -r owl_tag owl_rev < <(newest "$OWL_URL" "$OWL_BELOW")
+read -r om_tag om_rev < <(newest "$OMDROP_URL")
+read -r owl_any _ < <(newest "$OWL_URL")
+
+echo "omdrop-owl: pinned ${cur_owl:0:7}, newest compatible $owl_tag (${owl_rev:0:7})"
+[ "$owl_any" != "$owl_tag" ] && echo "  note: $owl_any exists (Owly, >= $OWL_BELOW) — needs the integration migrated first"
+echo "omdrop:     pinned ${cur_om:0:7}, newest $om_tag (${om_rev:0:7})"
+[ "$cur_owl" = "$owl_rev" ] && [ "$cur_om" = "$om_rev" ] && { echo "Up to date."; exit 0; }
+[ "$check" = 1 ] && exit 0
+
+work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
+git clone -q "$OMDROP_URL" "$work/omdrop"
+git -C "$work/omdrop" -c advice.detachedHead=false checkout -q "$om_rev"
+# Every anchor nix/omdrop.nix patches must still be there, or the build
+# fails with --replace-fail: say which one first.
+# shellcheck disable=SC2016  # literal text to look for
+for a in 'PROJ="$(cd "$(dirname "$SELF")/.." && pwd)"' 'ctypes.CDLL("libkeyutils.so.1")'; do
+  grep -qF "$a" "$work/omdrop/bin/omdrop" || { echo "omdrop $om_tag: bin/omdrop no longer has: $a" >&2; exit 1; }
+done
+grep -qF "ctypes.CDLL('libkeyutils.so.1'" "$work/omdrop/bin/identity.py" ||
+  { echo "omdrop $om_tag: bin/identity.py changed its libkeyutils load" >&2; exit 1; }
+grep -qF 'ExecStart=/usr/bin/python3 ' "$work/omdrop/share/airdrop-receiver.service" ||
+  { echo "omdrop $om_tag: the receiver unit changed its ExecStart" >&2; exit 1; }
+# fetchFromGitHub's hash is the NAR hash of GitHub's archive = git archive.
+mkdir "$work/source"
+git -C "$work/omdrop" archive "$om_rev" | tar -x -C "$work/source"
+om_hash=$(nix hash path "$work/source")
+om_ver=${om_tag#v}
+
+sed -i "s|github:t4t5/omdrop-owl/[0-9a-f]\{40\}\"; # release [0-9.]*|github:t4t5/omdrop-owl/$owl_rev\"; # release ${owl_tag#v}|" flake.nix
+sed -i -e "s|version = \"[0-9.]*\";|version = \"$om_ver\";|" \
+       -e "s|rev = \"[0-9a-f]\{40\}\"; # release [0-9.]*|rev = \"$om_rev\"; # release $om_ver|" \
+       -e "s|hash = \"sha256-[A-Za-z0-9+/=]*\";|hash = \"$om_hash\";|" nix/omdrop.nix
+git diff --stat -- flake.nix nix/omdrop.nix
+
+ovr=(--override-input nixpkgs "$NIXPKGS" --override-input omdrop-owl "git+$OWL_URL?rev=$owl_rev")
+echo "Building omdrop $om_ver…"
+out=$(nix build --no-link --print-out-paths "${ovr[@]}" .#omdrop)
+"$out/bin/omdrop" version
+echo "Evaluating the NixOS module (modules-gating test)…"
+nix eval --raw "${ovr[@]}" .#tests.x86_64-linux.modules-gating.driver.drvPath >/dev/null
+echo "OK. Run the VM test before committing:"
+echo "  nix build ${ovr[*]} .#tests.x86_64-linux.modules-gating"

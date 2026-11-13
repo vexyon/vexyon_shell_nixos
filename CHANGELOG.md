@@ -8,6 +8,18 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
 
 ## [Unreleased]
 
+### Changed
+
+- **AirDrop: newer upstream releases.** omdrop 0.16.4 → 0.18.12 and
+  omdrop-owl → release 0.3.0 (the newest of its line; from 0.4 it is
+  "Owly", a rewrite with its own system service that Vexyon does not
+  integrate yet). Arch: the installer now also installs what omdrop's
+  receiver imports (`python-libarchive-c`, `keyutils`); NixOS: the receiver
+  check uses the packaged Python and libkeyutils. New
+  `tools/update-airdrop-pins` in each repository moves both pins to the
+  newest compatible releases and checks the result, so they stay
+  reproducible (pinned) without going stale.
+
 ### Fixed
 
 - **Theme switcher (Super+Alt+T) lagged when an arrow key was held.** The

@@ -20,6 +20,88 @@ VEXYON OUT-OF-THE-BOX POLICY Every Vexyon feature must ship together with all re
 
 PERMANENT POLICY: If Vexyon's installation changes, its GitHub README.md MUST be updated in the same development task. No exceptions.
 
+## Session (block 3): AirDrop — newest compatible upstream releases, and a way to keep them current
+
+### Why
+
+The owner wants AirDrop always on the newest upstream versions, without
+breaking NixOS reproducibility, and a mechanism to keep the pins current.
+
+### What upstream did, and the compromise chosen
+
+- omdrop (netmojo-systems/omdrop-plugin): 0.16.4 → **0.18.12** (newest
+  release). 0.18 adds an optional Rust "omdrop-core"; without it (Vexyon
+  installs none) the bash + Python implementation runs as before. It needs
+  a radio helper contract ≥ 0.7.0; omdrop-owl 0.3.0 reports 0.8.1.
+- omdrop-owl (t4t5/omdrop-owl): 1183205 (v0.2.0+9) → **v0.3.0**, the newest
+  release of its line (6 commits: hostapd log, iwlwifi channel 6, radiotap
+  flags patch). From **v0.4.0 it is "Owly"**: a Rust rewrite with a system
+  daemon (`owlyd`, D-Bus activated), NixOS option `services.owly` instead of
+  `services.omdrop-owl`, renamed interfaces (owlymon0…), new polkit/D-Bus
+  names. That is a migration of Vexyon's AirDrop integration (module, gating
+  rules, vexyon-airdrop, install.sh, the "no service" classification), not
+  a pin bump, and it cannot be tested here without AWDL hardware. So the
+  pin stops at v0.3.0 and the update script says when Owly releases exist.
+- Compromise: pins stay pins (commit + hash) so a given Vexyon commit always
+  builds the same thing (NixOS without flake.lock; Arch checks out commits
+  that git verifies); "always newest" comes from `tools/update-airdrop-pins`
+  (one per repository): it finds the newest compatible release, checks that
+  every anchor Vexyon patches still exists, rewrites the pins (NixOS: also
+  computes fetchFromGitHub's hash from `git archive`), and on NixOS builds
+  `omdrop` and evaluates the VM test. A maintainer runs it, reads it and
+  commits; users get it with `nix flake update vexyon` / re-running the
+  installer. Nothing updates itself on a user's machine (that would break
+  reproducibility and could pull an untested Owly).
+
+### What changed
+
+- NixOS: `flake.nix` omdrop-owl input → 8213aee (v0.3.0);
+  `nix/omdrop.nix` → 0.18.12, rev ee475b2, new hash. 0.18 dropped the
+  `[[ -e /usr/lib/libkeyutils.so.1 ]]` line the package patched (the
+  build would have failed) and checks the receiver's libraries with
+  `${OMDROP_RECEIVER_PYTHON:-/usr/bin/python3}`: the PATH block now exports
+  `OMDROP_RECEIVER_PYTHON` (the packaged Python) and the
+  `ctypes.CDLL("libkeyutils.so.1")` in bin/omdrop gets the store path.
+- Arch: `install.sh` OWL_COMMIT/OMDROP_COMMIT, the step's version text, and
+  `python-libarchive-c keyutils` in MOD_PKGS — omdrop's own RECEIVER_PKGS,
+  which before were only offered by omdrop's "install" button (against the
+  out-of-the-box policy).
+- `tools/update-airdrop-pins` in both repositories (platform-specific,
+  outside config/ and share/). READMEs, CHANGELOG.
+
+### Verified
+
+- `git archive` + `nix hash path` reproduces the hash already pinned for
+  0.16.4 (control), then gives 0.18.12's. `nix build .#omdrop` (nixos-26.05)
+  OK; `omdrop version` → "omdrop 0.18.12"; the receiver's library check
+  (`from libarchive import stream_reader; ctypes.CDLL(<store libkeyutils>)`)
+  passes with the packaged Python.
+- NixOS update script run end to end from the OLD pins in a scratch
+  worktree: same omdrop.nix as the manual update, owl input moved, build and
+  evaluation OK. Arch script run from the old pins: same three lines as the
+  manual edit. `--check` on the new pins: "Up to date." and the Owly note.
+  shellcheck clean on both scripts; `bash -n install.sh`.
+- install.sh's sed patch applied to 0.18.12's bin/omdrop: the PATH line is
+  inserted and `bash -n` passes.
+- omdrop-owl 0.3.0's sources (omdrop-awdl 534f91a, OWL 832d70f with
+  submodules) fetched with git because this sandbox gets 403 from GitHub
+  archive downloads; their NAR hashes equal the ones upstream pins.
+- NixOS VM test `modules-gating` (driver built with these pins, run without
+  KVM): passed, "test script finished in 506.74s", exit 0. Its AirDrop part:
+  `omdrop awdl-discoverable send-to-peer vexyon-airdrop` installed, the
+  omdrop-owl polkit action present, the radio probe says `{"backend":
+  "owl", "version": "0.3.0", "contract": "0.8.1", …}` (no Wi-Fi in the
+  VM), `vexyon-airdrop info` → `"installed":true,"version":"0.18.12"` with
+  only the hardware item missing (no "library" item: the receiver check
+  passed), and no owl / airdrop-serve.py process running.
+
+### Not verified
+
+- AirDrop itself with an iPhone (no AWDL-capable card here).
+- Building omdrop-owl 0.3.0 with makepkg on Arch, and the Arch install of
+  omdrop 0.18.12 (no Arch machine here).
+- Owly (≥ 0.4.0): not integrated, on purpose.
+
 ## Session (block 6): theme switcher lag on held keys; bar widgets that did not work
 
 ### Why
