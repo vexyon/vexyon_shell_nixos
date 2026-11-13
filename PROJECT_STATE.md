@@ -20,6 +20,97 @@ VEXYON OUT-OF-THE-BOX POLICY Every Vexyon feature must ship together with all re
 
 PERMANENT POLICY: If Vexyon's installation changes, its GitHub README.md MUST be updated in the same development task. No exceptions.
 
+## Session (block 6): theme switcher lag on held keys; bar widgets that did not work
+
+### Why
+
+The owner: in the theme manager opened with Super+Alt+(key) — it is
+Super+Alt+T (`vexyon-keybinds.lua`: `quickshell:themeswitcher` →
+`ThemeQuickPanel`) — holding a key lags and responds badly. And some bar
+widgets do not work: review them all.
+
+### Theme switcher: causes and fix
+
+- Measured in the lab (the key handler driven at 33 ms, a typical key
+  repeat, pointer resting on the list): with the old code the list's
+  `contentY` advanced ~26 px per step against 52 px rows (ListView's
+  default follow animation for `currentIndex`), so after 18 steps the
+  selection was far below the visible area and the view kept animating after
+  the "key" stopped. Rows also had a 100 ms ColorAnimation, longer than the
+  repeat interval. With the fix: `contentY` = row × 52 at every step, the
+  list ends on the last theme.
+- Also fixed by reading the code (not reproducible here: sway gives no
+  keyboard focus to that layer surface, and Qt sends no hover for content
+  scrolled under a still pointer in this lab): `onEntered` on every row set
+  the selection to the row passing under the pointer — under Hyprland that
+  fights the keyboard. Hover now selects only when the pointer really moved.
+- `modules/ThemeQuickPanel.qml`: `select()`, `positionViewAtIndex(…,
+  Contain)` on every change (`highlightFollowsCurrentItem: false`), no colour
+  animation, held ↑/↓ stop at the ends (single presses still wrap),
+  Home/End.
+
+### Widgets: all 37 catalog types reviewed
+
+Read every type's component and click action in `WidgetView.qml` and the
+service behind it. Broken and fixed:
+
+- **sysupdate** — on NixOS ran `sudo pacman -Syu` and polled `checkupdates`
+  (absent): now `/etc/NIXOS` (one FileView read) switches it to `nix flake
+  update` + `nixos-rebuild switch --flake /etc/nixos` when
+  `/etc/nixos/flake.nix` exists, else `nixos-rebuild switch --upgrade`, and
+  says when there is no configuration in /etc/nixos; no counter and no
+  30-minute timer on NixOS.
+- **gputemp** — read only amdgpu/i915 hwmon; the NVIDIA proprietary driver
+  has none, so on an NVIDIA-only desktop (the owner's tower) it was always
+  hidden. Now, with no integrated sensor, `nvidia-smi` every 10 s while
+  shown, ONLY if the card's `power/runtime_status` is `active` (or absent):
+  a suspended dGPU on a hybrid laptop is never woken. Scan once per 0→1
+  watcher (it ran once per temperature widget).
+- **vpn** — "quick connect" opened Quick Settings (no VPN there). Click now
+  runs `nmcli connection down|up id <name>` (active one, else the first
+  NetworkManager VPN/WireGuard), errors via `notify-send`; names with ":"
+  handled.
+- **notes** — `${EDITOR:-nano}`; Arch's installer does not install nano, so
+  the terminal opened and closed. Now `$EDITOR`, else nano, micro, nvim,
+  vim, vi, else `xdg-open`; the file is created if missing.
+- **colorpicker** — copied silently; now a notification with the colour.
+
+Reviewed and left as they are (no defect found in the code): applauncher,
+workspaces, clock, focusedwindow, volume, brightness, battery, network,
+bluetooth, microphone, power, controlcenter, weather, notifications,
+idleinhibitor, media, clipboard, cpu, memory, disk, cputemp, netspeed,
+systemtray, privacy, capslock, keyboardlayout (`switchxkblayout current
+next` checked in Hyprland 0.57's Commands.cpp), appsdock, vm, recorder,
+airdrop, spacer, separator.
+
+### Verified
+
+- Lab (headless sway, Quickshell 0.3.2, Mesa llvmpipe, this tree's QML;
+  fake `nvidia-smi`, `nmcli`, `ghostty`, `hyprpicker`, `notify-send` that
+  log their arguments; a fake NVIDIA PCI directory):
+  - gputemp: card active → `nvidia-smi --query-gpu=temperature.gpu …`,
+    pill "54°"; `runtime_status` = suspended → no nvidia-smi call in 12 s
+    and the pill hidden.
+  - sysupdate: Arch → `ghostty -e bash -c 'sudo pacman -Syu; …'`; with a
+    temporary `/etc/NIXOS` (removed afterwards) → the NixOS script;
+    `bash -n` and shellcheck of that script clean.
+  - notes → `ghostty -e nano ~/notes.md` (file created); colorpicker →
+    `notify-send -a Vexyon "Color copied" "#a1b2c3"`.
+  - vpn: click → `nmcli connection up id My:Office VPN` (escaped name),
+    again → `down`.
+  - Theme switcher A/B as above. No QML warnings from the changed files.
+- I18n checker 0 missing; byte-identity OK.
+
+### Not verified
+
+- Holding a key in the theme switcher on real Hyprland (the lab could not
+  give that layer surface keyboard focus; the cause was measured by
+  driving the same handler).
+- nvidia-smi on the owner's RTX 5080; a real NetworkManager VPN (secrets
+  agent prompts); a real NixOS update from the widget.
+- Widgets that depend on hardware/services absent here (battery,
+  brightness, bluetooth, media players, tray apps, weather network).
+
 ## Session (block 5): file manager — bookmarks, Places by real folder name, lost operations
 
 ### Why

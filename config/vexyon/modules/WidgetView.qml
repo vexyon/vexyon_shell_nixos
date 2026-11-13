@@ -90,7 +90,6 @@ Item {
         case "microphone":    if (right) Mic.toggleMute(); else { Panels.volumeInitTab = "inputs"; openPanel("volumePanel"); } break;
         case "power":         Panels.toggle("powermenu"); break;
         case "controlcenter": openPanel("quickSettings"); break;
-        case "vpn":           openPanel("quickSettings"); break;
         case "weather":       openPanel("weatherPanel"); break;
         case "notifications": if (right) Notifications.toggleDnd(); else { Notifications.clear(); openPanel("notifCenter"); } break;
         case "idleinhibitor": IdleInhibitor.toggle(); break;
@@ -106,9 +105,18 @@ Item {
                               break;
         case "cpu": case "memory": case "disk": case "cputemp": case "gputemp": openPanel("sysMonitor"); break;
         case "keyboardlayout": KeyboardState.cycle(); break;
-        case "notes":         Quickshell.execDetached(["bash", "-c", "ghostty -e bash -c '${EDITOR:-nano} ~/notes.md' || true"]); break;
-        case "colorpicker":   Quickshell.execDetached(["bash", "-c", "command -v hyprpicker >/dev/null && hyprpicker -a || true"]); break;
-        case "sysupdate":     Quickshell.execDetached(["bash", "-c", "ghostty -e bash -c 'sudo pacman -Syu; read -p \"Enter to close\"' || true"]); break;
+        // Notas: el editor del usuario ($EDITOR) o el primero que haya; antes
+        // era "${EDITOR:-nano}" y sin nano (Arch no lo trae) la terminal se
+        // abría y se cerraba sin más. Sin editor de terminal, el gráfico
+        // por defecto (xdg-open).
+        case "notes":         Quickshell.execDetached(["bash", "-c",
+            "f=\"$HOME/notes.md\"; [ -e \"$f\" ] || : > \"$f\"; e=\"$EDITOR\"; " +
+            "if [ -z \"$e\" ]; then for c in nano micro nvim vim vi; do command -v $c >/dev/null && { e=$c; break; }; done; fi; " +
+            "if [ -n \"$e\" ]; then exec ghostty -e $e \"$f\"; else exec xdg-open \"$f\"; fi"]); break;
+        // Cuentagotas: hyprpicker copia el color; ahora además se dice cuál.
+        case "colorpicker":   Quickshell.execDetached(["bash", "-c",
+            "command -v hyprpicker >/dev/null || exit 0; c=$(hyprpicker -a) || exit 0; " +
+            "[ -n \"$c\" ] && notify-send -a Vexyon \"" + I18n.t("Color copied") + "\" \"$c\" || true"]); break;
         }
     }
 
@@ -959,7 +967,23 @@ Item {
             id: vpnw
             property bool connected: false
             property bool detected: false
+            property string activeName: ""    // VPN de NetworkManager activa
+            property string firstName: ""     // la primera configurada
             implicitWidth: vpnBtn.implicitWidth; implicitHeight: 28
+            //  Clic: la conexión rápida que prometía. Antes abría Ajustes
+            //  rápidos, que no tienen nada de VPN. Activa → se desconecta;
+            //  si no, se levanta la primera VPN de NetworkManager. Un túnel
+            //  wg-quick (fuera de NetworkManager) necesita root: no se toca.
+            //  El fallo (falta la contraseña, el servidor no responde) se dice.
+            function pillAction(button) {
+                var n = vpnw.activeName !== "" ? vpnw.activeName : vpnw.firstName;
+                if (n === "" || vpnAct.running) return;
+                vpnAct.command = ["sh", "-c",
+                    "out=$(nmcli connection " + (vpnw.activeName !== "" ? "down" : "up") + " id \"$1\" 2>&1) || " +
+                    "notify-send -a Vexyon \"VPN\" \"$out\"", "sh", n];
+                vpnAct.running = true;
+            }
+            Process { id: vpnAct; onExited: vpnProc.running = true }
             readonly property bool selfHide: !detected
             Timer { interval: 6000; running: true; repeat: true; triggeredOnStart: true; onTriggered: vpnProc.running = true }
             Process {
@@ -969,7 +993,7 @@ Item {
                 // NetworkManager (wg-quick). 3 procesos por tick; antes, con
                 // las tuberías de grep, eran hasta 7.
                 command: ["sh", "-c",
-                    "nmcli -t -f TYPE,ACTIVE connection show 2>/dev/null; echo --; " +
+                    "nmcli -t -f TYPE,ACTIVE,NAME connection show 2>/dev/null; echo --; " +
                     "ip -brief link show type wireguard 2>/dev/null"]
                 stdout: StdioCollector {
                     onStreamFinished: {
@@ -977,15 +1001,20 @@ Item {
                         var sep = lines.indexOf("--");
                         var rows = sep < 0 ? lines : lines.slice(0, sep);
                         var up = sep >= 0 && lines.slice(sep + 1).join("").trim() !== "";
-                        var any = up;
+                        var any = up, act = "", first = "";
                         for (var i = 0; i < rows.length; i++) {
+                            // NAME va el último: puede llevar ":" (escapado "\:")
                             var f = rows[i].split(":");
-                            if (f[0] !== "vpn" && f[0] !== "wireguard") continue;
+                            if (f.length < 3 || (f[0] !== "vpn" && f[0] !== "wireguard")) continue;
+                            var name = f.slice(2).join(":").replace(/\\:/g, ":").replace(/\\\\/g, "\\");
                             any = true;
-                            if (f[1] === "yes") up = true;
+                            if (first === "") first = name;
+                            if (f[1] === "yes") { up = true; if (act === "") act = name; }
                         }
                         vpnw.connected = up;
                         vpnw.detected = any;
+                        vpnw.activeName = act;
+                        vpnw.firstName = first;
                     }
                 }
             }
@@ -1029,8 +1058,15 @@ Item {
         Item {
             id: upw
             property int count: 0
+            // NixOS no tiene `checkupdates` ni pacman: antes el contador se
+            // quedaba en 0 para siempre y el clic lanzaba `sudo pacman -Syu`,
+            // que ahí no existe. En NixOS no hay contador (calcularlo es
+            // evaluar el sistema entero) y el clic actualiza a la manera de
+            // NixOS. Se mira /etc/NIXOS una vez, sin proceso.
+            property bool nixos: false
+            FileView { path: "/etc/NIXOS"; printErrors: false; onLoaded: upw.nixos = true }
             implicitWidth: upRow.implicitWidth; implicitHeight: upRow.implicitHeight
-            Timer { interval: 1800000; running: true; repeat: true; triggeredOnStart: true; onTriggered: upProc.running = true }
+            Timer { interval: 1800000; running: !upw.nixos; repeat: true; triggeredOnStart: true; onTriggered: upProc.running = true }
             Process {
                 id: upProc
                 command: ["bash", "-c", "command -v checkupdates >/dev/null && checkupdates 2>/dev/null | wc -l || echo 0"]
@@ -1045,9 +1081,18 @@ Item {
             }
             // acción con estado propio (relanza el chequeo): la invoca el
             // fondo clicable de la pastilla en lugar de primaryAction().
+            //  NixOS: el flake del sistema en /etc/nixos (nix flake update +
+            //  rebuild) o, sin flake, el canal (--upgrade). Un flake guardado
+            //  en otro sitio no se adivina: se dice dónde se buscó.
             function pillAction(button) {
-                upProc.running = true;
-                Quickshell.execDetached(["bash", "-c", "ghostty -e bash -c 'sudo pacman -Syu; read -p \"Enter to close\"' || true"]);
+                var close = "; echo; read -p \"" + I18n.t("Press Enter to close") + "\"";
+                var script = upw.nixos
+                    ? "if [ -f /etc/nixos/flake.nix ]; then cd /etc/nixos && sudo nix flake update && sudo nixos-rebuild switch --flake /etc/nixos; "
+                      + "else sudo nixos-rebuild switch --upgrade; fi; "
+                      + "[ -f /etc/nixos/flake.nix ] || [ -f /etc/nixos/configuration.nix ] || echo \"" + I18n.t("No system configuration in /etc/nixos: update your flake where it lives, then rebuild.") + "\""
+                    : "sudo pacman -Syu";
+                if (!upw.nixos) upProc.running = true;
+                Quickshell.execDetached(["ghostty", "-e", "bash", "-c", script + close]);
             }
         }
     }

@@ -10,10 +10,13 @@ import Quickshell.Io
 //  bar cost a single subprocess every tick. Cheap, dependency-light (procfs +
 //  coreutils; temps via /sys/class/hwmon, sensors optional).
 //
-//  GPU TEMPERATURE POLICY (iGPU-only mandate): gpuTemp reads the integrated
-//  GPU's hwmon (amdgpu/i915). A discrete Nvidia reading, if any, is exposed
-//  separately as nvidiaTemp and marked informational — the active GPU is the
-//  iGPU; the shell never implies the dGPU is in use.
+//  GPU TEMPERATURE POLICY: gpuTemp reads the integrated GPU's hwmon
+//  (amdgpu/i915) first. Without one — a desktop where the NVIDIA card is the
+//  only GPU (its proprietary driver has no hwmon), or an Intel iGPU without
+//  a sensor — it is the NVIDIA card's temperature from nvidia-smi, but ONLY
+//  while that card is awake (runtime_status "active", or no runtime PM at
+//  all): querying a sleeping dGPU on a hybrid laptop would wake it. Before,
+//  the GPU temperature widget stayed hidden on such desktops.
 // ============================================================================
 Singleton {
     id: root
@@ -80,24 +83,49 @@ Singleton {
     // ---- temperaturas: los hwmon se buscan UNA vez (al aparecer el primer
     // consumidor) y luego se leen en el propio proceso ------------------------
     property var _tempFiles: []          // [{ name, path }]
-    onTempWatchersChanged: if (tempWatchers > 0) hwmonScan.running = true
+    property string _nvPci: ""           // sysfs dir of an NVIDIA display GPU, if nvidia-smi exists
+    property int _nvTick: 0
+    onTempWatchersChanged: if (tempWatchers === 1) hwmonScan.running = true   // 0 -> 1 only
     Process {
         id: hwmonScan
         command: ["bash", "-c",
             "for f in /sys/class/hwmon/hwmon*/temp1_input; do [ -e \"$f\" ] || continue; " +
-            "printf '%s\\t%s\\n' \"$(cat \"${f%/*}/name\" 2>/dev/null)\" \"$f\"; done"]
+            "printf '%s\\t%s\\n' \"$(cat \"${f%/*}/name\" 2>/dev/null)\" \"$f\"; done; " +
+            "command -v nvidia-smi >/dev/null || exit 0; " +
+            "for d in /sys/bus/pci/devices/*; do [ \"$(cat \"$d/vendor\" 2>/dev/null)\" = 0x10de ] || continue; " +
+            "case \"$(cat \"$d/class\" 2>/dev/null)\" in 0x03*) printf 'NVPCI\\t%s\\n' \"$d\"; break;; esac; done"]
         stdout: StdioCollector {
             onStreamFinished: {
-                var out = [], lines = this.text.split("\n");
+                var out = [], lines = this.text.split("\n"), nv = "";
                 for (var i = 0; i < lines.length; i++) {
                     var t = lines[i].indexOf("\t");
-                    if (t > 0) out.push({ name: lines[i].substring(0, t).toLowerCase(), path: lines[i].substring(t + 1) });
+                    if (t <= 0) continue;
+                    if (lines[i].substring(0, t) === "NVPCI") { nv = lines[i].substring(t + 1); continue; }
+                    out.push({ name: lines[i].substring(0, t).toLowerCase(), path: lines[i].substring(t + 1) });
                 }
                 root._tempFiles = out;
+                root._nvPci = nv;
+                nvPmFv.path = nv !== "" ? nv + "/power/runtime_status" : "";
+                root._nvTick = 0;
                 root.readTemps();
             }
         }
     }
+    //  runtime_status: reading it never wakes the card. Missing = no runtime
+    //  power management = the card is always on.
+    FileView { id: nvPmFv; blockLoading: true; printErrors: false }
+    Process {
+        id: nvSmi
+        command: ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"]
+        stdout: StdioCollector {
+            onStreamFinished: {
+                var v = parseInt((this.text.split("\n")[0] || "").trim()) || 0;
+                root.nvidiaTemp = v;
+                if (root._igpuTemp === 0) root.gpuTemp = v;
+            }
+        }
+    }
+    property int _igpuTemp: 0
     Instantiator {
         id: tempViews
         model: root._tempFiles
@@ -134,8 +162,18 @@ Singleton {
             }
         }
         root.cpuTemp = cpuT;
-        root.gpuTemp = gpuT;
-        root.nvidiaTemp = nvT;
+        root._igpuTemp = gpuT;
+        if (gpuT > 0 || root._nvPci === "") {
+            root.gpuTemp = gpuT;
+            root.nvidiaTemp = nvT;
+            return;
+        }
+        //  No integrated reading: the NVIDIA card, if awake, every 5th read
+        //  (10 s) — nvidia-smi costs more than a sysfs read.
+        nvPmFv.reload();
+        var pm = nvPmFv.path !== "" ? nvPmFv.text().trim() : "";
+        if (pm !== "" && pm !== "active") { root.gpuTemp = 0; root.nvidiaTemp = 0; return; }
+        if (root._nvTick++ % 5 === 0 && !nvSmi.running) nvSmi.running = true;
     }
 
     function parse(stat, mem, netdev) {

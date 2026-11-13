@@ -10,6 +10,24 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
 
 ### Fixed
 
+- **Theme switcher (Super+Alt+T) lagged when an arrow key was held.** The
+  list scrolled with ListView's default follow animation (about half a row
+  per key repeat), so the selection left the view and the list kept moving
+  after the key was released; every row also eased its colour over 100 ms.
+  The list now jumps to the selection, the highlight is instant, a held key
+  stops at the ends, Home/End work, and a row scrolled under a resting
+  pointer no longer steals the selection.
+- **Bar widgets that did not work.** *System update* ran `sudo pacman -Syu`
+  on NixOS too (and its counter could never count there): on NixOS it now
+  updates the flake in `/etc/nixos` (or the channel) and shows no counter.
+  *GPU temperature* was always hidden on desktops whose only GPU is an
+  NVIDIA card: it now reads that card through `nvidia-smi` when there is no
+  integrated-GPU sensor, and only while the card is awake. *VPN* promised
+  "quick connect" but opened Quick Settings: a click now connects or
+  disconnects the NetworkManager VPN. *Notes* needed `nano` (not installed
+  on Arch): it uses `$EDITOR` or the first editor found, else the default
+  app. *Color picker* now says which colour it copied.
+
 - **Bookmarks could not be added at all** (right-click *Add to Sidebar* or
   dragging a folder). Since the user-folders change, `vexyon-fm-helper
   bm-add`/`bm-move` unpacked `user_dirs()` as a tuple it no longer was and

@@ -19,9 +19,22 @@ AnchoredPanel {
     accentColor: Theme.accent
 
     property int selIndex: 0
+    //  Holding ↑/↓ used to lag and jump back. Three causes: every row eased its
+    //  colour over 100 ms while key repeat moves every ~30 ms (the highlight was
+    //  always behind); nothing scrolled the list to the selection; and with the
+    //  pointer resting on the list, each row scrolled under it fired onEntered
+    //  and pulled the selection back to that row. Now the selection is drawn at
+    //  once, the list follows it, and only a REAL pointer move selects by hover.
+    property point _lastPointer: Qt.point(-1, -1)
+    function select(i) {
+        var n = Theme.available.length;
+        if (n === 0) return;
+        tq.selIndex = Math.max(0, Math.min(n - 1, i));
+    }
 
     onShownChanged: {
         if (shown) {
+            tq._lastPointer = Qt.point(-1, -1);
             Theme.refreshThemes();
             // start the selection on the active theme
             var av = Theme.available;
@@ -61,7 +74,13 @@ AnchoredPanel {
                 spacing: 6
                 model: Theme.available
                 currentIndex: tq.selIndex
+                highlightFollowsCurrentItem: false
                 boundsBehavior: Flickable.StopAtBounds
+                // the selection always in view, without an animation to wait for
+                Connections {
+                    target: tq
+                    function onSelIndexChanged() { list.positionViewAtIndex(tq.selIndex, ListView.Contain); }
+                }
 
                 delegate: Rectangle {
                     id: trow
@@ -75,7 +94,6 @@ AnchoredPanel {
                     color: rma.containsMouse || selected ? Theme.surface1 : Theme.surface0
                     border.width: isActive ? 2 : (selected ? 1 : 0)
                     border.color: isActive ? Theme.accent : Theme.overlay0
-                    Behavior on color { ColorAnimation { duration: Theme.dur(100) } }
 
                     RowLayout {
                         anchors.fill: parent
@@ -114,7 +132,14 @@ AnchoredPanel {
                     MouseArea {
                         id: rma
                         anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-                        onEntered: tq.selIndex = trow.index
+                        // a row that scrolls under a still pointer is not a choice
+                        onPositionChanged: function(mouse) {
+                            var g = rma.mapToGlobal(mouse.x, mouse.y);
+                            if (g.x === tq._lastPointer.x && g.y === tq._lastPointer.y) return;
+                            var first = tq._lastPointer.x < 0;
+                            tq._lastPointer = Qt.point(g.x, g.y);
+                            if (!first) tq.select(trow.index);
+                        }
                         onClicked: Theme.apply(trow.modelData.id)
                     }
                 }
@@ -127,8 +152,11 @@ AnchoredPanel {
                 Keys.onPressed: function(event) {
                     var n = Theme.available.length;
                     if (n === 0) return;
-                    if (event.key === Qt.Key_Down)      { tq.selIndex = (tq.selIndex + 1) % n; event.accepted = true; }
-                    else if (event.key === Qt.Key_Up)   { tq.selIndex = (tq.selIndex - 1 + n) % n; event.accepted = true; }
+                    // held keys stop at the ends instead of wrapping round and round
+                    if (event.key === Qt.Key_Down)      { tq.select(event.isAutoRepeat ? tq.selIndex + 1 : (tq.selIndex + 1) % n); event.accepted = true; }
+                    else if (event.key === Qt.Key_Up)   { tq.select(event.isAutoRepeat ? tq.selIndex - 1 : (tq.selIndex - 1 + n) % n); event.accepted = true; }
+                    else if (event.key === Qt.Key_Home) { tq.select(0); event.accepted = true; }
+                    else if (event.key === Qt.Key_End)  { tq.select(n - 1); event.accepted = true; }
                     else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
                         Theme.apply(Theme.available[tq.selIndex].id); event.accepted = true;
                     } else if (event.key === Qt.Key_Escape) { tq.close(); event.accepted = true; }
