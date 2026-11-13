@@ -131,6 +131,51 @@ Singleton {
     // por VM encendida) y es lo que deja decir ANTES de parar o borrar una red
     // qué VMs encendidas se quedarían colgando.
     property var liveNics: []
+
+    // ---- red puente (la gestiona el shell, no el usuario) -----------------
+    //  «Puente» = la red de libvirt `vexyon-lan`: un pool macvtap
+    //  (<forward mode='bridge'><interface dev='…'/>) sobre la tarjeta CABLEADA
+    //  del anfitrión. Por qué macvtap y no un puente br0 de NetworkManager
+    //  (medido en el laboratorio de la fase 1, PROJECT_STATE.md):
+    //   * no toca la red del anfitrión: su IP sigue en la misma tarjeta, nada
+    //     se reconfigura, crear la red no corta la conexión ni un segundo;
+    //   * no pasa por el reenvío del kernel ni por br_netfilter: el FORWARD en
+    //     DROP de Docker y cualquier cortafuegos del anfitrión ni la ven;
+    //   * el precio: este equipo NO llega a sus propias VMs en puente (límite
+    //     de macvtap); la LAN y las demás VMs sí. Se dice en la interfaz.
+    //  Un puente L2 no funciona sobre Wi-Fi (el punto de acceso solo acepta la
+    //  MAC de la tarjeta): sin tarjeta cableada con cable, el modo puente se
+    //  ofrece desactivado con el motivo y la alternativa (NAT privada con
+    //  reenvío de puertos).
+    readonly property string lanNet: "vexyon-lan"
+    // Tarjetas del anfitrión: [{ name, wifi, carrier, isDefault }]
+    property var hostIfaces: []
+    property bool hostIfacesRead: false
+    // La cableada que usaría el puente: la de la ruta por defecto si es
+    // cableada y tiene cable; si no, la primera cableada con cable.
+    readonly property string lanIface: {
+        var best = "";
+        for (var i = 0; i < root.hostIfaces.length; i++) {
+            var f = root.hostIfaces[i];
+            if (f.wifi || !f.carrier) continue;
+            if (f.isDefault) return f.name;
+            if (best === "") best = f.name;
+        }
+        return best;
+    }
+    // "ok" | "wifi" (solo Wi-Fi conectada) | "nocable" (cableada sin cable) | "none"
+    readonly property string lanState: {
+        if (root.lanIface !== "") return "ok";
+        var wired = false, wifiUp = false;
+        for (var i = 0; i < root.hostIfaces.length; i++) {
+            if (root.hostIfaces[i].wifi) { if (root.hostIfaces[i].carrier) wifiUp = true; }
+            else wired = true;
+        }
+        if (wifiUp) return "wifi";
+        return wired ? "nocable" : "none";
+    }
+    // La tarjeta sobre la que está definida `vexyon-lan` ahora ("" = no existe)
+    property string lanNetDev: ""
     // Resultado del diagnóstico de redes (solo a petición, botón en la pestaña
     // de redes): [{ level: "bad"|"warn"|"info", title, detail, fix, net,
     // settings }]. `net` = red con adaptadores que se pueden reenganchar;
@@ -500,7 +545,12 @@ Singleton {
     //  Todo a /dev/null: `run` toma cualquier stderr por error, y si la red
     //  no se puede levantar el propio `virsh start` lo dice con su mensaje.
     function _netsUp(name) {
-        return "for n in $($V domiflist " + q(name) + " 2>/dev/null | awk 'NR>2 && $2==\"network\" {print $3}' | sort -u); do " +
+        //  La red puente se asegura AL ARRANCAR, con la tarjeta cableada de
+        //  este momento: si no existía (primer uso) o el portátil cambió de
+        //  tarjeta, se hace o se rehace aquí, sin que nadie toque nada.
+        return "if $V domiflist " + q(name) + " 2>/dev/null | awk 'NR>2 {print $3}' | grep -qx " + q(root.lanNet) + "; then " +
+                 root._lanEnsure() + "fi; " +
+               "for n in $($V domiflist " + q(name) + " 2>/dev/null | awk 'NR>2 && $2==\"network\" {print $3}' | sort -u); do " +
                "$V net-info \"$n\" 2>/dev/null | grep -q '^Active: *no' && $V net-start \"$n\" >/dev/null 2>&1; done; ";
     }
     readonly property bool openOnStart: Config.get("virtualization", "openOnStart", true) === true
@@ -592,7 +642,15 @@ Singleton {
               "i=$($V domblkinfo " + q(name) + " \"$t\" 2>/dev/null); " +
               "printf '@@DISKSZ\\t%s\\t%s\\t%s\\n' \"$t\" " +
                 "\"$(printf '%s' \"$i\" | sed -n 's/^Capacity: *//p')\" " +
-                "\"$(printf '%s' \"$i\" | sed -n 's/^Allocation: *//p')\"; done"];
+                "\"$(printf '%s' \"$i\" | sed -n 's/^Allocation: *//p')\"; done; " +
+            //  Direcciones IP de cada adaptador (vista experta): la concesión
+            //  DHCP de libvirt (sus redes), el agente del invitado
+            //  (qemu-guest-agent, si lo lleva) y la tabla ARP del anfitrión.
+            //  Un adaptador en puente (macvtap) no sale en ninguna de las dos
+            //  primeras de libvirt y el anfitrión no lo ve por ARP: sin agente,
+            //  su IP no se puede saber desde aquí.
+            "for s in lease agent arp; do $V domifaddr " + q(name) + " --source $s 2>/dev/null | " +
+              "awk -v s=$s 'NR>2 && $2 ~ /:/ && $4 != \"\" {print \"@@ADDR\\t\" $2 \"\\t\" $4 \"\\t\" s}'; done"];
         detailer.running = true;
     }
 
@@ -827,6 +885,7 @@ Singleton {
     function loadBridges() {
         if (!root.enabled) return;
         bridgeLister.running = true;
+        ifaceLister.running = true;
     }
     //  Cambiar la red de un adaptador EXISTENTE sin cambiar el adaptador.
     //  ⚠️ Lo que NO hay que hacer (y era lo único que dejaba la ventana):
@@ -867,6 +926,121 @@ Singleton {
         var cmd = "$V attach-interface " + q(name) + " bridge " + q(br) +
                   " --model " + q(model) + " --mac \"$MAC\"";
         root.run("nic-add", mkMac + root.cfgLive(name, cmd, cmd));
+    }
+
+    // ---- modos de adaptador (fase 1) ----------------------------------------
+    //  `vexyon-lan` existe, apunta a la tarjeta cableada de ahora y está
+    //  arrancada. Si ya existía sobre OTRA tarjeta (portátil que cambió de
+    //  base, otro adaptador USB) se rehace solo si ninguna VM encendida la usa;
+    //  si alguna la usa, se deja como está y se avisa. Nunca toca la tarjeta
+    //  del anfitrión: macvtap cuelga sus interfaces de ella sin reconfigurarla.
+    //  La tarjeta cableada AHORA (la misma regla que ifaceLister): la de la
+    //  ruta por defecto si es cableada y tiene cable; si no, la primera
+    //  cableada con cable. Deja $LANIF ("" si no hay ninguna).
+    readonly property string _lanDetect:
+        "DEF=$(ip -4 route show default 2>/dev/null | sed -n 's/.* dev \\([^ ]*\\).*/\\1/p' | head -n 1); LANIF=; FIRST=; " +
+        "for n in /sys/class/net/*; do i=${n##*/}; [ -e \"$n/device\" ] || continue; " +
+          "{ [ -d \"$n/wireless\" ] || [ -e \"$n/phy80211\" ]; } && continue; " +
+          "[ \"$(cat \"$n/operstate\" 2>/dev/null)\" = up ] || continue; " +
+          "[ \"$i\" = \"$DEF\" ] && { LANIF=$i; break; }; [ -z \"$FIRST\" ] && FIRST=$i; done; " +
+        "[ -z \"$LANIF\" ] && LANIF=$FIRST; "
+    //  $LANIF tiene que estar puesto (_lanDetect); sin tarjeta, error claro.
+    function _lanEnsure() {
+        var N = q(root.lanNet), I = "\"$LANIF\"";
+        return root._lanDetect +
+            "[ -n \"$LANIF\" ] || { echo " + q(I18n.t("Bridged mode needs a wired network card with a cable connected.")) + " >&2; exit 1; }; " +
+            "LT=$(mktemp) || exit 1; " +
+            "printf \"<network><name>%s</name><forward mode='bridge'><interface dev='%s'/></forward></network>\\n\" " + N + " \"$LANIF\" > \"$LT\"; " +
+            "if $V net-info " + N + " >/dev/null 2>&1; then " +
+              "CUR=$($V net-dumpxml " + N + " 2>/dev/null | sed -n \"s/.*<interface dev='\\([^']*\\)'.*/\\1/p\" | head -n 1); " +
+              "if [ \"$CUR\" != " + I + " ]; then " +
+                "USED=$($V net-dumpxml " + N + " 2>/dev/null | grep -c \"connections='[1-9]\"); " +
+                "if [ \"$USED\" = 0 ]; then $V net-destroy " + N + " >/dev/null 2>&1; $V net-define \"$LT\" >/dev/null || { rm -f \"$LT\"; exit 1; }; " +
+                "else printf '@@WARN %s\\t%s\\n' 'The bridged network stays on its previous card while VMs use it:' \"$CUR\" >&2; fi; " +
+              "fi; " +
+            "else $V net-define \"$LT\" >/dev/null || { rm -f \"$LT\"; exit 1; }; fi; " +
+            "rm -f \"$LT\"; $V net-autostart " + N + " >/dev/null 2>&1; " +
+            "$V net-info " + N + " 2>/dev/null | grep -q '^Active: *yes' || $V net-start " + N + " >/dev/null || exit 1; ";
+    }
+    //  El mismo cuerpo que setNicSource, para encadenarlo tras _lanEnsure en
+    //  UNA sola acción.
+    function _nicSourceScript(name, mac, kind, target) {
+        var X = q(root.xmlBin);
+        var net = kind !== "bridge";
+        var k = net ? "network" : "bridge";
+        return "D=$(mktemp -d) || exit 1; trap 'rm -rf \"$D\"' EXIT; " +
+            (net ? "$V net-info " + q(target) + " >/dev/null 2>&1 && $V net-start " + q(target) + " >/dev/null 2>&1; " : "") +
+            "S=$($V domstate " + q(name) + " 2>/dev/null); " +
+            root.editXml(name, "nic-" + k + " " + q(mac) + " " + q(target)) + " || exit 1; " +
+            "case \"$S\" in running|paused) ;; *) exit 0;; esac; " +
+            "$V dumpxml " + q(name) + " | " + X + " iface-retarget " + q(mac) + " " + k + " " + q(target) + " > \"$D/l.xml\" && " +
+            "$V update-device " + q(name) + " \"$D/l.xml\" --live >/dev/null 2>&1 || { printf '@@LIVEFAIL' >&2; exit 0; }; :";
+    }
+    //  Cambiar el MODO de un adaptador existente (misma MAC, mismo modelo):
+    //   "nat"      la red `default` de libvirt (VMs que se ven entre sí)
+    //   "bridged"  `vexyon-lan` (macvtap sobre la tarjeta cableada)
+    //   "private"  NAT privada con passt (reenvío de puertos; fuera del
+    //              cortafuegos y de Docker). El tipo de tarjeta cambia, así que
+    //              en una VM encendida se guarda y vale al reiniciarla.
+    function setNicMode(name, mac, mode) {
+        if (mode === "bridged") {
+            if (root.lanIface === "") { root.lastError = I18n.t("Bridged mode needs a wired network card with a cable connected."); return; }
+            root.run("nic-source", root._lanEnsure() +
+                     root._nicSourceScript(name, mac, "network", root.lanNet));
+        } else if (mode === "private") {
+            root.run("nic-source",
+                "S=$($V domstate " + q(name) + " 2>/dev/null); " +
+                root.editXml(name, "nic-user " + q(mac)) + " || exit 1; " +
+                "case \"$S\" in running|paused) printf '@@LIVEFAIL' >&2;; esac; :");
+        } else {
+            root.setNicSource(name, mac, "network", mode === "nat" ? "default" : mode);
+        }
+    }
+    //  Reenvíos de puertos de un adaptador de NAT privada: [{ proto, host,
+    //  guest, local }]. passt los lee al arrancar: con la VM encendida se
+    //  guardan y valen al reiniciarla (se avisa).
+    function setPortForwards(name, mac, list) {
+        var args = [];
+        for (var i = 0; i < list.length; i++) {
+            var r = list[i];
+            args.push(q(r.proto + ":" + r.host + ":" + r.guest + (r.local ? ":127.0.0.1" : "")));
+        }
+        root.run("port-forward",
+            "S=$($V domstate " + q(name) + " 2>/dev/null); " +
+            root.editXml(name, "pf-set " + q(mac) + (args.length ? " " + args.join(" ") : "")) + " || exit 1; " +
+            "case \"$S\" in running|paused) printf '@@LIVEFAIL' >&2;; esac; :");
+    }
+    //  Cambiar la MAC (solo con la VM apagada; la vista no lo ofrece encendida).
+    function setNicMac(name, mac, newMac) {
+        root.run("nic-mac", root.editXml(name, "nic-mac " + q(mac) + " " + q(String(newMac).toLowerCase())));
+    }
+    //  Añadir un adaptador en un modo: "nat" | "bridged" | "private" | <red>.
+    function addNicMode(name, mode, model) {
+        if (mode === "bridged") {
+            if (root.lanIface === "") { root.lastError = I18n.t("Bridged mode needs a wired network card with a cable connected."); return; }
+            var mkMac = "MAC=$(printf '52:54:00:%02x:%02x:%02x' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256))); ";
+            var cmd = "$V attach-interface " + q(name) + " network " + q(root.lanNet) +
+                      " --model " + q(model) + " --mac \"$MAC\"";
+            root.run("nic-add", root._lanEnsure() + mkMac + root.cfgLive(name, cmd, cmd));
+        } else if (mode === "private") {
+            //  attach-interface no sabe de passt: el <interface> va en un
+            //  fichero a attach-device. Solo a la config (passt no se engancha
+            //  en caliente de forma fiable): vale al siguiente arranque.
+            root.run("nic-add",
+                "MAC=$(printf '52:54:00:%02x:%02x:%02x' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256))); " +
+                "T=$(mktemp) || exit 1; " +
+                "printf \"<interface type='user'><mac address='%s'/><model type='%s'/><backend type='passt'/></interface>\\n\" \"$MAC\" " + q(model) + " > \"$T\"; " +
+                "$V attach-device " + q(name) + " \"$T\" --config; rc=$?; rm -f \"$T\"; [ $rc = 0 ] || exit $rc; " +
+                "[ \"$($V domstate " + q(name) + " 2>/dev/null)\" = running ] && printf '@@LIVEFAIL' >&2; :");
+        } else {
+            root.addNic(name, mode === "nat" ? "default" : mode, model);
+        }
+    }
+    //  Leer las tarjetas del anfitrión (y sobre cuál está `vexyon-lan`). Solo
+    //  lectura de /sys y una ruta: se pide al abrir la sección de red.
+    function loadHostIfaces() {
+        if (!root.enabled) return;
+        ifaceLister.running = true;
     }
 
     // ---- sonido -------------------------------------------------------------
@@ -1557,7 +1731,7 @@ Singleton {
             if (who.length > 0 && String(sys.backend || "").indexOf("nftables") === 0)
                 add("bad", I18n.t("libvirt's nftables rules cannot override the DROP policy set by") + " " + who.join(", "),
                     I18n.t("VMs lose DHCP (ufw) and all forwarded traffic: the internet and, with br_netfilter, each other."),
-                    I18n.t("Vexyon's installer sets this up when Docker or ufw is installed: run ./install.sh again. It writes firewall_backend = \"iptables\" in /etc/libvirt/network.conf; a network picks it up the next time it starts."),
+                    I18n.t("Vexyon's installer sets libvirt's iptables backend: run ./install.sh again (a firewall_backend line you wrote yourself in /etc/libvirt/network.conf is left alone). It applies when libvirtd next starts. Meanwhile, adapters in Private NAT or Bridged mode are not affected."),
                     "", root.platform === "arch");
             if (sys.units.nftables && (sys.fw["etcnft:hook input"] || sys.fw["etcnft:hook forward"])
                     && !sys.fw["etcnft:virbr"])
@@ -2200,8 +2374,23 @@ Singleton {
                                format: f[5], readonly: f[6] === "ro", capacity: 0 });
                 break;
             case "@@DISKSZ": sizes[f[1]] = parseInt(f[2], 10) || 0; break;
-            case "@@NIC":
-                d.nics.push({ mac: f[1], type: f[2], source: f[3], model: f[4], link: f[5] });
+            case "@@NIC": {
+                var pfs = [];
+                var raw = (f[7] || "").split(";");
+                for (var pk = 0; pk < raw.length; pk++) {
+                    var pp = raw[pk].split(":");
+                    if (pp.length >= 3 && pp[1] !== "")
+                        pfs.push({ proto: pp[0], host: pp[1], guest: pp[2], addr: pp.slice(3).join(":") });
+                }
+                d.nics.push({ mac: f[1], type: f[2], source: f[3], model: f[4], link: f[5],
+                              backend: f[6] || "", forwards: pfs, addrs: [] });
+                break;
+            }
+            case "@@ADDR":
+                if (!d._addrs) d._addrs = {};
+                var am = String(f[1]).toLowerCase();
+                if (!d._addrs[am]) d._addrs[am] = [];
+                if (d._addrs[am].indexOf(f[2]) === -1) d._addrs[am].push(f[2]);
                 break;
             case "@@CTRL":  d.ctrls.push({ type: f[1], index: f[2], model: f[3] }); break;
             case "@@VIDEO": d.video = { model: f[1], vram: parseInt(f[2], 10) || 0, heads: f[3] }; break;
@@ -2221,6 +2410,10 @@ Singleton {
         }
         for (var k = 0; k < d.disks.length; k++)
             if (sizes[d.disks[k].target] !== undefined) d.disks[k].capacity = sizes[d.disks[k].target];
+        if (d._addrs)
+            for (var n = 0; n < d.nics.length; n++)
+                d.nics[n].addrs = d._addrs[String(d.nics[n].mac).toLowerCase()] || [];
+        delete d._addrs;
         root.detail = d;
     }
 
@@ -2322,6 +2515,36 @@ Singleton {
                 for (var i = 0; i < ls.length; i++)
                     if (ls[i].trim() !== "") out.push(ls[i].trim());
                 root.hostBridges = out;
+            }
+        }
+    }
+
+    //  Tarjetas físicas: las que tienen `device` en /sys (las virtuales —
+    //  puentes, taps, veth, docker0, macvtap— no). Wi-Fi = `wireless` o
+    //  `phy80211`. Con cable = operstate up. Por defecto = la de la ruta
+    //  por defecto IPv4.
+    Process {
+        id: ifaceLister
+        command: ["bash", "-c", root.sh +
+            "DEF=$(ip -4 route show default 2>/dev/null | sed -n 's/.* dev \\([^ ]*\\).*/\\1/p' | head -n 1); " +
+            "for n in /sys/class/net/*; do i=${n##*/}; [ -e \"$n/device\" ] || continue; " +
+              "w=0; { [ -d \"$n/wireless\" ] || [ -e \"$n/phy80211\" ]; } && w=1; " +
+              "c=0; [ \"$(cat \"$n/operstate\" 2>/dev/null)\" = up ] && c=1; " +
+              "d=0; [ \"$i\" = \"$DEF\" ] && d=1; " +
+              "printf '@@IF\\t%s\\t%s\\t%s\\t%s\\n' \"$i\" \"$w\" \"$c\" \"$d\"; done; " +
+            "printf '@@LANNET\\t%s\\n' \"$($V net-dumpxml " + root.lanNet + " 2>/dev/null | sed -n \"s/.*<interface dev='\\([^']*\\)'.*/\\1/p\" | head -n 1)\""]
+        stdout: StdioCollector {
+            onStreamFinished: {
+                var out = [], dev = "", ls = this.text.split("\n");
+                for (var i = 0; i < ls.length; i++) {
+                    var f = ls[i].split("\t");
+                    if (f[0] === "@@IF" && f.length >= 5)
+                        out.push({ name: f[1], wifi: f[2] === "1", carrier: f[3] === "1", isDefault: f[4] === "1" });
+                    else if (f[0] === "@@LANNET") dev = f[1] || "";
+                }
+                root.hostIfaces = out;
+                root.lanNetDev = dev;
+                root.hostIfacesRead = true;
             }
         }
     }

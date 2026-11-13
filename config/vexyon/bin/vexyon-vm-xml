@@ -87,12 +87,15 @@ def cmd_info(root, argv):
         if src is not None:
             source = (src.get("network") or src.get("bridge")
                       or src.get("dev") or src.get("portgroup") or "")
+        be = nic.find("backend")
         rec("@@NIC",
             mac.get("address", "") if mac is not None else "",
             nic.get("type", ""),
             source,
             mdl.get("type", "") if mdl is not None else "",
-            link.get("state", "up") if link is not None else "up")
+            link.get("state", "up") if link is not None else "up",
+            be.get("type", "") if be is not None else "",
+            ";".join(pf_specs(nic)))
 
     for c in dev.findall("controller"):
         rec("@@CTRL", c.get("type", ""), c.get("index", ""), c.get("model", ""))
@@ -472,6 +475,116 @@ def cmd_scsi_virtio(root, argv):
     return root
 
 
+def find_nic(root, mac):
+    for nic in devices(root).findall("interface"):
+        m = nic.find("mac")
+        if m is not None and m.get("address", "").lower() == mac.lower():
+            return nic
+    die("no hay ninguna interfaz con la MAC %s en este dominio" % mac)
+
+
+def drop_user_parts(nic):
+    """Lo que solo tiene sentido en un adaptador de usuario (passt): el
+    <backend> y los <portForward>. Al volver a una red o a un puente sobran."""
+    for tag in ("backend", "portForward"):
+        for el in nic.findall(tag):
+            nic.remove(el)
+
+
+def pf_specs(nic):
+    """<portForward> de un adaptador passt -> ["tcp:8080:80:", "udp:5353:53:127.0.0.1"]
+    (proto:puerto_anfitrión:puerto_invitado:dirección_de_escucha)."""
+    out = []
+    for pf in nic.findall("portForward"):
+        proto = pf.get("proto", "tcp")
+        addr = pf.get("address", "")
+        for r in pf.findall("range"):
+            start = r.get("start", "")
+            to = r.get("to", start)
+            if start:
+                out.append("%s:%s:%s:%s" % (proto, start, to, addr))
+    return out
+
+
+def valid_port(p):
+    return p.isdigit() and 1 <= int(p) <= 65535
+
+
+def cmd_nic_user(root, argv):
+    """nic-user <mac> — pasa una interfaz a NAT PRIVADA con passt.
+
+    passt es red de usuario: el invitado sale por los sockets normales de este
+    equipo, sin puente, sin tap y sin reenvío por el kernel, así que NI el
+    FORWARD en DROP de Docker NI ningún cortafuegos del anfitrión la tocan
+    (medido: PROJECT_STATE.md, fase 1 de VMs). Es el «NAT» de VirtualBox: cada
+    VM sola detrás de la dirección de este equipo, y los demás llegan a ella
+    por los puertos reenviados (pf-set).
+
+    Igual que nic-network/nic-bridge: misma MAC, mismo modelo, misma ranura;
+    solo cambia el enganche.
+    """
+    nic = find_nic(root, argv[0])
+    nic.set("type", "user")
+    for tag in ("source", "target", "virtualport", "bandwidth"):
+        for el in nic.findall(tag):
+            nic.remove(el)
+    be = nic.find("backend")
+    if be is None:
+        be = ET.SubElement(nic, "backend")
+    be.attrib.clear()
+    be.set("type", "passt")
+    return root
+
+
+def cmd_pf_set(root, argv):
+    """pf-set <mac> [proto:puerto_anfitrión:puerto_invitado[:dirección]]… —
+    sustituye TODOS los reenvíos de puertos de ese adaptador passt (sin
+    argumentos, los quita). passt solo los lee al arrancar la VM."""
+    nic = find_nic(root, argv[0])
+    be = nic.find("backend")
+    if nic.get("type") != "user" or be is None or be.get("type") != "passt":
+        die("el adaptador %s no es de NAT privada (passt)" % argv[0])
+    for el in nic.findall("portForward"):
+        nic.remove(el)
+    seen = set()
+    for spec in argv[1:]:
+        f = spec.split(":")
+        if len(f) not in (3, 4):
+            die("reenvío mal escrito: %s" % spec)
+        proto, hp, gp = f[0], f[1], f[2]
+        addr = f[3] if len(f) == 4 else ""
+        if proto not in ("tcp", "udp") or not valid_port(hp) or not valid_port(gp):
+            die("reenvío no válido: %s" % spec)
+        if addr not in ("", "127.0.0.1", "0.0.0.0", "::1", "::"):
+            die("dirección de escucha no válida: %s" % addr)
+        key = (proto, hp, addr)
+        if key in seen:
+            die("el puerto %s/%s del anfitrión está repetido" % (hp, proto))
+        seen.add(key)
+        pf = ET.SubElement(nic, "portForward", {"proto": proto})
+        if addr:
+            pf.set("address", addr)
+        ET.SubElement(pf, "range", {"start": hp, "to": gp})
+    return root
+
+
+def cmd_nic_mac(root, argv):
+    """nic-mac <mac> <mac_nueva> — cambia la MAC de un adaptador (VM apagada).
+    Solo direcciones unicast administradas localmente o de QEMU (52:54:00)."""
+    old, new = argv[0], argv[1].lower()
+    import re
+    if not re.fullmatch(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}", new):
+        die("MAC no válida: %s" % new)
+    if int(new[:2], 16) & 1:
+        die("una MAC de multidifusión no vale para un adaptador: %s" % new)
+    for nic in devices(root).findall("interface"):
+        m = nic.find("mac")
+        if m is not None and m.get("address", "").lower() == new and new != old.lower():
+            die("otra interfaz de esta VM ya usa %s" % new)
+    find_nic(root, old).find("mac").set("address", new)
+    return root
+
+
 def cmd_nic_model(root, argv):
     """nic-model <mac> <modelo> — cambia el modelo de UNA interfaz.
 
@@ -555,9 +668,10 @@ def cmd_nic_bridge(root, argv):
             src = ET.SubElement(nic, "source")
         # `portid` es el puerto de la red VIEJA (solo sale en el XML vivo):
         # arrastrarlo a otra red haría que libvirt buscara un puerto que no es.
-        for a in ("network", "dev", "portgroup", "portid"):
+        for a in ("network", "dev", "portgroup", "portid", "mode"):
             src.attrib.pop(a, None)
         src.set("bridge", br)
+        drop_user_parts(nic)
         # el modo de virtualport de una red gestionada no vale para un puente
         for vp in nic.findall("virtualport"):
             nic.remove(vp)
@@ -584,9 +698,10 @@ def cmd_nic_network(root, argv):
             src = ET.SubElement(nic, "source")
         # `bridge` y `portid` del XML vivo son el puente y el puerto que libvirt
         # le dio en la red de ANTES; los de la nueva los pone libvirt.
-        for a in ("bridge", "dev", "portgroup", "portid"):
+        for a in ("bridge", "dev", "portgroup", "portid", "mode"):
             src.attrib.pop(a, None)
         src.set("network", net)
+        drop_user_parts(nic)
     if not hit:
         die("no hay ninguna interfaz con la MAC %s en este dominio" % mac)
     return root
@@ -722,6 +837,9 @@ COMMANDS = {
     "iface-retarget": cmd_iface_retarget,
     "nic-bridge": cmd_nic_bridge,
     "nic-network": cmd_nic_network,
+    "nic-user": cmd_nic_user,
+    "pf-set": cmd_pf_set,
+    "nic-mac": cmd_nic_mac,
     "firmware": cmd_firmware,
     "rename": cmd_rename,
     "clone": cmd_clone,

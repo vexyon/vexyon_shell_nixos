@@ -3449,9 +3449,33 @@ FloatingWindow {
                         //  conjunto de reglas ESCRITO A MANO puede seguir cortando,
                         //  y ese no se toca nunca por detrás.
                         SsHeader { text: I18n.t("VM NETWORKING") }
+                        //  Estado del modo puente: se lee al abrir la página
+                        //  (/sys y una ruta; nada se queda vigilando).
                         Text {
                             Layout.fillWidth: true
-                            text: I18n.t("VM networks work out of the box: Vexyon opens what they need in NixOS's firewall, switches libvirt to its iptables backend when Docker or ufw are installed on Arch, and firewalld needs nothing. Only a firewall ruleset you wrote yourself can still block them. If Diagnose networks, in the VM manager's Host networks tab, points to your firewall, allow these on libvirt's bridges — the first two in its input chain, the last two in its forward chain:")
+                            Component.onCompleted: Vm.loadHostIfaces()
+                            text: !Vm.hostIfacesRead ? ""
+                                : Vm.lanState === "ok" ? I18n.t("Bridged mode: ready on the wired card %1. Vexyon makes the bridge itself when a VM uses it, without touching this computer's own connection.").arg(Vm.lanIface)
+                                : Vm.lanState === "wifi" ? I18n.t("Bridged mode: not available — this computer is on Wi-Fi only, and a bridge does not work over Wi-Fi. Use Private NAT with port forwarding to reach a VM from other computers.")
+                                : Vm.lanState === "nocable" ? I18n.t("Bridged mode: not available — the wired card has no cable connected.")
+                                : I18n.t("Bridged mode: not available — this computer has no wired network card.")
+                            color: Vm.lanState === "ok" ? Theme.green : Theme.yellow
+                            visible: text !== ""
+                            wrapMode: Text.Wrap
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontSize - 2
+                        }
+                        Text {
+                            Layout.fillWidth: true
+                            text: I18n.t("Each VM adapter is NAT (the default: VMs see each other and this computer reaches them), Bridged (on your local network; made with macvtap, so this computer's connection is never touched) or Private NAT with port forwarding (like VirtualBox's NAT). Bridged and Private NAT need no firewall rule at all, and Docker does not affect them.")
+                            color: Theme.subtext0
+                            wrapMode: Text.Wrap
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontSize - 2
+                        }
+                        Text {
+                            Layout.fillWidth: true
+                            text: I18n.t("NAT networks work out of the box too: Vexyon opens what they need in NixOS's firewall, sets libvirt to its iptables backend on Arch (so Docker's and ufw's DROP policies do not cut them), and firewalld needs nothing. Only a firewall ruleset you wrote yourself can still block NAT networks — Vexyon never edits it. If Diagnose networks, in the VM manager's Host networks tab, points to it, either switch the VM to Private NAT, or allow these on libvirt's bridges — the first two in its input chain, the last two in its forward chain:")
                             color: Theme.subtext0
                             wrapMode: Text.Wrap
                             font.family: Theme.fontFamily

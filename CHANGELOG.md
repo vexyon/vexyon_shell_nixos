@@ -10,6 +10,26 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
 
 ### Changed
 
+- **VM networking, phase 1: Bridged and Private NAT with port forwarding,
+  without touching anything.** Each adapter now has a mode: NAT (default),
+  Bridged or Private NAT + port forwarding (or any other libvirt network).
+  Bridged is a libvirt network Vexyon makes itself (`vexyon-lan`, macvtap on
+  the wired card that has the default route), created or re-pointed when a
+  VM starts: the host's own connection is never reconfigured, and Docker
+  and the firewall do not see it; this computer cannot reach its own
+  bridged VMs (a macvtap limit, said in the UI). On Wi-Fi only, without a
+  cable or without a wired card, Bridged is shown unavailable with the
+  reason and Private NAT as the alternative. Private NAT uses passt
+  (VirtualBox-style NAT): forwarded ports are edited in the adapter card,
+  reachable from this computer always and from others only if your
+  firewall allows it. Each adapter's advanced options show the card model,
+  the MAC (editable with the VM off, or random) and its IP addresses. The
+  old "create a bridge yourself" recipes are gone.
+- **Arch: libvirt's iptables firewall backend is now always set** (unless
+  you set one yourself), so installing Docker or ufw later no longer cuts
+  the VMs' NAT; `passt` is installed, and `iptables` only if no `iptables`
+  command exists.
+
 - **AirDrop: newer upstream releases.** omdrop 0.16.4 → 0.18.12 and
   omdrop-owl → release 0.3.0 (the newest of its line; from 0.4 it is
   "Owly", a rewrite with its own system service that Vexyon does not

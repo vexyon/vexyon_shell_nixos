@@ -141,6 +141,7 @@ FloatingWindow {
     //  "Añadir adaptador", en red gestionada y en puente). Antes iba fijo a
     //  virtio, que en Windows es un adaptador sin driver.
     property string newNicModel: "virtio"
+    property string newNicMode: "nat"
     readonly property bool hasDefaultNet: {
         for (var i = 0; i < Vm.networks.length; i++)
             if (Vm.networks[i].name === Vm.protectedNet) return true;
@@ -510,6 +511,85 @@ FloatingWindow {
     }
     IntValidator { id: intVal; bottom: 1; top: 999999 }
 
+    // ---- modo experto -------------------------------------------------------
+    //  Lo técnico (MAC, IPs, modelos, XML, línea de QEMU) no estorba por
+    //  defecto: va en los bloques «Opciones avanzadas», que con el modo
+    //  experto salen ya abiertos. Se recuerda en shell.json (vm.expert).
+    readonly property bool expert: Config.get("vm", "expert", false) === true
+    function setExpert(on) { Config.set("vm", "expert", on === true); }
+
+    // Bloque plegable «Opciones avanzadas»: cerrado por defecto, abierto en
+    // modo experto; el usuario lo puede abrir o cerrar a mano.
+    component Fold : ColumnLayout {
+        id: fd
+        property string title: I18n.t("Advanced options")
+        property bool open: vm.expert
+        default property alias body: fdBody.data
+        Layout.fillWidth: true
+        spacing: 8
+        Rectangle {
+            Layout.fillWidth: true
+            implicitHeight: 30
+            radius: Theme.radius
+            color: fdMa.containsMouse ? Theme.surface1 : "transparent"
+            RowLayout {
+                anchors.fill: parent; anchors.leftMargin: 4; spacing: 6
+                Text {
+                    text: fd.open ? Icons.chevronDown : Icons.chevronRight
+                    color: Theme.subtext0; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
+                }
+                Text {
+                    Layout.fillWidth: true
+                    text: fd.title; color: Theme.subtext1
+                    font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2; font.bold: true
+                }
+            }
+            MouseArea { id: fdMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: fd.open = !fd.open }
+        }
+        ColumnLayout {
+            id: fdBody
+            Layout.fillWidth: true
+            Layout.leftMargin: 10
+            visible: fd.open
+            spacing: 8
+        }
+    }
+
+    // ---- modos de adaptador (fase 1) ----------------------------------------
+    //  nat | bridged | private | other — lo que el adaptador ES para el usuario.
+    function nicModeOf(nic) {
+        if (nic.type === "user") return "private";
+        if (nic.type === "network" && nic.source === "default") return "nat";
+        if (nic.type === "network" && nic.source === Vm.lanNet) return "bridged";
+        return "other";
+    }
+    readonly property var nicModeOptions: [
+        { key: "nat", label: I18n.t("NAT") },
+        { key: "bridged", label: I18n.t("Bridged"), off: Vm.hostIfacesRead && Vm.lanState !== "ok" },
+        { key: "private", label: I18n.t("Private NAT + port forwarding") },
+        { key: "other", label: I18n.t("Other network…") }
+    ]
+    function nicModeText(mode, nic) {
+        switch (mode) {
+        case "nat": return I18n.t("Shares this computer's connection. VMs on NAT see each other, and this computer reaches them by their address.");
+        case "bridged":
+            if (Vm.lanState !== "ok")
+                return I18n.t("On your local network with its own address from your router.");
+            return I18n.t("On your local network with its own address from your router, through the wired card %1. Other computers and VMs reach it; this computer itself cannot (a limit of how the bridge is made, which never touches this computer's own connection).").arg(Vm.lanIface);
+        case "private": return I18n.t("This VM alone behind this computer's address, like VirtualBox's NAT. Reach it through forwarded ports. Docker and the firewall do not affect it.");
+        }
+        return I18n.t("On the libvirt network or host bridge \"%1\".").arg(nic ? nic.source : "");
+    }
+    //  Por qué no se puede el puente aquí, con la alternativa.
+    readonly property string lanWhyNot: {
+        switch (Vm.lanState) {
+        case "wifi": return I18n.t("This computer is on Wi-Fi only. A bridge does not work over Wi-Fi: the access point accepts only your card's own address. To reach the VM from other computers, use Private NAT with port forwarding.");
+        case "nocable": return I18n.t("The wired network card has no cable connected. Plug it in to use bridged mode, or use Private NAT with port forwarding.");
+        case "none": return I18n.t("This computer has no wired network card. Use Private NAT with port forwarding to reach the VM from other computers.");
+        }
+        return "";
+    }
+
     // ---- selector segmentado (firmware, red…) ------------------------------
     component Segmented : Flow {
         id: seg
@@ -522,6 +602,8 @@ FloatingWindow {
             delegate: Rectangle {
                 required property var modelData
                 readonly property bool on: modelData.key === seg.value
+                readonly property bool off: modelData.off === true
+                opacity: off && !on ? 0.4 : 1
                 implicitWidth: segTxt.implicitWidth + 22
                 implicitHeight: 30
                 radius: Theme.radius
@@ -538,8 +620,9 @@ FloatingWindow {
                 }
                 MouseArea {
                     id: sMa
-                    anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-                    onClicked: seg.picked(modelData.key)
+                    anchors.fill: parent; hoverEnabled: true
+                    cursorShape: parent.off ? Qt.ArrowCursor : Qt.PointingHandCursor
+                    onClicked: if (!parent.off) seg.picked(modelData.key)
                 }
             }
         }
@@ -1620,181 +1703,318 @@ FloatingWindow {
                                     spacing: 10
 
                                     onVisibleChanged: if (visible) Vm.loadBridges()
+                                    Component.onCompleted: if (visible) Vm.loadBridges()
 
                                     Sec { text: I18n.t("NETWORK ADAPTERS") }
+                                    Note {
+                                        visible: Vm.detail.nics.length === 0
+                                        text: I18n.t("This VM has no network adapter. Add one below.")
+                                    }
                                     Repeater {
                                         model: Vm.detail.nics
                                         delegate: Rectangle {
+                                            id: nicCard
                                             required property var modelData
+                                            required property int index
+                                            readonly property string mode: vm.nicModeOf(modelData)
+                                            readonly property bool off: !vm.sel || vm.sel.state === "shut off"
                                             Layout.fillWidth: true
-                                            implicitHeight: nicCol.implicitHeight + 16
+                                            implicitHeight: nicCol.implicitHeight + 20
                                             radius: Theme.radius
                                             color: Theme.surface0
                                             border.width: 1; border.color: Theme.overlay0
                                             ColumnLayout {
                                                 id: nicCol
                                                 anchors.left: parent.left; anchors.right: parent.right
-                                                anchors.verticalCenter: parent.verticalCenter
+                                                anchors.top: parent.top; anchors.topMargin: 10
                                                 anchors.leftMargin: 12; anchors.rightMargin: 12
-                                                spacing: 4
+                                                spacing: 8
                                                 RowLayout {
                                                     Layout.fillWidth: true
                                                     spacing: 8
                                                     Rectangle {
                                                         width: 9; height: 9; radius: 4.5
-                                                        color: modelData.link === "down" ? Theme.overlay2 : Theme.green
+                                                        color: nicCard.modelData.link === "down" ? Theme.overlay2 : Theme.green
                                                     }
                                                     Text {
                                                         Layout.fillWidth: true
-                                                        //  ⚠️ NO poner "NAT" fijo porque el tipo de interfaz
-                                                        //  sea `network`: eso es el tipo de ENGANCHE, no lo que
-                                                        //  la red hace. Con redes propias (host-only, interna)
-                                                        //  todas salían rotuladas "NAT", que es justo lo
-                                                        //  contrario de lo que son. Se mira el modo de LA RED.
-                                                        text: modelData.source + "  ·  " + modelData.model
-                                                              + "  ·  " + (modelData.type === "network"
-                                                                           ? vm.netModeLabel(vm.netModeOf(modelData.source))
-                                                                           : modelData.type)
+                                                        text: I18n.t("Adapter %1").arg(nicCard.index + 1)
+                                                              + (nicCard.modelData.addrs.length ? "  ·  " + nicCard.modelData.addrs[0] : "")
                                                         color: Theme.text
                                                         font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1
                                                         font.bold: true
                                                         elide: Text.ElideRight
                                                     }
                                                 }
-                                                Text {
-                                                    Layout.fillWidth: true
-                                                    text: modelData.mac
-                                                    color: Theme.subtext0
-                                                    font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
-                                                }
-                                                //  ⚠️ EL MODELO DE LA TARJETA, que antes no se podía
-                                                //  ni ver ni cambiar y estaba fijo en virtio para
-                                                //  todo el mundo. Windows NO trae driver en caja
-                                                //  para virtio-net: el adaptador sale como
-                                                //  desconocido en el Administrador de dispositivos
-                                                //  y el invitado se queda SIN RED — por NAT y por
-                                                //  puente igual, que es justo lo que se veía. Linux
-                                                //  sí lo trae, de ahí que la misma red `default`
-                                                //  funcionara en Ubuntu y no en Windows.
                                                 Segmented {
                                                     Layout.fillWidth: true
-                                                    value: modelData.model
-                                                    options: [ { key: "virtio", label: "virtio-net" },
-                                                               { key: "e1000e", label: "e1000e" },
-                                                               { key: "rtl8139", label: "rtl8139" } ]
+                                                    value: nicCard.mode
+                                                    options: vm.nicModeOptions
                                                     onPicked: function(k) {
-                                                        if (k !== modelData.model)
-                                                            Vm.setNicModel(vm.selected, modelData.mac, k);
+                                                        if (k === nicCard.mode) return;
+                                                        if (k === "other") { vm.askNicSource(nicCard.modelData); return; }
+                                                        if (k === "bridged" && Vm.lanState !== "ok") return;
+                                                        Vm.setNicMode(vm.selected, nicCard.modelData.mac, k);
                                                     }
                                                 }
-                                                Text {
-                                                    Layout.fillWidth: true
-                                                    visible: modelData.model === "virtio"
-                                                    text: I18n.t("virtio-net has no built-in Windows driver. On a Windows guest switch to e1000e, or install NetKVM from the virtio-win ISO inside the guest. Linux has virtio-net built in and should stay on it.")
-                                                    color: Theme.subtext0; wrapMode: Text.Wrap
-                                                    font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
+                                                Note { text: vm.nicModeText(nicCard.mode, nicCard.modelData) }
+                                                Note {
+                                                    visible: Vm.hostIfacesRead && Vm.lanState !== "ok" && nicCard.mode !== "private"
+                                                    tone: "warn"
+                                                    text: vm.lanWhyNot
                                                 }
+
+                                                // ---- reenvío de puertos (NAT privada) ----
+                                                ColumnLayout {
+                                                    Layout.fillWidth: true
+                                                    visible: nicCard.mode === "private"
+                                                    spacing: 6
+                                                    Text {
+                                                        text: I18n.t("Port forwarding"); color: Theme.subtext1
+                                                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2; font.bold: true
+                                                    }
+                                                    Note {
+                                                        visible: nicCard.modelData.forwards.length === 0
+                                                        text: I18n.t("No forwarded ports yet. Example: host port 2222 to guest port 22 gives SSH to the VM at this computer's address, port 2222.")
+                                                    }
+                                                    Repeater {
+                                                        model: nicCard.modelData.forwards
+                                                        delegate: RowLayout {
+                                                            required property var modelData
+                                                            required property int index
+                                                            Layout.fillWidth: true
+                                                            spacing: 8
+                                                            Text {
+                                                                Layout.fillWidth: true
+                                                                text: modelData.proto.toUpperCase() + "  " + modelData.host + "  →  " + modelData.guest
+                                                                      + (modelData.addr === "127.0.0.1" ? "   (" + I18n.t("this computer only") + ")" : "")
+                                                                color: Theme.text
+                                                                font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
+                                                            }
+                                                            ActBtn {
+                                                                glyph: Icons.trash; danger: true; tint: Theme.red
+                                                                enabled: !Vm.busy
+                                                                onClicked: {
+                                                                    var l = [], fw = nicCard.modelData.forwards;
+                                                                    for (var i = 0; i < fw.length; i++)
+                                                                        if (i !== index) l.push({ proto: fw[i].proto, host: fw[i].host, guest: fw[i].guest, local: fw[i].addr === "127.0.0.1" });
+                                                                    Vm.setPortForwards(vm.selected, nicCard.modelData.mac, l);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    RowLayout {
+                                                        Layout.fillWidth: true
+                                                        spacing: 8
+                                                        Segmented {
+                                                            id: pfProto
+                                                            value: "tcp"
+                                                            options: [ { key: "tcp", label: "TCP" }, { key: "udp", label: "UDP" } ]
+                                                            onPicked: function(k) { pfProto.value = k; }
+                                                        }
+                                                        Field { id: pfHost; label: I18n.t("Host port"); numeric: true; placeholder: "2222" }
+                                                        Field { id: pfGuest; label: I18n.t("Guest port"); numeric: true; placeholder: "22" }
+                                                    }
+                                                    RowLayout {
+                                                        Layout.fillWidth: true
+                                                        spacing: 8
+                                                        Toggle { id: pfLocal; checked: false; onToggled: function(v) { pfLocal.checked = v; } }
+                                                        Text {
+                                                            Layout.fillWidth: true
+                                                            text: I18n.t("Only from this computer")
+                                                            color: Theme.subtext0; wrapMode: Text.Wrap
+                                                            font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
+                                                        }
+                                                        ActBtn {
+                                                            glyph: Icons.plus; label: I18n.t("Add rule"); tint: Theme.teal
+                                                            readonly property int hp: parseInt(pfHost.text, 10) || 0
+                                                            readonly property int gp: parseInt(pfGuest.text, 10) || 0
+                                                            enabled: !Vm.busy && hp >= 1 && hp <= 65535 && gp >= 1 && gp <= 65535
+                                                            onClicked: {
+                                                                var l = [], fw = nicCard.modelData.forwards;
+                                                                for (var i = 0; i < fw.length; i++) {
+                                                                    if (fw[i].proto === pfProto.value && String(fw[i].host) === String(hp)) {
+                                                                        Vm.lastError = I18n.t("Host port %1/%2 is already forwarded.").arg(hp).arg(pfProto.value.toUpperCase());
+                                                                        return;
+                                                                    }
+                                                                    l.push({ proto: fw[i].proto, host: fw[i].host, guest: fw[i].guest, local: fw[i].addr === "127.0.0.1" });
+                                                                }
+                                                                l.push({ proto: pfProto.value, host: hp, guest: gp, local: pfLocal.checked });
+                                                                Vm.setPortForwards(vm.selected, nicCard.modelData.mac, l);
+                                                                pfHost.text = ""; pfGuest.text = "";
+                                                            }
+                                                        }
+                                                    }
+                                                    Note {
+                                                        text: I18n.t("This computer always reaches forwarded ports. Other computers reach them only if this computer's firewall lets that port in: Vexyon never opens ports in your firewall.")
+                                                    }
+                                                    Note {
+                                                        visible: !nicCard.off
+                                                        tone: "warn"
+                                                        text: I18n.t("Forwarded ports change when the VM next starts.")
+                                                    }
+                                                }
+
                                                 Flow {
                                                     Layout.fillWidth: true
                                                     spacing: 6
                                                     ActBtn {
-                                                        glyph: Icons.wifi; label: I18n.t("Connect"); tint: Theme.green
-                                                        enabled: !Vm.busy && vm.running
+                                                        glyph: Icons.wifi; label: I18n.t("Connect cable"); tint: Theme.green
+                                                        visible: vm.running && nicCard.modelData.link === "down"
+                                                        enabled: !Vm.busy
                                                         onClicked: Vm.setLink(vm.selected, true)
                                                     }
                                                     ActBtn {
-                                                        glyph: Icons.noNetwork; label: I18n.t("Disconnect"); tint: Theme.peach
-                                                        enabled: !Vm.busy && vm.running
-                                                        onClicked: Vm.setLink(vm.selected, false)
-                                                    }
-                                                    //  Cambiar de red SIN cambiar de adaptador: misma
-                                                    //  MAC, mismo dispositivo en el invitado. Quitar +
-                                                    //  añadir es OTRA tarjeta (MAC nueva). Ver
-                                                    //  Vm.setNicSource.
-                                                    ActBtn {
-                                                        glyph: Icons.ethernet; label: I18n.t("Change network")
-                                                        tint: Theme.teal
+                                                        glyph: Icons.noNetwork; label: I18n.t("Disconnect cable"); tint: Theme.peach
+                                                        visible: vm.running && nicCard.modelData.link !== "down"
                                                         enabled: !Vm.busy
-                                                        onClicked: vm.askNicSource(modelData)
+                                                        onClicked: Vm.setLink(vm.selected, false)
                                                     }
                                                     ActBtn {
                                                         glyph: Icons.trash; label: I18n.t("Remove")
                                                         danger: true; tint: Theme.red
                                                         enabled: !Vm.busy
                                                         onClicked: vm.ask(I18n.t("Remove this network adapter?"),
-                                                            I18n.t("The VM loses this network interface. To move it to another network instead, use Change network: that keeps the same adapter and MAC address."),
+                                                            I18n.t("The VM loses this network interface. To move it to another network instead, change its mode above: that keeps the same adapter and MAC address."),
                                                             I18n.t("Remove"), true,
-                                                            function() { Vm.removeNic(vm.selected, modelData.mac); })
+                                                            function() { Vm.removeNic(vm.selected, nicCard.modelData.mac); })
+                                                    }
+                                                }
+
+                                                // ---- avanzado / experto ----
+                                                Fold {
+                                                    //  ⚠️ EL MODELO DE LA TARJETA. Windows NO trae driver en
+                                                    //  caja para virtio-net: sin NetKVM el adaptador sale como
+                                                    //  desconocido y el invitado se queda SIN RED.
+                                                    Text {
+                                                        text: I18n.t("Card model"); color: Theme.subtext0
+                                                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
+                                                    }
+                                                    Segmented {
+                                                        Layout.fillWidth: true
+                                                        value: nicCard.modelData.model
+                                                        options: [ { key: "virtio", label: "virtio-net" },
+                                                                   { key: "e1000e", label: "e1000e" },
+                                                                   { key: "rtl8139", label: "rtl8139" } ]
+                                                        onPicked: function(k) {
+                                                            if (k !== nicCard.modelData.model)
+                                                                Vm.setNicModel(vm.selected, nicCard.modelData.mac, k);
+                                                        }
+                                                    }
+                                                    Note {
+                                                        visible: nicCard.modelData.model === "virtio"
+                                                        text: I18n.t("virtio-net is the fastest. Windows needs the NetKVM driver from the guest tools for it; until then use e1000e.")
+                                                    }
+                                                    RowLayout {
+                                                        Layout.fillWidth: true
+                                                        spacing: 8
+                                                        Field {
+                                                            id: macField
+                                                            label: I18n.t("MAC address")
+                                                            text: nicCard.modelData.mac
+                                                            valid: /^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$/.test(text) && !(parseInt(text.slice(0, 2), 16) & 1)
+                                                        }
+                                                        ActBtn {
+                                                            label: I18n.t("Random")
+                                                            enabled: nicCard.off && !Vm.busy
+                                                            onClicked: {
+                                                                var h = function() { return ("0" + Math.floor(Math.random() * 256).toString(16)).slice(-2); };
+                                                                macField.text = "52:54:00:" + h() + ":" + h() + ":" + h();
+                                                            }
+                                                        }
+                                                        ActBtn {
+                                                            label: I18n.t("Apply")
+                                                            enabled: nicCard.off && !Vm.busy && macField.valid
+                                                                     && macField.text.toLowerCase() !== String(nicCard.modelData.mac).toLowerCase()
+                                                            onClicked: Vm.setNicMac(vm.selected, nicCard.modelData.mac, macField.text)
+                                                        }
+                                                    }
+                                                    Note {
+                                                        visible: !nicCard.off
+                                                        text: I18n.t("The MAC address can be changed with the VM shut down.")
+                                                    }
+                                                    Text {
+                                                        Layout.fillWidth: true
+                                                        text: I18n.t("IP addresses") + ": " + (nicCard.modelData.addrs.length ? nicCard.modelData.addrs.join(", ")
+                                                              : (nicCard.off ? I18n.t("VM shut down")
+                                                                 : nicCard.mode === "bridged" || nicCard.mode === "private"
+                                                                   ? I18n.t("not visible from here without the guest tools (qemu-guest-agent)")
+                                                                   : I18n.t("none yet")))
+                                                        color: Theme.subtext0; wrapMode: Text.Wrap
+                                                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
+                                                    }
+                                                    Text {
+                                                        Layout.fillWidth: true
+                                                        text: "type=" + nicCard.modelData.type + "  source=" + (nicCard.modelData.source || "—")
+                                                              + (nicCard.modelData.backend ? "  backend=" + nicCard.modelData.backend : "")
+                                                        color: Theme.overlay2; wrapMode: Text.Wrap
+                                                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
+                                                    }
+                                                    ActBtn {
+                                                        glyph: Icons.ethernet; label: I18n.t("Other network or host bridge…"); tint: Theme.teal
+                                                        enabled: !Vm.busy
+                                                        onClicked: vm.askNicSource(nicCard.modelData)
                                                     }
                                                 }
                                             }
                                         }
                                     }
+
                                     Sec { text: I18n.t("ADD AN ADAPTER") }
                                     Note {
-                                        text: I18n.t("An added adapter is an extra network card in the guest, with a new MAC address. To move an existing adapter to another network, use Change network on it instead.")
-                                    }
-                                    Text {
-                                        Layout.fillWidth: true
-                                        text: I18n.t("Card model for the new adapter"); color: Theme.subtext0
-                                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
+                                        text: I18n.t("An added adapter is an extra network card in the guest, with its own MAC address.")
                                     }
                                     Segmented {
                                         Layout.fillWidth: true
-                                        value: vm.newNicModel
-                                        options: [ { key: "virtio", label: I18n.t("virtio-net (Linux)") },
-                                                   { key: "e1000e", label: I18n.t("e1000e (Windows)") },
-                                                   { key: "rtl8139", label: "rtl8139" } ]
-                                        onPicked: function(k) { vm.newNicModel = k; }
-                                    }
-
-                                    Sec { text: I18n.t("BRIDGED MODE") }
-                                    Note {
-                                        text: I18n.t("A bridged adapter puts the VM directly on your physical network, with its own address from your router. It needs a bridge that already exists on this computer — the shell does not create one, because that reconfigures host networking.")
+                                        value: vm.newNicMode
+                                        options: vm.nicModeOptions.slice(0, 3)
+                                        onPicked: function(k) { vm.newNicMode = k; }
                                     }
                                     Note {
-                                        visible: Vm.userBridges.length === 0 && Vm.platform === "nixos"
+                                        visible: vm.newNicMode === "bridged" && Vm.hostIfacesRead && Vm.lanState !== "ok"
                                         tone: "warn"
-                                        text: I18n.t("No bridge found. On NixOS create one with, for example:") + "  networking.bridges.br0.interfaces = [ \"eth0\" ];"
+                                        text: vm.lanWhyNot
                                     }
-                                    Note {
-                                        visible: Vm.userBridges.length === 0 && Vm.platform === "arch"
-                                        tone: "warn"
-                                        text: I18n.t("No bridge found. On Arch create one with your network manager, for example:") + "  nmcli con add type bridge ifname br0"
-                                    }
-                                    Flow {
-                                        Layout.fillWidth: true
-                                        spacing: 6
-                                        Repeater {
-                                            model: Vm.userBridges
-                                            delegate: ActBtn {
-                                                required property var modelData
-                                                glyph: Icons.plus
-                                                label: I18n.t("Add adapter on ") + modelData
-                                                tint: Theme.teal
-                                                enabled: !Vm.busy
-                                                onClicked: Vm.addBridgeNic(vm.selected, modelData, vm.newNicModel)
+                                    Fold {
+                                        title: I18n.t("Card model for the new adapter")
+                                        Segmented {
+                                            Layout.fillWidth: true
+                                            value: vm.newNicModel
+                                            options: [ { key: "virtio", label: I18n.t("virtio-net (Linux)") },
+                                                       { key: "e1000e", label: I18n.t("e1000e (Windows)") },
+                                                       { key: "rtl8139", label: "rtl8139" } ]
+                                            onPicked: function(k) { vm.newNicModel = k; }
+                                        }
+                                        Flow {
+                                            Layout.fillWidth: true
+                                            spacing: 6
+                                            Repeater {
+                                                model: Vm.networks.filter(function(n) { return n.name !== "default" && n.name !== Vm.lanNet; })
+                                                delegate: ActBtn {
+                                                    required property var modelData
+                                                    glyph: Icons.plus
+                                                    label: I18n.t("Add adapter on ") + modelData.name
+                                                    enabled: !Vm.busy
+                                                    onClicked: Vm.addNic(vm.selected, modelData.name, vm.newNicModel)
+                                                }
+                                            }
+                                            Repeater {
+                                                model: Vm.userBridges
+                                                delegate: ActBtn {
+                                                    required property var modelData
+                                                    glyph: Icons.plus
+                                                    label: I18n.t("Add adapter on ") + modelData
+                                                    tint: Theme.teal
+                                                    enabled: !Vm.busy
+                                                    onClicked: Vm.addBridgeNic(vm.selected, modelData, vm.newNicModel)
+                                                }
                                             }
                                         }
                                     }
-
-                                    Note {
-                                        tone: "warn"
-                                        text: I18n.t("Connect/Disconnect acts on the live adapter only and is not remembered across a restart — libvirt 12.2.0 rejects --live on this command, so it is applied to the running device directly.")
-                                    }
-                                    Flow {
-                                        Layout.fillWidth: true
-                                        spacing: 6
-                                        Repeater {
-                                            model: Vm.networks
-                                            delegate: ActBtn {
-                                                required property var modelData
-                                                glyph: Icons.plus
-                                                label: I18n.t("Add adapter on ") + modelData.name
-                                                enabled: !Vm.busy
-                                                onClicked: Vm.addNic(vm.selected, modelData.name, vm.newNicModel)
-                                            }
-                                        }
+                                    ActBtn {
+                                        glyph: Icons.plus; label: I18n.t("Add adapter"); tint: Theme.teal
+                                        enabled: !Vm.busy && (vm.newNicMode !== "bridged" || Vm.lanState === "ok")
+                                        onClicked: Vm.addNicMode(vm.selected, vm.newNicMode, vm.newNicModel)
                                     }
                                 }
 

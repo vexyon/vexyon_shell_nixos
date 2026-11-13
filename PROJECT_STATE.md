@@ -20,6 +20,134 @@ VEXYON OUT-OF-THE-BOX POLICY Every Vexyon feature must ship together with all re
 
 PERMANENT POLICY: If Vexyon's installation changes, its GitHub README.md MUST be updated in the same development task. No exceptions.
 
+## Session (VM manager, phase 1): networking — Bridged without setup, Private NAT with port forwarding, Docker and a closed firewall together
+
+### Why
+
+The owner wants the VM manager at VirtualBox/VMware level and ready out of
+the box. Phase 1 = networking: VMs born in NAT, switchable to a bridged
+mode with nothing to configure, port forwarding, Wi-Fi detected and said,
+an expert view (IP, MAC, model, several cards), and everything working
+TOGETHER with Docker, NetworkManager and a closed firewall — without the
+user touching firewall, sysctl, networks or services, and without ever
+cutting the host's own connection. (UI reorganization and phases 2–4 are
+separate commits.)
+
+### Design chosen, and why (measured, not assumed)
+
+A lab with the real binaries (nixos-26.05: libvirtd 12.2.0, QEMU 10.2.4
+TCG, dockerd 29.9.2, passt 2025_09_19, dnsmasq 2.93) in three network
+namespaces: a "LAN" bridge with DHCP and a peer machine, and a "host" with
+a wired NIC (veth) running libvirtd and dockerd. Throwaway busybox guests
+(`vxt-*`), never the owner's VMs.
+
+- **Bridged = macvtap**, a libvirt network `vexyon-lan`
+  (`<forward mode='bridge'><interface dev='WIRED'/></forward>`), not a
+  NetworkManager bridge br0 and not qemu-bridge-helper:
+  - a br0 moves the host's IP onto a new device: a reconnect (DHCP again),
+    firewall zones/rules bound to the old interface name stop matching, and
+    with Docker's br_netfilter + FORWARD DROP the bridged frames go through
+    iptables and are dropped — the exact known failure;
+  - macvtap leaves the host's NIC and IP untouched (creating it never cuts
+    the connection), and its frames never go through the host's forwarding
+    path, so Docker's FORWARD DROP, br_netfilter and any host firewall do not
+    see them;
+  - cost: the host cannot talk to its own macvtap guests (the LAN and other
+    VMs can). Said in the adapter card and in Settings.
+  Measured: bridged VM gets DHCP from the LAN, LAN↔VM and VM↔VM PASS, host
+  stays online, host→bridged VM FAIL (expected).
+- **Private NAT + port forwarding = passt** (`<interface type='user'>
+  <backend type='passt'/><portForward…>`), VirtualBox's NAT: user-mode, so no
+  bridge, tap or kernel forwarding — immune to Docker and the firewall.
+  Measured in qemu:///system: forwards from the host and from the LAN work,
+  outbound works.
+- **NAT (default) stays libvirt's `default` network** (virbr0): VMs see
+  each other and the host reaches them by IP.
+- **Docker coexistence for NAT** — reproduced: Docker started first (Arch
+  order: it turns forwarding on and sets FORWARD DROP) + libvirt's nftables
+  backend → NAT VM→LAN FAIL. With libvirt's iptables backend → PASS,
+  also with a ufw-like INPUT DROP, and after Docker restarts later (its
+  chains go back to the top: still PASS). libvirt's rules live in its own
+  LIBVIRT_* chains; Docker's rules and order are untouched. An accept in an
+  own nftables table cannot undo a drop in another table's base chain, so
+  "our own table" cannot fix this case — libvirt's own backend can.
+  Bridged and Private NAT need no rule at all.
+
+### What changed
+
+- `bin/vexyon-vm-xml` (shared): `nic-user` (adapter → passt, same MAC/model/
+  slot), `pf-set` (replace forwards; validates ports, duplicates, address
+  127.0.0.1/0.0.0.0/::1/::), `nic-mac` (unicast only, no duplicates);
+  `nic-network`/`nic-bridge` drop passt parts; `info` emits backend +
+  forwards.
+- `services/Vm.qml` (shared): `vexyon-lan` managed by the shell —
+  `_lanDetect` (wired NIC with carrier, default route first; physical =
+  `/sys/class/net/X/device`, Wi-Fi = `wireless`/`phy80211`), `_lanEnsure`
+  (define/autostart/start; re-point only if no VM uses it, else warn);
+  `_netsUp` ensures it when a VM that uses it STARTS (first use, laptop on
+  another card); `setNicMode` (nat/bridged/private/other network),
+  `setPortForwards`, `setNicMac`, `addNicMode`; host NIC probe
+  (`hostIfaces`, `lanIface`, `lanState` ok/wifi/nocable/none), read when the
+  Network tab or the Settings page opens (no watcher); per-NIC IPs from
+  `domifaddr` (lease, agent, arp) in the detail read.
+- `modules/VmManager.qml` (shared): Network tab rebuilt — per adapter a mode
+  selector (Bridged dimmed when unavailable, with the reason), the mode's
+  meaning, the Wi-Fi/no-cable/no-card warning, port-forward editor (TCP/UDP,
+  host/guest port, "only from this computer"), cable connect/disconnect,
+  Remove, and a fold "Advanced options" (card model, MAC with Random/Apply,
+  IPs, type/source/backend, other network or host bridge). New `Fold`
+  component and `expert` flag (shell.json `vm.expert`) used by the coming UI
+  reorganization; `Segmented` options can be shown disabled. The bridge
+  recipes ("create one with networking.bridges / nmcli") are removed.
+- `modules/Settings.qml` (shared): Virtualization → VM networking says the
+  bridged-mode state of this computer and what each mode is; the
+  hand-written-firewall case now offers Private NAT as the no-rule way out.
+- I18n: 47 new Spanish strings, 10 obsolete keys removed.
+- `install.sh` (Arch): `passt`; `iptables` only if no `iptables` command
+  (replaces the old `nftables` fallback); libvirt's iptables backend ALWAYS
+  when no `firewall_backend` is set (before: only if Docker/ufw were already
+  installed). NixOS: nothing — the module already adds the `virbr*`
+  firewall exceptions, its libvirtd backend defaults to iptables, and
+  nixpkgs' libvirtd wrapper already has passt on its PATH (read from the
+  wrapper).
+- READMEs (both), CHANGELOG.
+
+### Verified
+
+- Final matrix, all at once in the lab: Docker active (FORWARD DROP,
+  br-nf-call-iptables=1, docker0 172.17.0.1/16) + INPUT DROP (closed
+  firewall) + libvirt iptables backend + three VMs STARTED FROM THE UI:
+  NAT VM DHCP, NAT VM→LAN, host→NAT VM, bridged VM DHCP from the LAN,
+  bridged VM→LAN, LAN→bridged VM, host:18081→private-NAT VM:80,
+  private-NAT VM→LAN, host→LAN: all PASS. LAN→host:18081 blocked by the
+  closed firewall (expected). Docker: 15 DOCKER rule lines and FORWARD DROP
+  unchanged.
+- Through the real UI (headless sway, Quickshell 0.3.2, this tree's QML,
+  real libvirtd): NAT→Private NAT on a running VM (saved, "applies after
+  restart"), adding a forward rule, restart → forward works; Private
+  NAT→Bridged with `vexyon-lan` absent → created on `enp1s0`; starting a
+  bridged VM with `vexyon-lan` absent → created at start, LAN IP; MAC
+  Random+Apply on a stopped VM; Wi-Fi-only host (lab patch marking the NIC
+  as Wi-Fi) → Bridged dimmed + the Wi-Fi sentence. No QML warnings.
+- `vexyon-vm-xml` commands on real domain XML, including refusals
+  (duplicate host port, multicast MAC). `py_compile`; `bash -n install.sh`;
+  shellcheck: the same single pre-existing warning as before. I18n checker 0
+  missing; shared files byte-identical except the allowed platform files.
+
+### Not verified
+
+- A real bridge on a physical wired NIC, a real router's DHCP, a real
+  Wi-Fi card (the lab NIC is a veth; Wi-Fi was simulated by a lab-only
+  patch; physical = `/sys/.../device` was not exercised with real hardware).
+- Arch itself: the installer changes were not run on Arch (no Arch here).
+  `passt` and `iptables` are Arch package names from memory of the official
+  repositories, not checked against a mirror in this session.
+- IPv6, a KVM guest, Windows guests, NetworkManager reacting to macvtap
+  devices (it ignores externally created links by default), and the
+  owner's tower and laptop.
+- The NixOS VM test was not re-run for this phase: nothing in the module or
+  in any unit changed.
+
 ## Session (block 3): AirDrop — newest compatible upstream releases, and a way to keep them current
 
 ### Why
