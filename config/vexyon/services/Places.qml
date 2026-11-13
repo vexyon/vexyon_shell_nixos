@@ -7,11 +7,16 @@ import qs.services
 // ============================================================================
 //  Places — the File Manager sidebar's locations, shared by every window.
 //
-//  * Built-in places: Home plus the XDG user folders (Desktop, Documents,
-//    Downloads, Pictures, Music, Videos) at the paths the user's
-//    user-dirs.dirs configures — ~/Documentos, ~/Bilder… — never guessed from
-//    English names. Listing them never creates anything: the folders are
-//    created ONCE per user by initUserDirs(), in the shell's language.
+//  * Built-in places: Home plus the standard folders found by their NAME in
+//    $HOME, in the shell's language — Desktop, Documents, Downloads,
+//    Pictures, Music, Videos in English; Escritorio, Documentos, Descargas,
+//    Imágenes, Música, Vídeos in Spanish. Each row shows the folder's real
+//    name and opens that folder; a missing one is not listed. Switching the
+//    language renames, moves or creates nothing: the rows of the other
+//    language just stop showing until such a folder exists. (user-dirs.dirs
+//    is not used for this: it can point somewhere else than the folder the
+//    user actually has.) The folders are created ONCE per user by
+//    initUserDirs(), in the language picked at the first start.
 //  * Bookmarks: the GTK bookmarks file (~/.config/gtk-3.0/bookmarks), the one
 //    GTK file choosers, Nautilus, Thunar and Nemo already use. Adding one
 //    writes a line there — no symlink, nothing inside the folder — and
@@ -26,14 +31,12 @@ Singleton {
     id: root
 
     readonly property string home: Quickshell.env("HOME")
-    property var dirs: ({})          // XDG key -> { path, exists }
+    property var dirs: ({})          // user-dirs.dirs: XDG key -> { path, exists }
+    property var std: []             // standard folders by name: [{ key, path, name }]
     property var bookmarks: []       // [{ path, label, exists }]
     property bool ready: false
     property bool _loading: false
     property bool _again: false
-
-    //  The XDG folders the sidebar shows, in this order (Nautilus's).
-    readonly property var sidebarKeys: ["DESKTOP", "DOCUMENTS", "DOWNLOAD", "PICTURES", "MUSIC", "VIDEOS"]
 
     //  The default symbol of each user folder (FolderIcons catalog ids).
     readonly property var xdgIcons: ({
@@ -42,42 +45,35 @@ Singleton {
         TEMPLATES: "pencil-ruler", PUBLICSHARE: "share-variant", PROJECTS: "code-braces"
     })
 
-    //  path -> XDG key, for the default emblem of a folder anywhere it shows.
+    //  path -> XDG key, for the default emblem of a folder anywhere it shows:
+    //  the folders found by name and the ones user-dirs.dirs names.
     readonly property var byPath: {
         var m = {};
         for (var k in root.dirs) m[root.dirs[k].path] = k;
+        for (var i = 0; i < root.std.length; i++) m[root.std[i].path] = root.std[i].key;
         return m;
     }
 
-    //  Built-in sidebar rows: Home, then the user folders that exist. Named by
-    //  what they are, in the shell's language — not by the folder's name on
-    //  disk: an English shell over ~/Escritorio still says "Desktop", and a
-    //  Spanish one over ~/Desktop says "Escritorio".
+    //  Built-in sidebar rows: Home, then the standard folders that exist, under
+    //  their real name.
     readonly property var builtin: {
         var out = [{ key: "HOME", path: root.home, label: I18n.t("Home"), exists: true }];
-        for (var i = 0; i < root.sidebarKeys.length; i++) {
-            var d = root.dirs[root.sidebarKeys[i]];
-            if (d && d.exists)
-                out.push({ key: root.sidebarKeys[i], path: d.path, label: root.xdgLabel(root.sidebarKeys[i], d.path), exists: true });
-        }
+        for (var i = 0; i < root.std.length; i++)
+            out.push({ key: root.std[i].key, path: root.std[i].path, label: root.std[i].name, exists: true });
         return out;
     }
-    function xdgLabel(key, path) {
-        switch (key) {
-        case "DESKTOP":   return I18n.t("Desktop");
-        case "DOCUMENTS": return I18n.t("Documents");
-        case "DOWNLOAD":  return I18n.t("Downloads");
-        case "PICTURES":  return I18n.t("Pictures");
-        case "MUSIC":     return I18n.t("Music");
-        case "VIDEOS":    return I18n.t("Videos");
-        }
-        return root.basename(path);
+    //  A standard folder's path (the one shown in the sidebar), or "".
+    function stdPath(key) {
+        for (var i = 0; i < root.std.length; i++) if (root.std[i].key === key) return root.std[i].path;
+        var d = root.dirs[key];
+        return (d && d.exists) ? d.path : "";
     }
 
     function basename(p) { var s = p.replace(/\/+$/, ""); return s.substring(s.lastIndexOf("/") + 1) || "/"; }
     function isBuiltin(p) {
         if (p === root.home) return true;
-        return root.byPath[p] !== undefined;
+        for (var i = 0; i < root.std.length; i++) if (root.std[i].path === p) return true;
+        return false;
     }
     function isBookmarked(p) {
         for (var i = 0; i < root.bookmarks.length; i++)
@@ -89,44 +85,57 @@ Singleton {
     function _apply(r) {
         if (!r || r.error) return;
         root.dirs = r.dirs || ({});
+        root.std = r.std || [];
         root.bookmarks = r.bookmarks || [];
         root.ready = true;
+    }
+    //  Every call says the shell's language: it decides which folder names
+    //  are the standard ones.
+    function _run(args, cb) { FmHelper.run(["--lang", I18n.lang].concat(args), cb); }
+
+    //  The language changed: the standard folders are others now. One read,
+    //  only if the sidebar was ever loaded.
+    Connections {
+        target: I18n
+        function onLangChanged() { if (root.ready) root.refresh(); }
     }
 
     function refresh() {
         if (root._loading) { root._again = true; return; }
         root._loading = true;
-        FmHelper.run(["places"], function(r) {
+        root._run(["places"], function(r) {
             root._loading = false;
             root._apply(r);
             if (root._again) { root._again = false; root.refresh(); }
         });
     }
 
-    //  cb(added, rejected): rejected = [{ path, why }] with why one of
-    //  "notdir", "builtin", "duplicate", "invalid".
+    //  cb(added, rejected, ok): rejected = [{ path, why }] with why one of
+    //  "notdir", "builtin", "duplicate", "invalid"; ok false = the helper
+    //  did not answer (nothing was added), never a silent no-op.
     function add(paths, at, cb) {
         if (!paths || !paths.length) return;
         var args = ["bm-add"];
         if (at !== undefined && at !== null && at >= 0) args.push("--at", String(at));
-        FmHelper.run(args.concat(paths), function(r) {
+        root._run(args.concat(paths), function(r, code) {
             root._apply(r);
-            if (cb) cb(r && r.added ? r.added : [], r && r.rejected ? r.rejected : []);
+            var ok = !!r && !r.error && code === 0;
+            if (cb) cb(r && r.added ? r.added : [], r && r.rejected ? r.rejected : [], ok);
         });
     }
-    function remove(path) { FmHelper.run(["bm-remove", path], root._apply); }
+    function remove(path) { root._run(["bm-remove", path], root._apply); }
     //  Vexyon renamed or moved `from`: bookmarks of it (or of folders inside
     //  it) follow, keeping their place and label.
     function moved(from, to) {
         for (var i = 0; i < root.bookmarks.length; i++) {
             var p = root.bookmarks[i].path;
             if (p === from || p.indexOf(from + "/") === 0) {
-                FmHelper.run(["bm-moved", from, to], root._apply);
+                root._run(["bm-moved", from, to], root._apply);
                 return;
             }
         }
     }
-    function move(path, index) { FmHelper.run(["bm-move", path, String(index)], root._apply); }
+    function move(path, index) { root._run(["bm-move", path, String(index)], root._apply); }
 
     //  The user folders (Desktop/Escritorio, Downloads/Descargas…), created
     //  ONCE per user and never again: shell.qml calls this as soon as the

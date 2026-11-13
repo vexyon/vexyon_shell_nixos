@@ -20,6 +20,98 @@ VEXYON OUT-OF-THE-BOX POLICY Every Vexyon feature must ship together with all re
 
 PERMANENT POLICY: If Vexyon's installation changes, its GitHub README.md MUST be updated in the same development task. No exceptions.
 
+## Session (block 5): file manager — bookmarks, Places by real folder name, lost operations
+
+### Why
+
+The owner: bookmarks could sometimes be added by dragging, now never (not
+by dragging, not with right-click); with the shell in English, "Downloads"
+in Places opened `~/Descargas`. New rule from the owner: Places shows and
+opens the standard folders by their REAL name on disk, in the shell's
+language; changing the language renames/moves nothing — the other
+language's entries just disappear until such a folder exists.
+
+### Root causes
+
+- `vexyon-fm-helper`: commit 7aef209 changed `user_dirs()` from returning
+  `(dirs, created)` to `dirs`, but `bm_add()` and `bm_move()` still did
+  `dirs, _ = user_dirs()`. With 9 XDG entries → ValueError; with 2 → the
+  keys, then `AttributeError: 'str' object has no attribute 'values'`
+  (reproduced). The helper printed no JSON, `Places.add` called back with
+  nothing added and nothing rejected, and the window said nothing. That is
+  the whole "now never": both the menu and the drop go through `bm-add`.
+  ("Sometimes it worked" = before 7aef209, or a `user-dirs.dirs` that
+  happened to unpack.)
+- Drag to the sidebar: with bookmarks present only the outer 25 % of each
+  row and ±2 px below the list meant "add"; just below the last bookmark
+  nothing happened, and the middle of a row moved the folder INTO it.
+- Places took paths from `user-dirs.dirs` and labelled them by role
+  (`Places.builtin` from the previous session): the owner's file said
+  `XDG_DOWNLOAD_DIR="$HOME/Descargas"` while the folder they use is
+  `~/Downloads`, so the row said "Downloads" and opened Descargas.
+- `runOp()` and the directory `lister` were one Process each; a second
+  start while running was dropped (an operation lost; a listing of the
+  previous folder applied under the new path).
+
+### Conflict with the previous entry and how it is resolved
+
+The previous session made Places label user folders BY ROLE in the shell's
+language while keeping the configured paths. The owner's new rule replaces
+that: the label is the folder's real name and the folder is found by that
+name, not by `user-dirs.dirs`. Kept from before: `user-dirs-init` still
+creates the folders ONCE in the language picked at first start, and never
+renames anything; `user-dirs.dirs` still gives folders their default
+emblem (`Places.byPath`) and stays untouched on disk.
+
+### What changed
+
+- `bin/vexyon-fm-helper` (shared): `--lang en|es` before any command;
+  `std_dirs()` lists, in Nautilus' order, the folders of that language that
+  exist as directories in `$HOME` (NFC-normalised names, Spanish also
+  accepts "Videos"); `places` returns them as `std`; `builtin_paths()` is
+  home + those (so `~/Descargas` can be a bookmark in an English shell);
+  the tuple unpacking in `bm_add`/`bm_move` removed.
+- `services/Places.qml`: `std`, `builtin` from it with the real name,
+  `stdPath()`, every helper call passes `I18n.lang`, a `Connections` on
+  `I18n.langChanged` re-reads once (only if the sidebar was loaded — no
+  watcher, no timer); `add()` reports `ok` = the helper answered.
+- `modules/FileManager.qml`: notice "The sidebar could not be updated."
+  when the helper fails; the "Drop a folder here" slot also shows during
+  any folder drag; `runOp()` queues; `relist()` serialises listings and
+  drops a result for another folder; the folder-icon image picker opens
+  `Places.stdPath("PICTURES")`.
+- I18n (es), README (both), CHANGELOG.
+
+### Verified
+
+- Helper, run directly with a temporary `$HOME`: English → std =
+  Downloads, Pictures (with `user-dirs.dirs` pointing Downloads at
+  Descargas); Spanish → Descargas, Música (an NFD "Música" on disk),
+  Vídeos; `bm-add Projects Downloads Descargas nope` → added Projects and
+  Descargas, Downloads rejected `builtin`, nope `notdir`; `bm-move` reorders;
+  the original code died with the traceback above. `py_compile` OK.
+- Lab (headless sway, Quickshell 0.3.2, Mesa llvmpipe EGL so shadows and
+  menus render, this tree's QML via a test-only IPC to open a window, a
+  virtual-pointer client for real clicks and drags):
+  - English sidebar: Home, Documents, Downloads, Pictures (not
+    Descargas). Right-click Projects → *Add to Sidebar* → bookmark line
+    written, row shown. Dragging Descargas to the new slot under the
+    bookmarks → added (slot visible mid-drag, labelled "Add to Sidebar").
+  - Language switched live to Spanish: Inicio, Descargas, Música; Downloads
+    gone; the Descargas bookmark hidden as a built-in; `ls ~` unchanged.
+  - Right-click a bookmark → *Quitar de la barra lateral*: line removed,
+    folder kept. Double-click into folders, Back; drag f1.txt onto sub2 →
+    moved.
+- I18n checker 0 missing; byte-identity OK.
+
+### Not verified
+
+- On the owner's machine (their real `user-dirs.dirs`, their folders).
+- Drops coming from other applications (Nautilus, a browser) onto the
+  sidebar — same `bm-add` path, not exercised here.
+- Queued operations under real load (two trash operations in a row): the
+  lab has no `gio`.
+
 ## Session (block 1+2): black screen on fullscreen video in Chromium browsers; HDR that never turned on
 
 ### Why

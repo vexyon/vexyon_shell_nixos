@@ -1163,6 +1163,7 @@ Singleton {
             "Clock": "Reloj",
             "Color depth": "Profundidad de color",
             "HDR": "HDR",
+            "The sidebar could not be updated.": "No se pudo actualizar la barra lateral.",
             "HDR always uses 10 bits.": "El HDR usa siempre 10 bits.",
             "SDR brightness in HDR": "Brillo SDR en HDR",
             "SDR saturation in HDR": "Saturación SDR en HDR",

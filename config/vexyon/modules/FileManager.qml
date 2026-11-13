@@ -101,7 +101,7 @@ FloatingWindow {
         fm.cwd = path;
         fm.clearSelection();
         fm.anchorIndex = -1;
-        lister.running = true;
+        fm.relist();
     }
     function goBack() {
         if (fm.backStack.length === 0) return;
@@ -124,7 +124,19 @@ FloatingWindow {
         if (parent === "") parent = "/";
         navigate(fm.isTrashFilesDir(parent) ? fm.trashDir : parent);   // la papelera de otro disco: a la vista común
     }
-    function refresh() { lister.running = true; }
+    function refresh() { fm.relist(); }
+    //  Un solo `find` a la vez: pedir otro listado mientras corre uno (entrar
+    //  en una carpeta mientras se lista una grande, refrescar tras una
+    //  operación) se perdía, y la vista se quedaba con el contenido viejo —o
+    //  con los nombres de la carpeta anterior pegados a la ruta nueva. Ahora
+    //  se apunta y se repite al acabar, y un resultado de otra carpeta se tira.
+    property bool _relist: false
+    property string _listDir: ""
+    function relist() {
+        if (lister.running) { fm._relist = true; return; }
+        fm._listDir = fm.cwd;
+        lister.running = true;
+    }
 
     // Acciones del menú contextual. Vive en el ROOT (no en el delegate del
     // menú) para que la acción sobreviva a la destrucción del delegate que
@@ -186,6 +198,11 @@ FloatingWindow {
             opProc.after = null;
             fm.refresh();
             if (f) f(code, opOut.text, opErr.text);
+            if (fm._opQueue.length && !opProc.running) {
+                var nx = fm._opQueue[0];
+                fm._opQueue = fm._opQueue.slice(1);
+                fm.runOp(nx.s, nx.a);
+            }
         }
         stdout: StdioCollector { id: opOut }
         stderr: StdioCollector {
@@ -200,7 +217,12 @@ FloatingWindow {
         return (i === 0 || v >= 10 ? Math.round(v) : v.toFixed(1)) + " " + u[i];
     }
 
+    //  Una operación a la vez, en orden: la que llega mientras otra corre
+    //  (borrar dos cosas seguidas, crear una carpeta mientras se vacía la
+    //  papelera) espera su turno. Antes se perdía sin aviso.
+    property var _opQueue: []
     function runOp(script, after) {
+        if (opProc.running) { fm._opQueue = fm._opQueue.concat([{ s: script, a: after || null }]); return; }
         opProc.after = after || null;
         opProc.command = ["bash", "-c", script];
         opProc.running = true;
@@ -704,8 +726,10 @@ FloatingWindow {
         command: ["bash", "-c", fm.cwd === fm.trashDir
             ? fm.trashRootsSh + "roots | while IFS= read -r r; do find \"$r\" -maxdepth 1 -mindepth 1 -printf '%y\\t%D:%i\\t%f\\t%h\\n'; done 2>/dev/null | sort -t$'\\t' -k1,1 -k3,3f"
             : "find " + fm.shq(fm.cwd) + " -maxdepth 1 -mindepth 1 -printf '%y\\t%D:%i\\t%f\\n' 2>/dev/null | sort -t$'\\t' -k1,1 -k3,3f"]
+        onRunningChanged: if (!running && fm._relist) { fm._relist = false; Qt.callLater(fm.relist); }
         stdout: StdioCollector {
             onStreamFinished: {
+                if (fm._listDir !== fm.cwd) return;     // listado de otra carpeta
                 var out = [], names = {};
                 var lines = this.text.split("\n");
                 var base = fm.cwd === "/" ? "" : fm.cwd;
@@ -1053,7 +1077,8 @@ FloatingWindow {
             else dirs.push(paths[i]);
         }
         if (!dirs.length) { fm.notice(I18n.t("Only folders can be added to the sidebar."), false); return; }
-        Places.add(dirs, at, function(added, rejected) {
+        Places.add(dirs, at, function(added, rejected, ok) {
+            if (!ok) { fm.notice(I18n.t("The sidebar could not be updated."), true); return; }
             if (!rejected.length && !files) return;
             var why = rejected.length ? rejected[0].why : "notdir";
             fm.notice(why === "duplicate" || why === "builtin" ? I18n.t("Already in the sidebar.")
@@ -1153,8 +1178,8 @@ FloatingWindow {
         fm.iconPickOpen = false;
         fm.pickImageFor = path;
         fm.pickReturnDir = fm.cwd;
-        var pics = Places.dirs.PICTURES;
-        if (pics && pics.exists) fm.navigate(pics.path);
+        var pics = Places.stdPath("PICTURES");
+        if (pics !== "") fm.navigate(pics);
     }
     function endImagePick(reopen) {
         var p = fm.pickImageFor, back = fm.pickReturnDir;
@@ -1319,9 +1344,9 @@ FloatingWindow {
                             Layout.bottomMargin: 4
                         }
 
-                        // Home + las carpetas de usuario en sus rutas CONFIGURADAS
-                        // (user-dirs.dirs: ~/Documentos, ~/Bilder…), nunca adivinadas
-                        // por su nombre en inglés.
+                        // Home + las carpetas estándar que EXISTEN con el nombre del
+                        // idioma del shell (~/Downloads en inglés, ~/Descargas en
+                        // español), con su nombre real. Ver services/Places.qml.
                         Repeater {
                             model: Places.builtin
                             delegate: sideRowCmp
@@ -1354,9 +1379,15 @@ FloatingWindow {
                                     model: Places.bookmarks
                                     delegate: sideRowCmp
                                 }
-                                // hueco donde soltar cuando aún no hay marcadores
+                                // hueco donde soltar: siempre que no haya marcadores y,
+                                // con marcadores, mientras se arrastran carpetas. Antes,
+                                // con marcadores, solo valían el 25 % de arriba/abajo de
+                                // cada fila y 2 px bajo la lista: soltar debajo del
+                                // último no añadía nada, y en el centro de una fila
+                                // MOVÍA la carpeta dentro.
                                 Rectangle {
-                                    visible: Places.bookmarks.length === 0
+                                    id: bmDropSlot
+                                    visible: Places.bookmarks.length === 0 || fm.folderDragActive
                                     Layout.fillWidth: true
                                     Layout.preferredHeight: 34
                                     radius: Theme.radius
@@ -1377,9 +1408,11 @@ FloatingWindow {
                                 }
                             }
 
-                            // línea de inserción (soltar o reordenar)
+                            // línea de inserción (soltar o reordenar); al final de la
+                            // lista ya lo marca el hueco de soltar
                             Rectangle {
                                 visible: fm.bmInsert >= 0 && Places.bookmarks.length > 0
+                                         && !(bmDropSlot.visible && fm.bmInsert >= bmRep.count)
                                 x: 4
                                 width: parent.width - 8
                                 height: 3

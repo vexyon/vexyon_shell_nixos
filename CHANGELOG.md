@@ -10,6 +10,26 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
 
 ### Fixed
 
+- **Bookmarks could not be added at all** (right-click *Add to Sidebar* or
+  dragging a folder). Since the user-folders change, `vexyon-fm-helper
+  bm-add`/`bm-move` unpacked `user_dirs()` as a tuple it no longer was and
+  died with a traceback, so nothing was added and nothing was said. Fixed,
+  and a helper that does not answer now shows "The sidebar could not be
+  updated." While a folder is dragged a "Drop a folder here" slot appears
+  at the end of the bookmarks (before, only a few pixels between rows
+  counted, and the middle of a row moved the folder into it).
+- **"Downloads" opened ~/Descargas in an English shell.** The sidebar took
+  the user folders from `user-dirs.dirs` and named them by role. It now
+  finds them by their real name in your home, in the shell's language
+  (Desktop, Documents, Downloads, Pictures, Music, Videos; Escritorio,
+  Documentos, Descargas, Imágenes, Música, Vídeos/Videos), shows that name
+  and opens that folder. Changing the language renames nothing; folders of
+  the other language just stop showing.
+- **File manager lost operations and showed stale folders.** Starting a
+  file operation while another ran, or listing a folder while another was
+  being listed, was silently dropped (one process each); they now queue,
+  and a listing that comes back for a folder you already left is ignored.
+
 - **Black screen when a video goes fullscreen in Brave/Vivaldi/Chrome.**
   With Hyprland's AutoHDR (`render:cm_auto_hdr`, on by default) the
   fullscreen window is offered an HDR image description over Wayland's

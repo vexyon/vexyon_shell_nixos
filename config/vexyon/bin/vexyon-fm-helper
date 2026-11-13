@@ -9,7 +9,8 @@ resident except what the Wayland clipboard itself requires (see clip-set).
     clip-get                     what the clipboard holds (files only)
     clip-done                    a cut was pasted: take it off the clipboard
 
-    places                       XDG user folders + sidebar bookmarks
+    [--lang en|es] places        standard folders + sidebar bookmarks
+                                 (--lang goes before any command; default en)
     user-dirs-init en|es         create the user folders ONCE, in that language
     bm-add [--at N] PATH...      add sidebar bookmarks
     bm-remove PATH               remove a bookmark (the folder is never touched)
@@ -49,9 +50,14 @@ loses data.
 
 PLACES
 ------
-User folders come from user-dirs.dirs (the configured, possibly translated
-paths such as ~/Documentos), never from English names. Listing them never
-creates anything.
+The sidebar's standard folders are found by their NAME in $HOME, in the
+shell's language (--lang): Desktop, Documents, Downloads, Pictures, Music,
+Videos in English; Escritorio, Documentos, Descargas, Imágenes, Música,
+Vídeos (or Videos) in Spanish. Each is shown under its real name and opens
+itself; one that does not exist is simply not listed. user-dirs.dirs is NOT
+used for this: on the owner's machine it pointed Downloads at ~/Descargas
+while the folder on disk was ~/Downloads. Changing the shell's language
+never renames, moves or creates anything. Listing never creates anything.
 
 They are created ONCE per user, by `user-dirs-init`, in the shell's language
 (the one picked in the welcome screen): Desktop/Documents/Downloads… in
@@ -86,6 +92,7 @@ import signal
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as ET
 
@@ -504,16 +511,53 @@ def write_bookmarks(lines):
     write_atomic(BOOKMARKS, data.encode("utf-8", "surrogateescape"))
 
 
-def builtin_paths(dirs):
+# The sidebar's standard folders, in its order, by name per shell language.
+# Spanish accepts "Videos" too (Latin American spelling; xdg-user-dirs' es
+# translation says "Vídeos").
+STD_ORDER = ["DESKTOP", "DOCUMENTS", "DOWNLOAD", "PICTURES", "MUSIC", "VIDEOS"]
+STD_NAMES = {
+    "en": {"DESKTOP": ["Desktop"], "DOCUMENTS": ["Documents"], "DOWNLOAD": ["Downloads"],
+           "PICTURES": ["Pictures"], "MUSIC": ["Music"], "VIDEOS": ["Videos"]},
+    "es": {"DESKTOP": ["Escritorio"], "DOCUMENTS": ["Documentos"], "DOWNLOAD": ["Descargas"],
+           "PICTURES": ["Imágenes"], "MUSIC": ["Música"], "VIDEOS": ["Vídeos", "Videos"]},
+}
+LANG = "en"
+
+
+def std_dirs():
+    """[{key, path, name}] for the standard folders of the shell language that
+    exist in $HOME as real directories, matched by name (Unicode NFC, so a
+    folder copied from macOS as NFD "Música" still counts)."""
+    try:
+        names = os.listdir(HOME)
+    except OSError:
+        names = []
+    by_nfc = {}
+    for n in names:
+        by_nfc.setdefault(unicodedata.normalize("NFC", n), n)
+    res = []
+    for key in STD_ORDER:
+        for want in STD_NAMES[LANG][key]:
+            real = by_nfc.get(want)
+            if real is None:
+                continue
+            p = os.path.join(os.path.normpath(HOME), real)
+            if os.path.isdir(p):
+                res.append({"key": key, "path": p, "name": real})
+                break
+    return res
+
+
+def builtin_paths():
     s = {os.path.normpath(HOME)}
-    for v in dirs.values():
-        s.add(v["path"])
+    for d in std_dirs():
+        s.add(d["path"])
     return s
 
 
 def places(extra=None):
     dirs = user_dirs()
-    builtin = builtin_paths(dirs)
+    builtin = builtin_paths()
     bms, seen = [], set()
     for _, p, label in bookmark_entries(read_bookmark_lines()):
         if p in seen or p in builtin:
@@ -521,15 +565,16 @@ def places(extra=None):
         seen.add(p)
         bms.append({"path": p, "label": label or os.path.basename(p) or p,
                     "custom": bool(label), "exists": os.path.isdir(p)})
-    res = {"home": os.path.normpath(HOME), "dirs": dirs, "bookmarks": bms}
+    res = {"home": os.path.normpath(HOME), "lang": LANG, "std": std_dirs(),
+           "dirs": dirs, "bookmarks": bms}
     if extra:
         res.update(extra)
     out(res)
 
 
-def visible_index_to_line(lines, entries, dirs, n):
+def visible_index_to_line(lines, entries, n):
     """Position N among the bookmarks the sidebar shows -> index in `lines`."""
-    builtin = builtin_paths(dirs)
+    builtin = builtin_paths()
     shown, seen = [], set()
     for i, p, _ in entries:
         if p in seen or p in builtin:
@@ -551,8 +596,7 @@ def bm_add(args):
         args = args[2:]
     added, rejected = [], []
     with Locked():
-        dirs, _ = user_dirs()
-        builtin = builtin_paths(dirs)
+        builtin = builtin_paths()
         lines = read_bookmark_lines()
         have = {p for _, p, _ in bookmark_entries(lines)}
         new = []
@@ -569,7 +613,7 @@ def bm_add(args):
             else:
                 new.append(p)
         if new:
-            pos = visible_index_to_line(lines, bookmark_entries(lines), dirs, at)
+            pos = visible_index_to_line(lines, bookmark_entries(lines), at)
             lines[pos:pos] = [path_to_uri(p) for p in new]
             write_bookmarks(lines)
             added = new
@@ -608,12 +652,11 @@ def bm_moved(src, dst):
 def bm_move(path, n):
     path = os.path.normpath(path)
     with Locked():
-        dirs, _ = user_dirs()
         lines = read_bookmark_lines()
         mine = [l for l in lines if uri_to_path(split_bm(l)[0]) == path]
         if mine:
             rest = [l for l in lines if uri_to_path(split_bm(l)[0]) != path]
-            pos = visible_index_to_line(rest, bookmark_entries(rest), dirs, n)
+            pos = visible_index_to_line(rest, bookmark_entries(rest), n)
             rest[pos:pos] = mine[:1]
             if rest != lines:
                 write_bookmarks(rest)
@@ -913,7 +956,11 @@ def icon_image(path, image):
 
 # ---------------------------------------------------------------------------
 def main():
+    global LANG
     a = sys.argv[1:]
+    if len(a) >= 2 and a[0] == "--lang":
+        LANG = a[1] if a[1] in STD_NAMES else "en"
+        a = a[2:]
     if not a:
         fail("usage: see the header of this file", 2)
     cmd, rest = a[0], a[1:]
