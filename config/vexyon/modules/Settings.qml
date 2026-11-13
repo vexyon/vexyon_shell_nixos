@@ -2515,6 +2515,24 @@ FloatingWindow {
                             color: Theme.surface0
                             border.width: 1; border.color: Theme.surface2
 
+                            readonly property bool hdrOn: Displays.monCfg(modelData.name) !== null && Displays.hdrOn(modelData.name)
+                            // What HDR does on this monitor, in one line: the
+                            // capability comes from the EDID (Hyprland's own
+                            // check); "now" is what Hyprland reports running.
+                            function hdrStatus() {
+                                var m = monCard.modelData;
+                                var now = (m.cmPreset === "hdr" || m.cmPreset === "hdredid") ? I18n.t("now: HDR") : I18n.t("now: SDR");
+                                now += m.tenBit ? " · 10 bits" : " · 8 bits";
+                                if (m.hdrCapable === false && !monCard.hdrOn)
+                                    return I18n.t("This monitor does not report HDR support (EDID).");
+                                if (monCard.hdrOn)
+                                    return I18n.t("The whole desktop in HDR.") + " (" + now + ")";
+                                // hardwareDetails (and no_auto_hdr) came with newer
+                                // Hyprland: without them, no browser exception
+                                if (m.hdrCapable === null)
+                                    return I18n.t("Off: SDR desktop. Fullscreen HDR games and videos may still switch to HDR on their own.") + " (" + now + ")";
+                                return I18n.t("Off: SDR desktop. Fullscreen HDR games and videos still switch to HDR on their own (except Chromium browsers).") + " (" + now + ")";
+                            }
                             function modeOpts() {
                                 var o = []; var ms = monCard.modelData.modes;
                                 for (var i = 0; i < ms.length; i++) o.push({ v: ms[i].res + "@" + ms[i].refresh, l: ms[i].label });
@@ -2614,6 +2632,52 @@ FloatingWindow {
                                         onPicked: function(v) { Displays.setMonitorField(monCard.modelData.name, "vrr", v); }
                                     }
 
+                                    // HDR del escritorio = cm "hdr" + 10 bits en
+                                    // Hyprland. Antes solo existía "Profundidad de
+                                    // color", que cambia bitdepth y deja el monitor
+                                    // en sRGB: no activaba HDR.
+                                    RowLayout {
+                                        Layout.fillWidth: true; spacing: 10
+                                        ColumnLayout {
+                                            Layout.fillWidth: true; spacing: 2
+                                            Text { text: I18n.t("HDR"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1 }
+                                            Text {
+                                                Layout.fillWidth: true
+                                                text: monCard.hdrStatus()
+                                                color: Theme.subtext0; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
+                                                wrapMode: Text.WordWrap
+                                            }
+                                        }
+                                        Toggle {
+                                            id: hdrToggle
+                                            enabled: monCard.modelData.hdrCapable !== false || monCard.hdrOn
+                                            opacity: enabled ? 1 : 0.4
+                                            checked: monCard.hdrOn
+                                            onToggled: function(v) {
+                                                Displays.setMonitorField(monCard.modelData.name, "hdr", v);
+                                                hdrToggle.checked = Qt.binding(function() { return monCard.hdrOn; });
+                                            }
+                                        }
+                                    }
+                                    RowLayout {
+                                        Layout.fillWidth: true; spacing: 10
+                                        visible: monCard.hdrOn
+                                        DropSelect {
+                                            Layout.fillWidth: true
+                                            label: I18n.t("SDR brightness in HDR")
+                                            options: Displays.sdrBrightnessPresets
+                                            current: monCard.c.sdrBrightness || 1.0
+                                            onPicked: function(v) { Displays.setMonitorField(monCard.modelData.name, "sdrBrightness", v); }
+                                        }
+                                        DropSelect {
+                                            Layout.fillWidth: true
+                                            label: I18n.t("SDR saturation in HDR")
+                                            options: Displays.sdrSaturationPresets
+                                            current: monCard.c.sdrSaturation || 1.0
+                                            onPicked: function(v) { Displays.setMonitorField(monCard.modelData.name, "sdrSaturation", v); }
+                                        }
+                                    }
+
                                     // Workspace "de casa" de este monitor. Se guarda
                                     // por descripción EDID (no por conector), así que
                                     // sigue al monitor aunque cambie de puerto.
@@ -2647,10 +2711,18 @@ FloatingWindow {
                                     }
                                     DropSelect {
                                         visible: monCard.compExpanded
+                                        enabled: !monCard.hdrOn
                                         label: I18n.t("Color depth")
                                         options: Displays.bitdepths
-                                        current: monCard.c.bitdepth || 8
+                                        current: monCard.hdrOn ? 10 : (monCard.c.bitdepth || 8)
                                         onPicked: function(v) { Displays.setMonitorField(monCard.modelData.name, "bitdepth", v); }
+                                    }
+                                    Text {
+                                        Layout.fillWidth: true
+                                        visible: monCard.compExpanded && monCard.hdrOn
+                                        text: I18n.t("HDR always uses 10 bits.")
+                                        color: Theme.subtext0; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
+                                        wrapMode: Text.WordWrap
                                     }
                                 }
                             }

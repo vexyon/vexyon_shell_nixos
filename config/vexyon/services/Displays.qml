@@ -43,7 +43,17 @@ Singleton {
         { v: 1.0, l: "1.0×" }, { v: 1.25, l: "1.25×" }, { v: 1.5, l: "1.5×" },
         { v: 1.75, l: "1.75×" }, { v: 2.0, l: "2.0×" }, { v: 2.5, l: "2.5×" }, { v: 3.0, l: "3.0×" }
     ]
-    readonly property var bitdepths: [ { v: 8, l: "8 bits (SDR)" }, { v: 10, l: "10 bits (HDR/WCG)" } ]
+    readonly property var bitdepths: [ { v: 8, l: "8 bits" }, { v: 10, l: "10 bits" } ]
+    // HDR desktop (cm = "hdr"): how bright and how saturated SDR content (the
+    // desktop, most windows) is drawn inside HDR. Hyprland's default for both
+    // is 1.0; its wiki puts typical brightness between 1.0 and 2.0.
+    readonly property var sdrBrightnessPresets: [
+        { v: 1.0, l: "1.0×" }, { v: 1.1, l: "1.1×" }, { v: 1.2, l: "1.2×" }, { v: 1.35, l: "1.35×" },
+        { v: 1.5, l: "1.5×" }, { v: 1.75, l: "1.75×" }, { v: 2.0, l: "2.0×" }
+    ]
+    readonly property var sdrSaturationPresets: [
+        { v: 0.9, l: "0.9×" }, { v: 0.95, l: "0.95×" }, { v: 1.0, l: "1.0×" }, { v: 1.05, l: "1.05×" }, { v: 1.1, l: "1.1×" }
+    ]
 
     // ======================= live monitor reading ==========================
     //  `all`: the monitors that are switched off too. Plain `monitors` lists
@@ -87,6 +97,14 @@ Singleton {
                             vrr: m.vrr === true ? 1 : 0,
                             x: m.x, y: m.y,
                             disabled: m.disabled === true,
+                            // HDR, as Hyprland sees it: the EDID has an HDR
+                            // metadata block and BT.2020 (supportsHDR() needs
+                            // both). null = unknown: Hyprland before 0.57 has
+                            // no hardwareDetails. cmPreset/tenBit are what is
+                            // running now.
+                            hdrCapable: m.hardwareDetails ? !!(m.hardwareDetails.hdr && m.hardwareDetails.bt2020) : null,
+                            cmPreset: m.colorManagementPreset || "",
+                            tenBit: String(m.currentFormat || "").indexOf("2101010") >= 0,
                             modes: modes
                         });
                     }
@@ -140,12 +158,18 @@ Singleton {
         var p = root.activeProfile();
         if (p && p.monitors && p.monitors[monName]) {
             var c = p.monitors[monName];
-            return {
+            var o = {
                 enabled: c.enabled !== false,
                 resolution: c.resolution, refresh: c.refresh, scale: c.scale,
                 transform: c.transform || 0, vrr: c.vrr || 0,
                 x: c.x || 0, y: c.y || 0, bitdepth: c.bitdepth || 8
             };
+            // `hdr` only once chosen here: an older profile without it emits
+            // no `cm` and keeps whatever the rest of the config says.
+            if (c.hdr !== undefined) o.hdr = c.hdr === true;
+            if (c.sdrBrightness !== undefined) o.sdrBrightness = Number(c.sdrBrightness);
+            if (c.sdrSaturation !== undefined) o.sdrSaturation = Number(c.sdrSaturation);
+            return o;
         }
         // derive from live
         var m = root.monitorByName(monName);
@@ -153,8 +177,16 @@ Singleton {
         return {
             enabled: !m.disabled,
             resolution: m.width + "x" + m.height, refresh: m.refresh, scale: m.scale,
-            transform: m.transform, vrr: m.vrr, x: m.x, y: m.y, bitdepth: 8
+            transform: m.transform, vrr: m.vrr, x: m.x, y: m.y, bitdepth: m.tenBit ? 10 : 8
         };
+    }
+
+    // HDR desktop on for this monitor (saved choice, else what is running)
+    function hdrOn(monName) {
+        var c = root.monCfg(monName);
+        if (c && c.hdr !== undefined) return c.hdr === true;
+        var m = root.monitorByName(monName);
+        return !!m && (m.cmPreset === "hdr" || m.cmPreset === "hdredid");
     }
 
     function monitorByName(name) {
@@ -267,8 +299,25 @@ Singleton {
               + ', scale = "' + root.fmtScale(c.scale) + '"'
               + ", transform = " + (c.transform || 0)
               + ", vrr = " + (c.vrr || 0);
-        if ((c.bitdepth || 8) === 10) s += ", bitdepth = 10";
+        // Explicit, never left out: hl.monitor() MERGES into the rule the
+        // output already has (Hyprland 0.57 LuaBindingsConfigRules.cpp), so a
+        // field left out keeps its old value live — going back to 8 bits or
+        // out of HDR did nothing until the next reload.
+        // HDR needs 10 bits: in 8 Hyprland warns "Wide color gamut is enabled
+        // but the display is not in 10bit mode".
+        var hdr = c.hdr === true;
+        s += ", bitdepth = " + (hdr || Number(c.bitdepth) === 10 ? 10 : 8);
+        if (c.hdr !== undefined) {
+            s += ', cm = "' + (hdr ? "hdr" : "srgb") + '"';
+            s += ", sdrbrightness = " + root.fmtNum(c.sdrBrightness, 1)
+               + ", sdrsaturation = " + root.fmtNum(c.sdrSaturation, 1);
+        }
         return s + " })";
+    }
+    function fmtNum(v, def) {
+        var n = Number(v);
+        if (!isFinite(n) || n <= 0) n = def;
+        return (Math.round(n * 1000) / 1000).toString();
     }
     function fmtScale(s) {
         var n = Number(s);
@@ -323,8 +372,10 @@ Singleton {
             mons[m.name] = {
                 enabled: !m.disabled,
                 resolution: m.width + "x" + m.height, refresh: m.refresh, scale: m.scale,
-                transform: m.transform, vrr: m.vrr, x: m.x, y: m.y, bitdepth: 8
+                transform: m.transform, vrr: m.vrr, x: m.x, y: m.y, bitdepth: m.tenBit ? 10 : 8
             };
+            // a monitor already in HDR keeps it in the new profile
+            if (m.cmPreset === "hdr") mons[m.name].hdr = true;
         }
         var p = { name: name, fingerprint: root.fingerprint(), monitors: mons };
         var ps = root.profiles().slice();

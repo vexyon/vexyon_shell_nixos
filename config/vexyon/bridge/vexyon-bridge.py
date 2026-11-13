@@ -374,9 +374,33 @@ def lua_monitor_call(name, c):
         f"transform = {int(c.get('transform', 0))}",
         f"vrr = {int(c.get('vrr', 0))}",
     ]
-    if int(c.get("bitdepth", 8)) == 10:
-        fields.append("bitdepth = 10")
+    # Explicit, never left out: hl.monitor() MERGES into the rule the output
+    # already has (Hyprland 0.57), so the live call from Displays.monCall()
+    # must name every field; this mirrors it. HDR needs 10 bits.
+    hdr = c.get("hdr") is True
+    try:
+        ten = int(c.get("bitdepth", 8) or 8) == 10
+    except (TypeError, ValueError):
+        ten = False
+    fields.append(f"bitdepth = {10 if (hdr or ten) else 8}")
+    # `hdr` only exists once chosen in Settings: an older profile emits no
+    # `cm` at all (Hyprland's default, "srgb").
+    if "hdr" in c:
+        fields.append(f"cm = {lua_str('hdr' if hdr else 'srgb')}")
+        fields.append(f"sdrbrightness = {fmt_num(c.get('sdrBrightness'), 1)}")
+        fields.append(f"sdrsaturation = {fmt_num(c.get('sdrSaturation'), 1)}")
     return f"hl.monitor({{ {', '.join(fields)} }})"
+
+
+def fmt_num(v, default):
+    """Mirrors Displays.fmtNum(): a positive number, at most 3 decimals."""
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        n = default
+    if not (n > 0) or n != n or n == float("inf"):
+        n = default
+    return f"{round(n, 3):g}"
 
 
 def build_settings_lua(cfg):
@@ -484,7 +508,62 @@ def build_settings_lua(cfg):
         'hl.window_rule({ name = "vexyon-virt-viewer-unset-initial-ws", '
         'match = { class = "virt-viewer" }, workspace = "unset" })\n'
     )
+    # Pantalla negra al poner un video a pantalla completa en Brave/Vivaldi/
+    # Chrome con HDR en el monitor. Cadena (codigo de Hyprland 0.57.2,
+    # Renderer.cpp handleFullscreenSettings y Monitor.cpp
+    # getAutoHDRImageDescription): con render:cm_auto_hdr (por defecto 1),
+    # Hyprland OFRECE a la ventana a pantalla completa una descripcion de
+    # imagen HDR por el protocolo de color management de Wayland; Chromium la
+    # acepta y empieza a enviar HDR; Hyprland pasa el monitor a HDR, cambia el
+    # infoframe ("Infoframe changed ... hdr=1" en el kernel) y el driver de
+    # NVIDIA hace un modeset completo: negro. Firefox no anuncia HDR y no lo
+    # dispara; Chromium sin WaylandWpColorManagerV1 tampoco.
+    #
+    # no_auto_hdr corta las dos mitades (no se ofrece HDR a esa ventana y
+    # wantHDR se queda en lo configurado en el monitor). Solo para estas clases:
+    # mpv, juegos, etc. siguen con AutoHDR, y un monitor con HDR fijo
+    # (cm = "hdr", Ajustes -> Pantallas) sigue en HDR. Efecto dinamico, se
+    # aplica a ventanas ya abiertas al recargar.
+    #
+    # Clases: Chromium usa como app_id de Wayland el nombre de su .desktop
+    # (shell_integration_linux.cc GetProgramClassClass/GetDesktopBaseName):
+    # brave-browser, vivaldi-stable, google-chrome, chromium (NixOS:
+    # chromium-browser), microsoft-edge, mas -beta/-unstable/-snapshot... Con
+    # --user-data-dir anade " (ruta)". Las PWA son <prefijo>-<id de 32>-<perfil>.
+    # Coincidencia completa (RE2 FullMatch), sin distinguir mayusculas (XWayland
+    # usa "Brave-browser"). Derivado del codigo de Chromium, no medido en la
+    # torre: `hyprctl clients` lo confirma.
+    #
+    # no_auto_hdr existe desde Hyprland 0.56 (la "oferta" de HDR, desde 0.57);
+    # nixos-26.05 trae 0.55.4, que rechaza el campo con un error de config.
+    # De ahi la guarda con hl.version() (existe en 0.55 y 0.57; comprobado con
+    # `Hyprland --verify-config` de ambas).
+    body += (
+        "\n-- Navegadores Chromium: sin AutoHDR al ir a pantalla completa (el cambio de\n"
+        "-- infoframe provocaba un modeset del monitor = pantalla negra en NVIDIA).\n"
+        "-- no_auto_hdr existe desde Hyprland 0.56.\n"
+        "do\n"
+        '    local maj, min = string.match(hl.version and hl.version() or "", "^v?(%d+)%.(%d+)")\n'
+        "    if maj and (tonumber(maj) > 0 or tonumber(min) >= 56) then\n"
+        f'        hl.window_rule({{ name = "vexyon-chromium-no-auto-hdr", '
+        f'match = {{ class = {lua_str(CHROMIUM_CLASS_RE)} }}, no_auto_hdr = true }})\n'
+        "    end\n"
+        "end\n"
+    )
     return body
+
+
+# app_id / clase de los navegadores basados en Chromium (ver build_settings_lua)
+CHROMIUM_CLASS_RE = (
+    "(?i)("
+    "brave-browser(-beta|-nightly)?"
+    "|vivaldi(-stable|-snapshot)?"
+    "|google-chrome(-beta|-unstable|-canary)?"
+    "|chromium(-browser)?"
+    "|microsoft-edge(-beta|-dev)?"
+    "|(chrome|brave|vivaldi|msedge)-[a-p]{32}-.+"
+    ")( [(].*[)])?"
+)
 
 
 # ============================================================================

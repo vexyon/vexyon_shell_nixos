@@ -10,6 +10,28 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
 
 ### Fixed
 
+- **Black screen when a video goes fullscreen in Brave/Vivaldi/Chrome.**
+  With Hyprland's AutoHDR (`render:cm_auto_hdr`, on by default) the
+  fullscreen window is offered an HDR image description over Wayland's
+  color-management protocol; Chromium takes it, Hyprland switches the
+  monitor to HDR, the HDR infoframe changes and the NVIDIA driver does a
+  full modeset — the screen goes black. The bridge now emits a window rule
+  with `no_auto_hdr` for Chromium-based browsers only (classes from their
+  `.desktop` names, case-insensitive, `--user-data-dir` and web apps
+  included) in `vexyon-settings.lua`, so it reaches existing installs —
+  on Hyprland 0.56 or newer, where `no_auto_hdr` exists (older versions
+  skip it). AutoHDR keeps working for mpv, games and everything else.
+- **The "HDR" setting did not turn HDR on.** Settings → Displays only had a
+  colour-depth selector ("10 bits (HDR/WCG)"), which sets `bitdepth` and
+  leaves the monitor in sRGB. There is now an HDR switch per monitor
+  (`cm = "hdr"`, always with 10 bits) with SDR brightness and saturation;
+  monitors whose EDID declares no HDR say so and keep the switch off. The
+  depth selector is just "8 bits / 10 bits".
+- **Display changes that did not apply until a reload.** `hl.monitor()`
+  merges into the rule the output already has, so leaving a field out kept
+  the old value: going back to 8 bits did nothing live. Bit depth (and the
+  colour mode, once chosen) are now always written out.
+
 - **Settings → Displays: a monitor turned off vanished and could not be
   turned back on.** The page read `hyprctl monitors -j`, which lists only
   enabled monitors, so the switched-off one left the list, its profile

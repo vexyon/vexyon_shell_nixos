@@ -20,6 +20,122 @@ VEXYON OUT-OF-THE-BOX POLICY Every Vexyon feature must ship together with all re
 
 PERMANENT POLICY: If Vexyon's installation changes, its GitHub README.md MUST be updated in the same development task. No exceptions.
 
+## Session (block 1+2): black screen on fullscreen video in Chromium browsers; HDR that never turned on
+
+### Why
+
+The owner's tower (RTX 5080, NVIDIA 615.78.08, three monitors DP-1/2/3 at
+XBGR2101010 reporting HDR, Hyprland 0.57.2) and laptop go black when a
+video goes fullscreen in Brave or Vivaldi; never in Firefox, nor in Vivaldi
+started with `--disable-features=WaylandWpColorManagerV1`. Each blackout
+matches `[nvidia-drm] Infoframe changed on CRTC 0 (hdr=1 …)` and a
+"Modesetting DP-1" in Hyprland's log. Separately, the "HDR" setting in
+Settings → Displays changed nothing.
+
+### Root causes (from Hyprland's source, not guessed)
+
+- Hyprland 0.57 `Monitor.cpp getAutoHDRImageDescription()` +
+  `Compositor.cpp`: with `render:cm_auto_hdr` (default 1) the fullscreen
+  window's surface is OFFERED an HDR preferred image description through
+  the Wayland color-management protocol. Chromium (WaylandWpColorManagerV1)
+  takes it and submits HDR; `Renderer.cpp handleFullscreenSettings()` then
+  sees an HDR surface, `applyCMType(CM_HDR)`, new HDR metadata → infoframe
+  change → the NVIDIA driver does a full modeset. Firefox never declares
+  HDR. The offer exists since 0.57.0 (absent in 0.56.x), `no_auto_hdr`
+  since 0.56.0; both read with `curl` of the tagged sources.
+- `no_auto_hdr` (dynamic window-rule effect) cuts both halves: no HDR offer
+  to that window, and `wantHDR` stays what the monitor is configured with.
+- Settings → Displays had no HDR switch at all: only "Color depth" with
+  "10 bits (HDR/WCG)", which writes `bitdepth = 10` and leaves the monitor
+  in `cm = "srgb"`. HDR in Hyprland is `cm = "hdr"` (wiki
+  configuring/core/monitors/colors.md; `LuaBindingsConfigRules.cpp`).
+- `hl.monitor()` MERGES into the output's existing rule (0.55.4 and 0.57.2,
+  `LuaBindingsConfigRules.cpp`: `parser.rule() = *existing`). Displays only
+  emitted `bitdepth = 10`, so choosing 8 bits again did nothing live until
+  a reload re-read the generated file.
+- `Displays.monCfg()`/`createProfile()` derived `bitdepth: 8` from a live
+  monitor that was in fact at 10 bits.
+
+### What changed
+
+- Bridge (both repos, `build_settings_lua` → `vexyon-settings.lua`, which
+  the bridge rewrites; `vexyon-rules.lua` is seed-once and untouched):
+  `hl.window_rule({ name = "vexyon-chromium-no-auto-hdr", match = { class
+  = CHROMIUM_CLASS_RE }, no_auto_hdr = true })`, wrapped in a
+  `hl.version() >= 0.56` guard so Hyprland 0.55.4 (nixos-26.05) does not
+  report an unknown field. Classes: Chromium sets its Wayland app_id to its
+  `.desktop` base name (`shell_integration_linux.cc`
+  GetProgramClassClass/GetDesktopBaseName, fetched from chromium/main):
+  brave-browser(-beta|-nightly), vivaldi(-stable|-snapshot),
+  google-chrome(-beta|-unstable|-canary), chromium(-browser on NixOS),
+  microsoft-edge(-beta|-dev), web apps `<prefix>-<32 a-p>-<profile>`, plus
+  the " (<dir>)" suffix `--user-data-dir` adds; `(?i)` for XWayland's
+  capitalised class. RE2 FullMatch, as Hyprland's RegexMatchEngine.
+- Plan B (`--disable-features=WaylandWpColorManagerV1`) NOT implemented:
+  the shell neither installs browsers nor launches them except through
+  `vexyon-open-browser` (Super+B only), so a flag there would not cover the
+  launcher or `.desktop` starts. The rule covers every start.
+- Displays (`services/Displays.qml`, shared): per-monitor `hdr`,
+  `sdrBrightness`, `sdrSaturation`; live `hdrCapable` (hardwareDetails.hdr
+  && bt2020, Hyprland's supportsHDR(); `null` when Hyprland < 0.57 has no
+  hardwareDetails), `cmPreset`, `tenBit` (currentFormat). `monCall()` and
+  the bridge's `lua_monitor_call()` always write `bitdepth` (10 whenever HDR
+  is on) and, once HDR was chosen, `cm = "hdr"|"srgb"`, `sdrbrightness`,
+  `sdrsaturation`. A profile without `hdr` emits no `cm` (unchanged
+  behaviour). A new profile copies HDR from a monitor already in HDR.
+- Settings → Displays: HDR switch per monitor with a status line (what it
+  does + what Hyprland reports now); disabled with "This monitor does not
+  report HDR support (EDID)." when the EDID says no; SDR brightness and
+  saturation presets (1.0–2.0, 0.9–1.1) while on; colour depth shows 10
+  and is locked while HDR is on; labels "8 bits"/"10 bits". Changes go
+  through the existing 10-second revert dialog. Spanish strings added.
+- README (feature line), CHANGELOG.
+
+### Verified
+
+- Real Hyprland binaries from nixpkgs, `Hyprland --verify-config` on the
+  seeded `hyprland.lua` with the bridge's generated files (both repos'
+  bridges): 0.57.2 → "config ok"; 0.55.4 → "config ok". Control runs: the
+  same file with the field misspelled → 0.57.2 reports
+  `unknown field 'no_auto_hdrX'` (the guarded branch runs), 0.55.4 does
+  not (skipped). Before the guard, 0.55.4 rejected `no_auto_hdr`.
+  Monitor lines with `cm = "hdr"`, `sdrbrightness`, `bitdepth = 8|10`:
+  "config ok" on both versions. (One early 0.57.2 run exited 139 without
+  output; three reruns of the same file exited 0.)
+- The class regex compiled and matched with real RE2 (`google-re2`):
+  brave-browser, Brave-browser, vivaldi-stable, google-chrome,
+  chromium-browser, `brave-browser (/tmp/p)`, a Chrome web-app id → match;
+  firefox, mpv, org.quickshell, steam_app_123 → no match.
+- `luac -p` of every generated/seeded Lua file; `py_compile` of both
+  bridges.
+- Lab (headless sway, nixpkgs Quickshell 0.3.2, this tree's QML, a fake
+  `hyprctl` with three monitors: DP-1 HDR-capable in SDR at 10 bits, DP-2
+  already in HDR, DP-3 without HDR / without hardwareDetails):
+  DP-1 HDR on → `hl.monitor({ … bitdepth = 10, cm = "hdr", sdrbrightness
+  = 1, sdrsaturation = 1 })` and `"hdr": true` in shell.json; DP-2 shown
+  on ("The whole desktop in HDR. (now: HDR · 10 bits)"), off →
+  `cm = "srgb"`; DP-3 with `hdr:false` in its EDID → switch disabled and
+  the EDID sentence; DP-3 with no hardwareDetails → switch usable, no
+  browser claim. No QML warnings from the changed files.
+- NixOS package builds (`nix build .#vexyon-shell`, nixpkgs nixos-26.05
+  from channels.nixos.org). I18n checker: 0 missing. Shared files
+  byte-identical except the allowed platform files.
+
+### Not verified
+
+- The black screen itself: no NVIDIA GPU, monitor or Brave/Vivaldi here.
+  That the rule stops it rests on Hyprland's source; the owner has to run
+  a fullscreen video with `journalctl -kf | grep -i infoframe` open.
+- The browsers' real app_id on the owner's machines (derived from
+  Chromium's source; `hyprctl clients` shows it). A browser installed
+  under another `.desktop` name (Flatpak `com.brave.Browser`, Helium,
+  Thorium, Opera…) is NOT covered.
+- On Hyprland 0.55 (NixOS 26.05) the rule is skipped: an HDR video in a
+  Chromium browser can still trigger AutoHDR there; nothing per-window
+  exists in that version.
+- Real HDR output (`cm = "hdr"` on a real panel), SDR brightness look, and
+  that `hardwareDetails.hdr` matches each panel.
+
 ## Session: a monitor turned off could not come back; English shell showing Spanish
 
 ### Why
