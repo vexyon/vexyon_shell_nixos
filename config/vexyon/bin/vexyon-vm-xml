@@ -21,6 +21,16 @@ import os
 import sys
 import xml.etree.ElementTree as ET
 
+# Espacios de nombres que aparecen en dominios de Vexyon. Registrarlos solo
+# cambia el PREFIJO con que se escriben (vexyon:, qemu:… en vez de ns0:);
+# libvirt los identifica por la URI, así que es cosmético salvo para quien lea
+# el XML en el modo experto.
+VX_NS = "https://github.com/vexyon/vm"
+QEMU_NS = "http://libvirt.org/schemas/domain/qemu/1.0"
+ET.register_namespace("vexyon", VX_NS)
+ET.register_namespace("qemu", QEMU_NS)
+ET.register_namespace("libosinfo", "http://libosinfo.org/xmlns/libvirt/domain/1.0")
+
 # --------------------------------------------------------------------------
 # utilidades
 # --------------------------------------------------------------------------
@@ -118,7 +128,8 @@ def cmd_info(root, argv):
         m = v.find("model")
         if m is None:
             continue
-        rec("@@VIDEO", m.get("type", ""), m.get("vram", ""), m.get("heads", "1"))
+        rec("@@VIDEO", m.get("type", ""), m.get("vram", ""), m.get("heads", "1"),
+            m.get("vgamem", ""))
 
     cpu = root.find("cpu")
     topo = cpu.find("topology") if cpu is not None else None
@@ -160,6 +171,11 @@ def cmd_info(root, argv):
         rec("@@USBDEV",
             v.get("id", "") if v is not None else "",
             p.get("id", "") if p is not None else "")
+
+    for a in pci_hostdevs(root):
+        rec("@@PCIDEV", a)
+
+    rec("@@GL3D", *gl_settings(root))
 
     for g in dev.findall("graphics"):
         cb = g.find("clipboard")
@@ -250,12 +266,48 @@ def cmd_gpu3d(root, argv):
     node = argv[0]
     if not node.startswith("/dev/dri/"):
         die("render node inválido: %s" % node)
+    mode, hostmem, blob = gl_settings(root)
     dev = devices(root)
     for v in dev.findall("video"):
         dev.remove(v)
     v = ET.SubElement(dev, "video")
-    m = ET.SubElement(v, "model", {"type": "virtio", "heads": "1", "primary": "yes"})
+    attrs = {"type": "virtio", "heads": "1", "primary": "yes"}
+    if blob == "on":
+        # Recursos blob: el invitado y QEMU comparten los búferes en vez de
+        # copiarlos. libvirt (12.2) lo tiene como atributo y exige memoria
+        # compartida.
+        attrs["blob"] = "on"
+        shared_memory(root)
+    m = ET.SubElement(v, "model", attrs)
     ET.SubElement(m, "acceleration", {"accel3d": "yes"})
+    # hostmem (la ventana de memoria del anfitrión que el invitado mapea) y
+    # Venus (Vulkan) NO tienen atributo en libvirt 12.2: van como propiedades
+    # del dispositivo de QEMU con <qemu:override> sobre el alias que libvirt
+    # le da al primer vídeo, `video0` (virtio-vga-gl,hostmem=…,venus=on).
+    props = []
+    if hostmem != "0":
+        props.append(("hostmem", "unsigned", str(int(hostmem) * 1024 * 1024)))
+    if mode == "venus":
+        props.append(("venus", "bool", "true"))
+    if props:
+        qn = lambda t: "{%s}%s" % (QEMU_NS, t)
+        ov = root.find(qn("override"))
+        if ov is None:
+            ov = ET.SubElement(root, qn("override"))
+        dv = None
+        for d in ov.findall(qn("device")):
+            if d.get("alias") == "video0":
+                dv = d
+        if dv is None:
+            dv = ET.SubElement(ov, qn("device"), {"alias": "video0"})
+        fe = dv.find(qn("frontend"))
+        if fe is None:
+            fe = ET.SubElement(dv, qn("frontend"))
+        for name, typ, val in props:
+            for old_p in fe.findall(qn("property")):
+                if old_p.get("name") == name:
+                    fe.remove(old_p)
+            ET.SubElement(fe, qn("property"), {"name": name, "type": typ, "value": val})
     for g in dev.findall("graphics"):
         if g.get("type") == "egl-headless":
             dev.remove(g)
@@ -283,6 +335,170 @@ def cmd_cpu(root, argv):
     topo.set("sockets", s)
     topo.set("cores", c)
     topo.set("threads", t)
+    return root
+
+
+# ---- 3D (virgl / Venus), memoria de vídeo, passthrough PCI ------------------
+
+GL_MODES = ("virgl", "venus")
+HOSTMEM_MIB = ("0", "1024", "2048", "4096", "8192")
+
+
+def vx_meta(root, create=False):
+    """El <vexyon:vm …/> de <metadata> (sistema del invitado, ajustes 3D)."""
+    md = root.find("metadata")
+    if md is None:
+        if not create:
+            return None
+        md = ET.SubElement(root, "metadata")
+    el = md.find("{%s}vm" % VX_NS)
+    if el is None and create:
+        el = ET.SubElement(md, "{%s}vm" % VX_NS)
+    return el
+
+
+def gl_settings(root):
+    """(modo, hostmem MiB, blob) para «Iniciar con aceleración 3D».
+
+    Se guardan en los metadatos y no en el <video> porque el arranque 3D es
+    transitorio (gpu3d): la definición guardada sigue con su vídeo de siempre.
+    Venus fuerza blob y una ventana hostmem (sin ellas no arranca)."""
+    el = vx_meta(root)
+    g = (lambda k: el.get(k, "") if el is not None else "")
+    mode = g("gl") if g("gl") in GL_MODES else "virgl"
+    hostmem = g("hostmem") if g("hostmem") in HOSTMEM_MIB else "0"
+    blob = "on" if g("blob") == "on" else "off"
+    if mode == "venus":
+        blob = "on"
+        if hostmem == "0":
+            hostmem = "4096"
+    return mode, hostmem, blob
+
+
+def cmd_gl3d(root, argv):
+    """gl3d <virgl|venus> <hostmem MiB: 0|1024|2048|4096|8192> <blob on|off>"""
+    mode, hostmem, blob = argv[0], argv[1], argv[2]
+    if mode not in GL_MODES:
+        die("modo 3D inválido: %s" % mode)
+    if hostmem not in HOSTMEM_MIB:
+        die("hostmem inválido: %s" % hostmem)
+    if blob not in ("on", "off"):
+        die("blob inválido: %s" % blob)
+    el = vx_meta(root, create=True)
+    el.set("gl", mode)
+    el.set("hostmem", hostmem)
+    el.set("blob", blob)
+    return root
+
+
+VRAM_MIB = ("16", "32", "64", "128", "256")
+
+
+def cmd_vram(root, argv):
+    """vram <MiB> — memoria de vídeo de qxl, vga, vmvga y bochs.
+
+    qxl: la que cuenta para la resolución es `vgamem` (el framebuffer: 16 MiB
+    dan hasta 2560x1600, 32 MiB un 4K, 64 MiB dos 4K); `ram` (barra 0) tiene
+    que ser al menos el doble y `vram` (superficies) se deja en 64 MiB o más.
+    vga, vmvga y bochs: `vram` es el framebuffer. virtio-gpu no tiene memoria
+    de vídeo fija: dibuja en la RAM del invitado."""
+    mib = argv[0]
+    if mib not in VRAM_MIB:
+        die("memoria de vídeo inválida: %s MiB" % mib)
+    kib = int(mib) * 1024
+    for v in devices(root).findall("video"):
+        m = v.find("model")
+        if m is None:
+            continue
+        t = m.get("type", "")
+        if t == "qxl":
+            if kib > 65536:
+                die("qxl: como mucho 64 MiB de framebuffer")
+            m.set("vgamem", str(kib))
+            m.set("ram", str(max(65536, 2 * kib)))
+            m.set("vram", str(max(65536, kib)))
+        elif t in ("vga", "vmvga", "bochs"):
+            m.set("vram", str(kib))
+        else:
+            die("el modelo %s no tiene memoria de vídeo fija" % t)
+    return root
+
+
+def pci_addr(s):
+    """'0000:01:00.0' -> (dominio, bus, slot, función) en hex de libvirt."""
+    try:
+        dom, bus, rest = s.split(":")
+        slot, fn = rest.split(".")
+        return ("0x%04x" % int(dom, 16), "0x%02x" % int(bus, 16),
+                "0x%02x" % int(slot, 16), "0x%x" % int(fn, 16))
+    except ValueError:
+        die("dirección PCI inválida: %s" % s)
+
+
+def pci_hostdevs(root):
+    """Direcciones '0000:01:00.0' de los <hostdev type='pci'> del dominio."""
+    out = []
+    for hd in devices(root).findall("hostdev"):
+        if hd.get("type") != "pci":
+            continue
+        a = hd.find("source/address")
+        if a is None:
+            continue
+        try:
+            out.append("%04x:%02x:%02x.%x" % (
+                int(a.get("domain", "0"), 16), int(a.get("bus", "0"), 16),
+                int(a.get("slot", "0"), 16), int(a.get("function", "0"), 16)))
+        except ValueError:
+            continue
+    return out
+
+
+def cmd_pci_add(root, argv):
+    """pci-add <addr>… — passthrough VFIO (managed: libvirt la desata del
+    anfitrión al arrancar y se la devuelve al apagar)."""
+    have = set(pci_hostdevs(root))
+    dev = devices(root)
+    for s in argv:
+        d, b, sl, f = pci_addr(s)
+        if "%04x:%02x:%02x.%x" % (int(d, 16), int(b, 16), int(sl, 16), int(f, 16)) in have:
+            continue
+        hd = ET.SubElement(dev, "hostdev",
+                           {"mode": "subsystem", "type": "pci", "managed": "yes"})
+        src = ET.SubElement(hd, "source")
+        ET.SubElement(src, "address",
+                      {"domain": d, "bus": b, "slot": sl, "function": f})
+    return root
+
+
+def cmd_pci_del(root, argv):
+    """pci-del <addr>… — quita esos dispositivos PCI del dominio."""
+    want = set()
+    for s in argv:
+        d, b, sl, f = pci_addr(s)
+        want.add("%04x:%02x:%02x.%x" % (int(d, 16), int(b, 16), int(sl, 16), int(f, 16)))
+    dev = devices(root)
+    for hd in list(dev.findall("hostdev")):
+        if hd.get("type") != "pci":
+            continue
+        a = hd.find("source/address")
+        if a is None:
+            continue
+        try:
+            k = "%04x:%02x:%02x.%x" % (
+                int(a.get("domain", "0"), 16), int(a.get("bus", "0"), 16),
+                int(a.get("slot", "0"), 16), int(a.get("function", "0"), 16))
+        except ValueError:
+            continue
+        if k in want:
+            dev.remove(hd)
+    return root
+
+
+def cmd_pci_list(root, argv):
+    """pci-list — una dirección PCI por línea (para la comprobación previa al
+    arranque: ¿hay algo de este equipo usando esa GPU?)."""
+    for a in pci_hostdevs(root):
+        sys.stdout.write(a + "\n")
     return root
 
 
@@ -415,6 +631,13 @@ def cmd_fs_add(root, argv):
     ET.SubElement(fs, "source", {"dir": src})
     ET.SubElement(fs, "target", {"dir": tag})
     # virtiofs EXIGE memoria compartida; sin esto el dominio no arranca.
+    shared_memory(root)
+    return root
+
+
+def shared_memory(root):
+    """Memoria del invitado compartible (memfd): la necesitan virtiofs y los
+    recursos blob de virtio-gpu."""
     mb = root.find("memoryBacking")
     if mb is None:
         mb = ET.SubElement(root, "memoryBacking")
@@ -422,7 +645,6 @@ def cmd_fs_add(root, argv):
         ET.SubElement(mb, "source", {"type": "memfd"})
     if mb.find("access") is None:
         ET.SubElement(mb, "access", {"mode": "shared"})
-    return root
 
 
 def cmd_fs_del(root, argv):
@@ -918,6 +1140,11 @@ COMMANDS = {
     "pf-set": cmd_pf_set,
     "nic-mac": cmd_nic_mac,
     "guest-agent": cmd_guest_agent,
+    "gl3d": cmd_gl3d,
+    "vram": cmd_vram,
+    "pci-add": cmd_pci_add,
+    "pci-del": cmd_pci_del,
+    "pci-list": cmd_pci_list,
     "webdav": cmd_webdav,
     "filetransfer": cmd_filetransfer,
     "firmware": cmd_firmware,
@@ -927,7 +1154,7 @@ COMMANDS = {
 
 
 # Órdenes que ya han escrito su propia salida: no se les añade el dominio.
-SELF_PRINTING = ("info", "iface-get", "iface-retarget")
+SELF_PRINTING = ("info", "iface-get", "iface-retarget", "pci-list")
 
 
 def main():

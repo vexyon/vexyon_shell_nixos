@@ -226,6 +226,16 @@ FloatingWindow {
     //  ninguna VM encendida el proceso que escucha desaparece.
     // Texto bajo los botones de la GPU dedicada (ver Vm.dgpu).
     // Aceleración 3D (ver Vm.dgpu): qué hace, o por qué está gris.
+    // Pantalla: memoria de vídeo del modelo actual y si el invitado es Windows.
+    readonly property bool vramModel: Vm.detail.video !== null
+                                      && ["qxl", "vga", "vmvga", "bochs"].indexOf(Vm.detail.video.model) !== -1
+    readonly property string vramNow: !Vm.detail.video ? ""
+        : "" + Math.round((Vm.detail.video.model === "qxl" ? Vm.detail.video.vgamem : Vm.detail.video.vram) / 1024)
+    readonly property bool selWin: /^win|microsoft\.com/.test(String(Vm.detail.os || ""))
+    readonly property string pciWarning: I18n.t("While this VM runs, the GPU belongs to it: libvirt takes it from this computer at start and gives it back at shutdown. Nothing here may be using it (a game, CUDA, an app on the dedicated GPU); Vexyon checks that before starting. Install the GPU's own driver inside the guest. Its picture comes out of the GPU's own video outputs: a laptop's dedicated GPU usually has none, so the VM window keeps showing the virtual display.")
+    function gpuVendor(v) {
+        return v === "0x10de" ? "NVIDIA GPU" : v === "0x1002" ? "AMD GPU" : v === "0x8086" ? "Intel GPU" : "GPU " + v;
+    }
     readonly property bool can3d: (Vm.dgpu.state === "on" || Vm.dgpu.state === "main")
                                   && Vm.dgpu.render !== "" && Vm.dgpu.gl3d !== "0"
     function dgpuNote() {
@@ -2454,6 +2464,188 @@ Fold {
                                                     onToggled: function(v) { modelData.f(v); }
                                                 }
                                             }
+                                        }
+                                    }
+                                    // ---- memoria de vídeo ----
+                                    //  Medido en libvirt 12.2 + QEMU 10.2 (arranca con cada
+                                    //  valor): qxl 16–64 MiB de framebuffer (vgamem), vga
+                                    //  hasta 256 MiB, vmvga y bochs igual que vga.
+                                    //  virtio-gpu no tiene memoria de vídeo fija.
+                                    Sec { text: I18n.t("VIDEO MEMORY") }
+                                    Segmented {
+                                        Layout.fillWidth: true
+                                        visible: vm.vramModel
+                                        value: vm.vramNow
+                                        options: (Vm.detail.video && Vm.detail.video.model === "qxl")
+                                            ? [ { key: "16", label: "16 MiB" }, { key: "32", label: "32 MiB" }, { key: "64", label: "64 MiB" } ]
+                                            : [ { key: "16", label: "16 MiB" }, { key: "32", label: "32 MiB" }, { key: "64", label: "64 MiB" },
+                                                { key: "128", label: "128 MiB" }, { key: "256", label: "256 MiB" } ]
+                                        onPicked: function(k) { Vm.setVram(vm.selected, k); }
+                                    }
+                                    Note {
+                                        visible: Vm.detail.video !== null && Vm.detail.video.model === "qxl"
+                                        text: I18n.t("QXL: 16 MiB is enough up to 2560×1600, 32 MiB for one 4K screen, 64 MiB for two. The guest sees the change at its next start.")
+                                    }
+                                    Note {
+                                        visible: vm.vramModel && Vm.detail.video.model !== "qxl"
+                                        text: I18n.t("The framebuffer of this display: more memory allows higher resolutions. The guest sees the change at its next start.")
+                                    }
+                                    Note {
+                                        visible: Vm.detail.video !== null && Vm.detail.video.model === "virtio"
+                                        text: I18n.t("virtio-gpu has no fixed video memory: it draws in the guest's own RAM, so there is nothing to set here. For 3D, the host memory window below plays that role.")
+                                    }
+                                    Fold {
+                                        title: I18n.t("Other display models")
+                                        Segmented {
+                                            Layout.fillWidth: true
+                                            value: Vm.detail.video ? Vm.detail.video.model : ""
+                                            options: [ { key: "vmvga", label: "VMware SVGA" }, { key: "bochs", label: "Bochs" } ]
+                                            onPicked: function(k) { Vm.setVideo(vm.selected, k, 16384); }
+                                        }
+                                        Note { text: I18n.t("For old or unusual guests. VMware SVGA only helps a guest that has VMware's display driver; Bochs is a plain display for UEFI guests without other drivers. Neither does 3D.") }
+                                    }
+
+                                    // ---- aceleración 3D ----
+                                    Sec { text: I18n.t("3D ACCELERATION") }
+                                    //  viogpu3d (virtio-win PR #943, sin fusionar) y su derivado
+                                    //  Triton necesitan un virglrenderer PARCHEADO en el anfitrión
+                                    //  y un driver firmado en modo de prueba dentro de Windows, con
+                                    //  cuelgues reportados en el propio PR: no se puede instalar
+                                    //  «de serie» sin sustituir librerías del sistema. No se ofrece.
+                                    Note {
+                                        visible: vm.selWin
+                                        tone: "warn"
+                                        text: I18n.t("Windows guests get no 3D here. The only virtio-gpu 3D driver for Windows (viogpu3d, and its Triton fork) is experimental: it needs a patched virglrenderer on this computer and a test-signed driver inside Windows, and crashes are reported, so Vexyon does not offer it. For 3D in Windows, pass a second GPU to the VM (below).")
+                                    }
+                                    ColumnLayout {
+                                        Layout.fillWidth: true
+                                        visible: !vm.selWin
+                                        spacing: 8
+                                        Note { text: I18n.t("Used by “Start with 3D acceleration” (Linux guests): OpenGL through virgl, and optionally Vulkan through Venus. The saved VM does not change: a normal Start uses its usual display.") }
+                                        Note {
+                                            visible: Vm.dgpu.state === "none"
+                                            tone: "warn"
+                                            text: I18n.t("This computer has no dedicated GPU, so “Start with 3D acceleration” is not offered.")
+                                        }
+                                        Segmented {
+                                            Layout.fillWidth: true
+                                            value: Vm.detail.gl3d.mode
+                                            options: [ { key: "virgl", label: I18n.t("OpenGL (virgl)") },
+                                                       { key: "venus", label: I18n.t("OpenGL + Vulkan (Venus)") } ]
+                                            onPicked: function(k) {
+                                                var g = Vm.detail.gl3d;
+                                                Vm.setGl3d(vm.selected, k, k === "venus" && g.hostmem === "0" ? "4096" : g.hostmem,
+                                                           k === "venus" || g.blob === "on");
+                                            }
+                                        }
+                                        Note {
+                                            visible: Vm.detail.gl3d.mode === "venus"
+                                            tone: "warn"
+                                            text: I18n.t("Venus is experimental. It needs, on this computer, a Vulkan driver for that GPU and a virglrenderer built with Venus, and Mesa 24.2 or newer inside the guest. If the VM does not start or shows errors, go back to OpenGL.")
+                                        }
+                                        Fold {
+                                            RowLayout {
+                                                Layout.fillWidth: true
+                                                spacing: 10
+                                                Text {
+                                                    Layout.fillWidth: true
+                                                    text: I18n.t("Blob resources (buffers shared instead of copied)")
+                                                    color: Theme.text; wrapMode: Text.Wrap
+                                                    font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1
+                                                }
+                                                Toggle {
+                                                    checked: Vm.detail.gl3d.blob === "on"
+                                                    enabled: Vm.detail.gl3d.mode !== "venus"
+                                                    onToggled: function(v) { Vm.setGl3d(vm.selected, Vm.detail.gl3d.mode, Vm.detail.gl3d.hostmem, v); }
+                                                }
+                                            }
+                                            Text {
+                                                text: I18n.t("Host memory window (hostmem)"); color: Theme.subtext0
+                                                font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
+                                            }
+                                            Segmented {
+                                                Layout.fillWidth: true
+                                                value: Vm.detail.gl3d.hostmem
+                                                options: [ { key: "0", label: I18n.t("No window"), off: Vm.detail.gl3d.mode === "venus" },
+                                                           { key: "1024", label: "1 GiB" }, { key: "2048", label: "2 GiB" },
+                                                           { key: "4096", label: "4 GiB" }, { key: "8192", label: "8 GiB" } ]
+                                                onPicked: function(k) {
+                                                    if (k === "0" && Vm.detail.gl3d.mode === "venus") return;
+                                                    Vm.setGl3d(vm.selected, Vm.detail.gl3d.mode, k, Vm.detail.gl3d.blob === "on");
+                                                }
+                                            }
+                                            Note { text: I18n.t("Blob resources and the host memory window let the guest map GPU buffers directly instead of copying them; Venus needs both (4 GiB by default). The window is address space, not RAM taken up front; blob resources make the guest's memory shared, which libvirt sets up by itself.") }
+                                        }
+                                    }
+
+                                    // ---- passthrough de GPU (VFIO) ----
+                                    ColumnLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 8
+                                        onVisibleChanged: if (visible) Vm.probePci()
+                                        Component.onCompleted: if (visible) Vm.probePci()
+                                        Sec { text: I18n.t("GPU PASSTHROUGH (VFIO)") }
+                                        Note { text: I18n.t("Gives a whole physical GPU to the VM: real 3D for any guest, Windows included, with the GPU's own driver inside. The GPU of this computer's display is never offered.") }
+                                        Note {
+                                            visible: Vm.pci.probed && Vm.pci.gpus.length < 2
+                                            tone: "warn"
+                                            text: I18n.t("This computer has only one GPU. Passing it to a VM would leave this computer without a display, so passthrough is not offered.")
+                                        }
+                                        Note {
+                                            visible: Vm.pci.probed && Vm.pci.gpus.length >= 2 && !Vm.pci.iommu
+                                            tone: "warn"
+                                            text: I18n.t("The IOMMU (Intel VT-d / AMD-Vi) is off, and passthrough needs it. Turn it on in the firmware (BIOS/UEFI) settings; that is the one thing Vexyon cannot do for you.")
+                                        }
+                                        Repeater {
+                                            model: Vm.pci.gpus.length >= 2 && Vm.pci.iommu ? Vm.pci.gpus : []
+                                            delegate: ColumnLayout {
+                                                id: pg
+                                                required property var modelData
+                                                readonly property string why: Vm.pciWhyNot(modelData)
+                                                readonly property bool inVm: Vm.detail.pcidevs.indexOf(modelData.addr) !== -1
+                                                Layout.fillWidth: true
+                                                spacing: 4
+                                                RowLayout {
+                                                    Layout.fillWidth: true
+                                                    spacing: 10
+                                                    Text {
+                                                        Layout.fillWidth: true
+                                                        text: (pg.modelData.name !== "" ? pg.modelData.name : vm.gpuVendor(pg.modelData.vendor))
+                                                              + "  ·  " + pg.modelData.addr
+                                                              + (pg.modelData.driver !== "" ? "  ·  " + pg.modelData.driver : "")
+                                                        color: Theme.text; wrapMode: Text.Wrap
+                                                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1
+                                                    }
+                                                    ActBtn {
+                                                        visible: pg.why === "" && !pg.inVm
+                                                        glyph: Icons.plus; label: I18n.t("Pass to this VM"); tint: Theme.teal
+                                                        enabled: !Vm.busy
+                                                        onClicked: vm.ask(I18n.t("Pass this GPU to the VM?"), vm.pciWarning,
+                                                            I18n.t("Pass to this VM"), false,
+                                                            function() { Vm.addPci(vm.selected, pg.modelData.funcs); })
+                                                    }
+                                                    ActBtn {
+                                                        visible: pg.inVm
+                                                        glyph: Icons.trash; label: I18n.t("Remove from this VM"); tint: Theme.red
+                                                        enabled: !Vm.busy
+                                                        onClicked: Vm.delPci(vm.selected, pg.modelData.funcs)
+                                                    }
+                                                }
+                                                Note {
+                                                    visible: pg.why === "display"
+                                                    text: I18n.t("This is the GPU of this computer's display: not offered.")
+                                                }
+                                                Note {
+                                                    visible: pg.why === "group"
+                                                    tone: "warn"
+                                                    text: I18n.t("It shares its IOMMU group with other devices (%1): passing it would take them too, so it is not offered.").arg(pg.modelData.others.join(", "))
+                                                }
+                                            }
+                                        }
+                                        Note {
+                                            visible: Vm.detail.pcidevs.length > 0
+                                            tone: "warn"
+                                            text: vm.pciWarning
                                         }
                                     }
                                 }

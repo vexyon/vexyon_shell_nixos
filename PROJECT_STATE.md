@@ -20,6 +20,101 @@ VEXYON OUT-OF-THE-BOX POLICY Every Vexyon feature must ship together with all re
 
 PERMANENT POLICY: If Vexyon's installation changes, its GitHub README.md MUST be updated in the same development task. No exceptions.
 
+## Session (VM manager, phase 3): graphics — virgl/Venus settings, VRAM, GPU passthrough, Windows 3D said as it is
+
+### Why
+
+The owner asked for: Linux 3D with virtio-gpu (virgl, and Venus if
+possible, with configurable hostmem/blob); keep QXL/VGA for Windows with
+adjustable VRAM; investigate the Windows 3D driver (viogpu3d/Triton) and
+offer it only if it can be integrated, off by default and with a warning;
+VFIO passthrough with IOMMU and GPU-count detection, never offered with a
+single GPU; VRAM where the model allows it and a clear statement where it
+does not.
+
+### What changed (`bin/vexyon-vm-xml`, `services/Vm.qml`, `modules/VmManager.qml`, `services/I18n.qml`, shared)
+
+- **3D settings per VM**, stored in the VM's metadata
+  (`<vexyon:vm gl="virgl|venus" hostmem="MiB" blob="on|off"/>`, new
+  `vexyon-vm-xml gl3d`) because the 3D start stays transient: `gpu3d` reads
+  them and builds the one-off domain with `<model type='virtio'
+  blob='on'>` (libvirt 12.2 has the attribute) + shared memfd memory, and
+  `hostmem`/`venus` as properties of QEMU's `video0` device through
+  `<qemu:override>` (libvirt 12.2 has no attribute for them). Venus forces
+  blob and a 4 GiB window. UI: Display → 3D acceleration (OpenGL (virgl) /
+  OpenGL + Vulkan (Venus), advanced: blob toggle, host memory window none /
+  1 / 2 / 4 / 8 GiB), with the experimental warning for Venus and a note
+  when the computer has no dedicated GPU (the 3D start is not offered then,
+  as before).
+- **Windows 3D: not offered, and said.** viogpu3d is still an open,
+  unmerged pull request in virtio-win (#943); it needs a patched
+  virglrenderer on the host (the author's `viogpu_win` branch, loaded with
+  `LD_LIBRARY_PATH`), a Mesa built inside the guest and a test-signed
+  driver, and the thread reports black screens, crashes and a BSOD; Triton
+  is a fork of it. None of that can ship "out of the box" without replacing
+  a system library, so the Display section says so and points to
+  passthrough. The virtio-win 0.1.285 ISO only has `viogpudo` (2D).
+- **VRAM** (`vexyon-vm-xml vram`): QXL 16 / 32 / 64 MiB of framebuffer
+  (`vgamem`; `ram` = twice that, at least 64 MiB; `vram` ≥ 64 MiB) with the
+  resolutions each allows; VGA, VMware SVGA and Bochs 16–256 MiB (`vram`).
+  virtio-gpu: "no fixed video memory, it draws in the guest's RAM". New
+  display choices in a fold: VMware SVGA and Bochs. `info` reports
+  `vgamem`.
+- **GPU passthrough (VFIO)**: on opening Display, one read of
+  `/sys/bus/pci/devices` (no polling): each GPU's address, vendor, driver,
+  `boot_vga`, render nodes, IOMMU group, the functions of its own slot in
+  that group, and any other non-bridge device in the group. Offered only
+  when there are 2+ GPUs, the IOMMU is on, the GPU is not the firmware's
+  boot GPU nor the session's GPU (`dgpu.state` main), and its group holds
+  nothing else; otherwise the reason is shown. "Pass to this VM" (asks
+  first, with what it means) adds every function of the slot as
+  `<hostdev type='pci' managed='yes'>` (`pci-add`; `pci-del` removes).
+  **Pre-start check**: for a VM with PCI hostdevs, if a process of this
+  session holds the GPU's card/render node (or `/dev/nvidia*` when it is the
+  only NVIDIA GPU), the start is refused naming the programs — with the
+  NVIDIA driver an unbind of a GPU in use hangs. libvirt/QEMU VFIO errors
+  get a readable hint.
+- Start errors mentioning Venus get a hint to go back to OpenGL.
+- I18n: 30 new Spanish strings.
+
+### Verified (lab: real libvirtd 12.2 + QEMU 10.2.4 TCG, headless sway + Quickshell 0.3.2, throwaway VMs)
+
+- `gl3d venus` → `gpu3d /dev/dri/renderD128` → `virsh domxml-to-native`:
+  QEMU gets `virtio-vga-gl` with `"blob":true,"hostmem":4294967296,
+  "venus":true`, `memory-backend-memfd … "share":true` and
+  `egl-headless,rendernode=…`. This QEMU lists `blob`, `hostmem`, `venus` for
+  `virtio-vga-gl`. nixpkgs' virglrenderer 1.3.0 is built with
+  `-Dvenus=true`.
+- VRAM: a throwaway VM defined AND started with qxl 16 and 64 MiB, vga
+  256 MiB, vmvga 32 MiB, bochs 64 MiB; virtio refused with the message.
+  From the UI: QXL 64 MiB on the Windows 11 VM → `ram='131072'
+  vram='65536' vgamem='65536'`.
+- Passthrough with a fake sysfs tree (`VEXYON_PCI_SYS`, iGPU + NVIDIA with
+  HDMI audio and a PCIe bridge in its group + AMD sharing its group with an
+  NVMe): iGPU "display, not offered", NVIDIA offered, AMD refused naming
+  the NVMe; "Pass to this VM" → two hostdevs (functions .0 and .1); Remove
+  → none. The pre-start guard (same script, fake tree): with a process
+  holding the GPU's render node the start is refused naming it; with the
+  process gone it goes ahead.
+- Venus from the UI → metadata `gl="venus" hostmem="4096" blob="on"`, blob
+  forced on and "no window" greyed out. Windows VM → the Windows 3D note.
+- Spanish strings checked (0 missing); shared files byte-identical;
+  `nix build .#vexyon-shell` OK. The NixOS module did not change in this
+  phase (no new package: QEMU's virglrenderer already has Venus on NixOS).
+
+### Not verified
+
+- Any real 3D: no GPU in this lab (no render node). virgl/Venus rendering,
+  blob and hostmem with a real guest, and Venus with the NVIDIA driver, need
+  the owner's tower or laptop.
+- Real VFIO passthrough (detach, guest driver, reattach) and the IOMMU
+  groups of the owner's machines; the guard only sees this user's
+  processes (a root service holding the GPU is reported by libvirt's own
+  error).
+- Whether Arch's virglrenderer is built with Venus (Arch's servers were not
+  reachable from here); if not, a Venus start fails with the hint to go
+  back to OpenGL.
+
 ## Session (VM manager, phase 2): guest tools without manual steps; clipboard and files said as they are
 
 ### Why

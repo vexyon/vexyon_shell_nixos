@@ -91,7 +91,8 @@ Singleton {
     property var detail: ({
         disks: [], nics: [], ctrls: [], video: null, cpu: null, boot: [],
         chans: [], fs: [], usbdevs: [], graphics: null, redir: 0,
-        desc: "", title: "", firmware: "bios", sound: "", tpm: null
+        desc: "", title: "", firmware: "bios", sound: "", tpm: null,
+        pcidevs: [], gl3d: { mode: "virgl", hostmem: "0", blob: "off" }
     })
     // ¿tiene el canal del agente SPICE? Sin él NO hay portapapeles compartido
     // ni redimensionado automático del invitado, por mucho que el invitado
@@ -455,6 +456,12 @@ Singleton {
         // errores de QEMU/libvirt traducidos a lo que el usuario puede hacer.
         if (t.indexOf("@@SAVED") !== -1)
             return I18n.t("This VM has a saved state. Start it normally (or discard the saved state) before starting it with 3D acceleration.");
+        if (t.indexOf("@@GPUBUSY") !== -1)
+            return I18n.t("The GPU passed to this VM is in use on this computer, so it cannot be handed over. Close these programs first:") + " " + t.split("\t")[1];
+        if (t.indexOf("venus") !== -1)
+            return t + "\n\n" + I18n.t("Vulkan (Venus) needs a virglrenderer built with Venus and a Vulkan driver for that GPU on this computer. Choose OpenGL (virgl) in Display → 3D acceleration; it works without them.");
+        if (t.indexOf("vfio") !== -1 || t.indexOf("VFIO") !== -1 || t.indexOf("iommu") !== -1)
+            return t + "\n\n" + I18n.t("The GPU could not be handed to the VM. Check in Display → GPU passthrough that it is still free to pass (IOMMU on, its own IOMMU group) and that nothing on this computer is using it.");
         if (t.indexOf("egl: ") !== -1 || t.indexOf("render node") !== -1) {
             return t + "\n\n" + I18n.t("QEMU could not draw on that GPU. With the NVIDIA driver, libvirt must let QEMU open /dev/nvidia* (the Vexyon installer sets this up; re-run it, or rebuild on NixOS). A plain Start still works.");
         }
@@ -555,7 +562,24 @@ Singleton {
               "$V dumpxml --inactive " + q(name) + " | " + q(root.xmlBin) + " gpu3d " + q(root.dgpu.render) +
               " | $V create /dev/stdin >/dev/null"
             : "$V start " + q(name) + " >/dev/null";
-        root.run("start", root._netsUp(name) + go + wait);
+        root.run("start", root._pciGuard(name) + root._netsUp(name) + go + wait);
+    }
+
+    //  Antes de arrancar una VM con una GPU en passthrough: si algún programa
+    //  de esta sesión tiene abierta esa GPU (su card/render node; con una sola
+    //  Nvidia, también /dev/nvidia*), libvirt no podría desatarla del driver
+    //  —con el driver de Nvidia la desconexión se queda colgada— así que no se
+    //  arranca y se dice quién la usa. Solo ve procesos propios: un servicio
+    //  de root que la use lo dirá el propio libvirt al fallar.
+    function _pciGuard(name) {
+        return "busy=; for a in $($V dumpxml --inactive " + q(name) + " 2>/dev/null | " + q(root.xmlBin) + " pci-list 2>/dev/null); do " +
+            "d=/sys/bus/pci/devices/$a; [ -d \"$d\" ] || continue; n=; " +
+            "for x in \"$d\"/drm/card* \"$d\"/drm/renderD*; do [ -e \"$x\" ] && n=\"$n /dev/dri/${x##*/}\"; done; " +
+            "if [ \"$(cat \"$d/vendor\")\" = 0x10de ] && [ \"$(grep -l 0x10de /sys/bus/pci/devices/*/vendor | while read -r f; do " +
+            "case \"$(cat \"${f%/vendor}/class\")\" in 0x03*) echo;; esac; done | wc -l)\" = 1 ]; then n=\"$n $(echo /dev/nvidia[0-9]*)\"; fi; " +
+            "for p in /proc/[0-9]*; do for f in \"$p\"/fd/*; do t=$(readlink \"$f\" 2>/dev/null) || continue; " +
+            "case \" $n \" in *\" $t \"*) busy=\"$busy $(cat \"$p/comm\" 2>/dev/null)\"; break;; esac; done; done; done; " +
+            "[ -n \"$busy\" ] && { printf '@@GPUBUSY\\t%s' \"$(echo $busy | tr ' ' '\\n' | sort -u | tr '\\n' ' ')\" >&2; exit 1; }; ";
     }
 
     //  Antes de arrancar, levantar las redes de libvirt que nombra la VM y
@@ -1252,6 +1276,78 @@ Singleton {
     // ---- ajustes por XML (todos config-only: piden reinicio) ----------------
     function setBootOrder(name, list) { root.run("boot", root.editXml(name, "boot " + q(list.join(",")))); }
     function setVideo(name, model, vram) { root.run("video", root.editXml(name, "video " + q(model) + " " + q("" + vram) + " 1")); }
+    //  Memoria de vídeo (MiB) de qxl, vga, vmvga y bochs. virtio-gpu no tiene:
+    //  dibuja en la RAM del invitado (la UI lo dice en vez de ofrecerla).
+    function setVram(name, mib) { root.run("video", root.editXml(name, "vram " + q("" + mib))); }
+    //  Ajustes de «Iniciar con aceleración 3D»: se guardan en los metadatos de
+    //  la VM y los aplica `gpu3d` en cada arranque 3D (la definición guardada
+    //  no cambia). mode: virgl | venus; hostmem en MiB (0 = sin ventana).
+    function setGl3d(name, mode, hostmem, blob) {
+        root.run("gl3d", root.editXml(name, "gl3d " + q(mode) + " " + q("" + hostmem) + " " + q(blob ? "on" : "off")));
+    }
+    //  Passthrough VFIO: todas las funciones de la GPU (vídeo y su audio HDMI)
+    //  van juntas; libvirt las desata del anfitrión al arrancar (managed).
+    function addPci(name, addrs) { root.run("pci", root.editXml(name, "pci-add " + addrs.map(q).join(" "))); }
+    function delPci(name, addrs) { root.run("pci", root.editXml(name, "pci-del " + addrs.map(q).join(" "))); }
+
+    // ---- GPUs del anfitrión para passthrough (VFIO) ---------------------------
+    //  Se lee al abrir la pestaña Pantalla, una vez: sin sondeo (una GPU no
+    //  aparece ni cambia de grupo IOMMU sin reiniciar). Solo lectura de /sys.
+    //  Por GPU: dirección, fabricante, nombre (lspci si está), driver,
+    //  boot_vga, render nodes, las funciones de su mismo slot dentro de su
+    //  grupo IOMMU (lo que hay que pasar junto) y los OTROS dispositivos del
+    //  grupo que no son puentes PCI (si hay alguno, pasarla se llevaría
+    //  también esos: no se ofrece).
+    property var pci: ({ probed: false, iommu: false, gpus: [] })
+    Process {
+        id: pciProbe
+        command: ["bash", "-c",
+            "S=${VEXYON_PCI_SYS:-/sys/bus/pci/devices}; io=0; " +
+            "[ -n \"$(ls -A /sys/class/iommu 2>/dev/null)\" ] && io=1; " +
+            "for d in \"$S\"/*; do c=$(cat \"$d/class\" 2>/dev/null); case \"$c\" in 0x03*) ;; *) continue ;; esac; " +
+            "a=${d##*/}; v=$(cat \"$d/vendor\" 2>/dev/null); drv=; [ -e \"$d/driver\" ] && drv=$(basename \"$(readlink -f \"$d/driver\")\"); " +
+            "bv=$(cat \"$d/boot_vga\" 2>/dev/null); rn=; for r in \"$d\"/drm/renderD*; do [ -e \"$r\" ] && rn=\"$rn /dev/dri/${r##*/}\"; done; " +
+            "nm=$(lspci -s \"$a\" 2>/dev/null | cut -d: -f3- | sed 's/^ *//'); " +
+            "fn=; ot=; g=; if [ -e \"$d/iommu_group\" ]; then io=1; g=$(basename \"$(readlink -f \"$d/iommu_group\")\"); " +
+            "for m in \"$d\"/iommu_group/devices/*; do ma=${m##*/}; " +
+            "if [ \"${ma%.*}\" = \"${a%.*}\" ]; then fn=\"$fn $ma\"; continue; fi; " +
+            "case \"$(cat \"$m/class\" 2>/dev/null)\" in 0x0604*) ;; *) ot=\"$ot $ma\" ;; esac; done; fi; " +
+            "printf 'GPU\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \"$a\" \"$v\" \"$drv\" \"$bv\" \"$g\" \"${rn# }\" \"${fn# }\" \"${ot# }\" \"$nm\"; done; " +
+            "echo \"IOMMU\t$io\""]
+        stdout: StdioCollector {
+            onStreamFinished: {
+                var r = { probed: true, iommu: false, gpus: [] };
+                var lines = this.text.split("\n");
+                for (var i = 0; i < lines.length; i++) {
+                    var f = lines[i].split("\t");
+                    if (f[0] === "IOMMU") r.iommu = f[1] === "1";
+                    else if (f[0] === "GPU" && f.length >= 10)
+                        r.gpus.push({ addr: f[1], vendor: f[2], driver: f[3], bootVga: f[4] === "1",
+                                      group: f[5], renders: f[6] === "" ? [] : f[6].split(" "),
+                                      funcs: f[7] === "" ? [f[1]] : f[7].split(" "),
+                                      others: f[8] === "" ? [] : f[8].split(" "), name: f[9] });
+                }
+                root.pci = r;
+            }
+        }
+    }
+    function probePci() { if (root.enabled && !pciProbe.running) pciProbe.running = true; }
+    //  ¿Se puede pasar esta GPU a una VM? "" si sí; si no, el motivo (clave
+    //  de I18n). Reglas, de más a menos grave:
+    //   * una sola GPU: pasarla dejaría este equipo sin pantalla — nunca;
+    //   * sin IOMMU (VT-d / AMD-Vi apagado en el firmware) no hay VFIO;
+    //   * la GPU con la que arrancó el firmware (boot_vga) es la de la
+    //     pantalla de este equipo, y la que dibuja la sesión cuando es la
+    //     dGPU (`dgpu.state` main) tampoco;
+    //   * un grupo IOMMU compartido con otros dispositivos se los llevaría.
+    function pciWhyNot(g) {
+        if (root.pci.gpus.length < 2) return "single";
+        if (!root.pci.iommu || g.group === "") return "noiommu";
+        if (g.bootVga) return "display";
+        if (root.dgpu.state === "main" && root.dgpu.render !== "" && g.renders.indexOf(root.dgpu.render) !== -1) return "display";
+        if (g.others.length > 0) return "group";
+        return "";
+    }
     function setCpuTopology(name, sockets, cores, threads) {
         root.run("cpu-topology", root.editXml(name, "cpu " + sockets + " " + cores + " " + threads));
     }
@@ -2519,7 +2615,8 @@ Singleton {
     function parseDetail(text) {
         var d = { disks: [], nics: [], ctrls: [], video: null, cpu: null, boot: [],
                   chans: [], fs: [], usbdevs: [], graphics: null, redir: 0,
-                  desc: "", title: "", firmware: "bios", sound: "", tpm: null, os: "" };
+                  desc: "", title: "", firmware: "bios", sound: "", tpm: null, os: "",
+                  pcidevs: [], gl3d: { mode: "virgl", hostmem: "0", blob: "off" } };
         var sizes = {};
         var lines = text.split("\n");
         for (var i = 0; i < lines.length; i++) {
@@ -2550,7 +2647,10 @@ Singleton {
                 if (d._addrs[am].indexOf(f[2]) === -1) d._addrs[am].push(f[2]);
                 break;
             case "@@CTRL":  d.ctrls.push({ type: f[1], index: f[2], model: f[3] }); break;
-            case "@@VIDEO": d.video = { model: f[1], vram: parseInt(f[2], 10) || 0, heads: f[3] }; break;
+            case "@@VIDEO": d.video = { model: f[1], vram: parseInt(f[2], 10) || 0, heads: f[3],
+                                        vgamem: parseInt(f[4], 10) || 0 }; break;
+            case "@@PCIDEV": d.pcidevs.push(f[1]); break;
+            case "@@GL3D":  d.gl3d = { mode: f[1], hostmem: f[2], blob: f[3] }; break;
             case "@@CPU":   d.cpu = { sockets: f[1], cores: f[2], threads: f[3], mode: f[4] }; break;
             case "@@BOOT":  d.boot.push(f[1]); break;
             case "@@FIRMWARE": d.firmware = f[1] === "efi" ? "uefi" : "bios"; break;

@@ -10,6 +10,21 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
 
 ### Changed
 
+- **VM graphics (phase 3).** Display → 3D acceleration sets, per Linux VM,
+  what "Start with 3D acceleration" uses: OpenGL through virgl, or OpenGL +
+  Vulkan through Venus (experimental), with blob resources and a host
+  memory window (1–8 GiB) in its advanced options; still a one-off start
+  that leaves the saved VM untouched. Windows guests are told plainly that
+  there is no 3D for them here (the experimental viogpu3d/Triton driver
+  needs a patched host library and test-signed drivers) and pointed to GPU
+  passthrough. New GPU passthrough (VFIO) section: it lists the GPUs and
+  offers only one that does not drive this computer's display and has its
+  own IOMMU group, with its HDMI audio; with one GPU, or the IOMMU off, it
+  says why it is not offered. Before starting a VM with a passed GPU,
+  Vexyon checks that no program here holds it and names the ones that do.
+  Video memory can be set for QXL (16–64 MiB), VGA, VMware SVGA and Bochs
+  (up to 256 MiB); VMware SVGA and Bochs are new display choices.
+
 - **VM guest tools without manual steps (phase 2).** The guest tools disc
   (virtio-win 0.1.285: virtio drivers, QXL display driver, SPICE agent and
   QEMU guest agent in one `virtio-win-guest-tools.exe`) now ships with
