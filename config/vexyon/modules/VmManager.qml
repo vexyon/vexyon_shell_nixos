@@ -63,8 +63,11 @@ FloatingWindow {
     function pick(name) {
         vm.selected = name;
         vm.showDetail = true;
+        // El detalle SIEMPRE: la tarjeta de resumen de arriba (SO, disco, red)
+        // sale de él en todas las pestañas. Antes, con Instantáneas abierta,
+        // solo se leían las instantáneas y el resumen salía a medias.
+        Vm.loadDetail(name);
         if (vm.tab === "snapshots") Vm.snapshots_(name);
-        else Vm.loadDetail(name);
     }
 
     // ---- diálogo genérico de campos ---------------------------------------
@@ -1217,6 +1220,16 @@ FloatingWindow {
                                 enabled: vm.can3d && !Vm.busy && vm.sel && vm.sel.state === "shut off"
                                 onClicked: Vm.start(vm.selected, true)
                             }
+                            //  Grabar la VM = el grabador de pantalla de la shell
+                            //  (módulo «recorder»), en su paso «Ventana»: se elige la
+                            //  ventana de la VM. Nada nuevo corriendo.
+                            ActBtn {
+                                glyph: Icons.record; label: I18n.t("Record the VM window")
+                                tint: Theme.red
+                                visible: Modules.recorderOn && Vm.has.viewer
+                                enabled: vm.sel && vm.sel.state === "running"
+                                onClicked: Panels.recorder = true
+                            }
                             ActBtn {
                                 glyph: Icons.bars; label: I18n.t("Text console")
                                 tint: Theme.mauve
@@ -1424,6 +1437,19 @@ FloatingWindow {
                                                 function(v) {
                                                     if (v.name !== "" && Vm.validName(v.name) && !Vm.nameTaken(v.name))
                                                         Vm.cloneVm(vm.selected, v.name);
+                                                })
+                                        }
+                                        ActBtn {
+                                            glyph: Icons.copy; label: I18n.t("Linked clone")
+                                            enabled: !Vm.busy && !vm.running
+                                                     && Vm.detail.disks.filter(function(d) { return d.device === "disk"; }).length === 1
+                                            onClicked: vm.ask2(I18n.t("Linked clone of this VM"),
+                                                I18n.t("The clone does not copy the disk: it keeps only what changes, so it takes seconds and almost no space. This VM's current disk becomes a frozen base shared by both, and each VM writes to its own difference disk. Needs the VM off, one disk and no snapshots."),
+                                                [ { key: "name", label: I18n.t("Name for the clone"), value: vm.selected + "-linked" } ],
+                                                I18n.t("Linked clone"),
+                                                function(v) {
+                                                    if (v.name !== "" && Vm.validName(v.name) && !Vm.nameTaken(v.name))
+                                                        Vm.linkedCloneVm(vm.selected, v.name);
                                                 })
                                         }
                                         ActBtn {
@@ -1749,6 +1775,7 @@ FloatingWindow {
                                             border.width: 1; border.color: Theme.overlay0
                                             ColumnLayout {
                                                 id: dkCol
+                                                readonly property var disk: modelData
                                                 anchors.left: parent.left; anchors.right: parent.right
                                                 anchors.verticalCenter: parent.verticalCenter
                                                 anchors.leftMargin: 12; anchors.rightMargin: 12
@@ -1797,6 +1824,77 @@ FloatingWindow {
                                                             I18n.t("The disk is detached AND its image file is erased from disk. Everything stored on it is lost. This cannot be undone."),
                                                             I18n.t("Delete image"), true,
                                                             function() { Vm.detachAndDeleteDisk(vm.selected, modelData.target, modelData.path); })
+                                                    }
+                                                }
+                                                //  Herramientas de disco: solo para imágenes del pool de
+                                                //  Vexyon (/var/lib/libvirt/images), que es lo que libvirt
+                                                //  puede convertir y descargar sin root.
+                                                Fold {
+                                                    title: I18n.t("Disk tools")
+                                                    visible: modelData.path.indexOf("/var/lib/libvirt/images/") === 0
+                                                    Flow {
+                                                        Layout.fillWidth: true
+                                                        spacing: 6
+                                                        ActBtn {
+                                                            glyph: Icons.plus; label: I18n.t("Enlarge…")
+                                                            enabled: !Vm.busy
+                                                            onClicked: vm.ask2(I18n.t("Enlarge this disk"),
+                                                                I18n.t("Only bigger: a disk is never shrunk, and not while the VM has snapshots. Inside the guest, grow the partition afterwards (Windows: Disk Management → Extend volume; Linux: growpart and resize2fs, or your desktop's disk tool)."),
+                                                                [ { key: "gb", label: I18n.t("New size (GiB)"),
+                                                                    value: "" + (Math.ceil(modelData.capacity / 1073741824) + 10) } ],
+                                                                I18n.t("Enlarge"),
+                                                                function(v) {
+                                                                    var g = parseInt(v.gb, 10);
+                                                                    if (g > modelData.capacity / 1073741824) Vm.growDisk(vm.selected, modelData.target, modelData.path, g);
+                                                                })
+                                                        }
+                                                        ActBtn {
+                                                            glyph: Icons.archive; label: I18n.t("Compact")
+                                                            visible: modelData.format === "qcow2"
+                                                            enabled: !Vm.busy && !vm.running
+                                                            onClicked: vm.ask(I18n.t("Compact this disk?"),
+                                                                I18n.t("Makes a new copy of the disk without its unused space and switches the VM to it; the old file is deleted only after that worked. A linked clone's disk becomes independent of its base. Needs the VM off and no snapshots. To free more, zero the free space inside the guest first."),
+                                                                I18n.t("Compact"), false,
+                                                                function() { Vm.convertDisk(vm.selected, modelData.target, modelData.path, "qcow2"); })
+                                                        }
+                                                        ActBtn {
+                                                            glyph: Icons.copy
+                                                            label: modelData.format === "raw" ? I18n.t("Convert to qcow2") : I18n.t("Convert to raw")
+                                                            enabled: !Vm.busy && !vm.running && (modelData.format === "raw" || modelData.format === "qcow2")
+                                                            onClicked: {
+                                                                var to = modelData.format === "raw" ? "qcow2" : "raw";
+                                                                vm.ask(I18n.t("Convert this disk?"),
+                                                                    I18n.t("Makes a copy in the other format and switches the VM to it; the old file is deleted only after that worked. qcow2 allows snapshots and grows as it fills; raw is a plain image, slightly faster, the full size on disk. Needs the VM off and no snapshots."),
+                                                                    I18n.t("Convert"), false,
+                                                                    function() { Vm.convertDisk(vm.selected, modelData.target, modelData.path, to); });
+                                                            }
+                                                        }
+                                                    }
+                                                    Text {
+                                                        text: I18n.t("Export a copy for another program"); color: Theme.subtext0
+                                                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
+                                                    }
+                                                    Flow {
+                                                        Layout.fillWidth: true
+                                                        spacing: 6
+                                                        Repeater {
+                                                            model: [ { f: "vdi", l: "VDI (VirtualBox)" }, { f: "vmdk", l: "VMDK (VMware)" },
+                                                                     { f: "qcow2", l: "qcow2" }, { f: "raw", l: "raw" } ]
+                                                            delegate: ActBtn {
+                                                                required property var modelData
+                                                                glyph: Icons.download; label: modelData.l
+                                                                enabled: !Vm.busy && !vm.running
+                                                                onClicked: {
+                                                                    var dk = dkCol.disk, fmt = modelData.f;
+                                                                    vm.ask2(I18n.t("Export a copy of this disk"),
+                                                                        I18n.t("A copy in that format, saved as your own file. The VM and its disk do not change. Needs the VM off."),
+                                                                        [ { key: "path", label: I18n.t("Save as"),
+                                                                            value: Quickshell.env("HOME") + "/" + vm.selected + "-" + dk.target + "." + fmt } ],
+                                                                        I18n.t("Export"),
+                                                                        function(v) { if (v.path !== "") Vm.exportDisk(vm.selected, dk.path, fmt, v.path); });
+                                                                }
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
@@ -2666,6 +2764,7 @@ Fold {
                                         tone: "warn"
                                         text: I18n.t("While a device is passed through it belongs to the VM and stops working on this computer. Do not pass through the keyboard or mouse you are using.")
                                     }
+                                    Note { text: I18n.t("A device added here works like a VirtualBox USB filter: it is matched by vendor and product, on any port, and taken by the VM at each start if it is plugged in; if it is not, the VM starts without it. Plugged in later, attach it again here or from the VM window's USB menu.") }
                                     Repeater {
                                         model: Vm.detail.usbdevs
                                         delegate: RowLayout {
@@ -2855,24 +2954,42 @@ Fold {
 
                                     Repeater {
                                         model: Vm.snapshots
+                                        //  Árbol: cada instantánea sangrada bajo su padre
+                                        //  (orden topológico de libvirt), y la actual
+                                        //  —desde la que sigue la VM— con su marca.
                                         delegate: Rectangle {
                                             required property var modelData
                                             Layout.fillWidth: true
+                                            Layout.leftMargin: Math.min(modelData.depth, 8) * 24
                                             implicitHeight: snapCol.implicitHeight + 16
                                             radius: Theme.radius
                                             color: Theme.surface0
-                                            border.width: 1; border.color: Theme.overlay0
+                                            border.width: 1; border.color: modelData.current ? Theme.accent : Theme.overlay0
                                             ColumnLayout {
                                                 id: snapCol
                                                 anchors.left: parent.left; anchors.right: parent.right
                                                 anchors.verticalCenter: parent.verticalCenter
                                                 anchors.leftMargin: 12; anchors.rightMargin: 12
                                                 spacing: 6
-                                                Text {
+                                                RowLayout {
                                                     Layout.fillWidth: true
-                                                    text: modelData.name; color: Theme.text
-                                                    font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1
-                                                    font.bold: true; elide: Text.ElideRight
+                                                    spacing: 8
+                                                    Text {
+                                                        visible: modelData.depth > 0
+                                                        text: "└"; color: Theme.overlay2
+                                                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1
+                                                    }
+                                                    Text {
+                                                        Layout.fillWidth: true
+                                                        text: modelData.name; color: Theme.text
+                                                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1
+                                                        font.bold: true; elide: Text.ElideRight
+                                                    }
+                                                    Text {
+                                                        visible: modelData.current
+                                                        text: I18n.t("Current state comes from here"); color: Theme.accent
+                                                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
+                                                    }
                                                 }
                                                 Text {
                                                     Layout.fillWidth: true

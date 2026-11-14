@@ -3489,6 +3489,24 @@ FloatingWindow {
                                 + "oifname \"virbr*\" ct state established,related accept"
                         }
 
+                        // ---------- lo que no se puede ----------
+                        //  Dicho aquí de una vez, como pide la política: nada de
+                        //  prometer lo que SPICE/libvirt/el hardware no hacen.
+                        SsHeader { text: I18n.t("WHAT VMs CANNOT DO HERE") }
+                        Text {
+                            Layout.fillWidth: true
+                            text: "• " + I18n.t("Seamless mode (guest windows mixed with this desktop's): SPICE has no such mode. The VM runs in its own window or full screen.")
+                                + "\n• " + I18n.t("Copying files with Ctrl+C / Ctrl+V: the SPICE clipboard carries text and images. Files go in by dragging them onto the VM window, a shared folder (Linux guests) or a WebDAV share.")
+                                + "\n• " + I18n.t("3D in Windows guests through virtio-gpu: no stable driver exists. Only GPU passthrough of a second GPU gives Windows 3D.")
+                                + "\n• " + I18n.t("GPU passthrough with a single GPU: this computer would lose its display.")
+                                + "\n• " + I18n.t("Bridged networking over Wi-Fi, and this computer reaching its own bridged VMs (a macvtap limit): use Private NAT with port forwarding.")
+                                + "\n• " + I18n.t("A USB device plugged in while the VM runs is not attached by itself: attach it in Ports and USB, or from the VM window's USB menu.")
+                            color: Theme.subtext0
+                            wrapMode: Text.Wrap
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontSize - 2
+                        }
+
                         // ---------- atajos ----------
                         SsHeader { text: I18n.t("OPEN") }
                         Text {

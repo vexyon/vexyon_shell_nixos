@@ -10,6 +10,22 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
 
 ### Changed
 
+- **VM extras (phase 4, first part).** Snapshots show as a tree, with the
+  one the current state comes from marked. Linked clones: seconds and
+  almost no space — the VM's disk becomes a frozen base and both VMs get
+  their own difference disk (refused, with the reason, if the VM is on, has
+  more than one disk or has snapshots). Storage → Disk tools: enlarge (only
+  bigger, also while running), compact, convert qcow2 ↔ raw (a new copy;
+  the old file is deleted only after the VM uses the new one, and never
+  while anything else uses it, a linked clone's base included), and export
+  a copy as VDI, VMDK, qcow2 or raw to your own folder. USB devices given
+  to a VM are kept as filters that do not block the start when the device
+  is missing. "Record the VM window" opens the screen recorder. Settings →
+  Virtualization says what VMs cannot do here (seamless mode, file
+  copy-paste, Windows 3D, single-GPU passthrough, Wi-Fi bridging, USB
+  hot-plug). Fixed: with the Snapshots tab open, picking another VM left
+  its summary card half empty.
+
 - **VM graphics (phase 3).** Display → 3D acceleration sets, per Linux VM,
   what "Start with 3D acceleration" uses: OpenGL through virgl, or OpenGL +
   Vulkan through Venus (experimental), with blob resources and a host

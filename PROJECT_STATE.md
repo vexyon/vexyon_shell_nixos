@@ -20,6 +20,104 @@ VEXYON OUT-OF-THE-BOX POLICY Every Vexyon feature must ship together with all re
 
 PERMANENT POLICY: If Vexyon's installation changes, its GitHub README.md MUST be updated in the same development task. No exceptions.
 
+## Session (VM manager, phase 4, first part): snapshot tree, linked clones, disk tools, USB filters, recording, the limits said in Settings
+
+### Why
+
+Phase 4 of the owner's VM-manager request: snapshot tree, linked clones,
+VM groups, serial ports, recording, USB passthrough with filters, disk
+management (resize, convert qcow2/raw/vdi, compact), and saying in Settings
+what cannot be done (seamless mode with SPICE). This commit is the first
+part; groups, serial ports and USB hot-plug auto-redirection are left for
+the next one (see "Not done yet").
+
+### What changed (`services/Vm.qml`, `modules/VmManager.qml`, `modules/Settings.qml`, `bin/vexyon-vm-xml`, `services/I18n.qml`, shared)
+
+- **Snapshot tree**: `snapshot-list --parent --topological` (+
+  `snapshot-current --name`), depth computed in one pass; children
+  indented under their parent, the current one outlined and marked "Current
+  state comes from here".
+- **Linked clone** (General → Linked clone): the VM's disk is frozen as a
+  base and two qcow2 difference disks are created on it with
+  `vol-create-as --backing-vol` (one for the clone, one the original
+  switches to with the new `vexyon-vm-xml disk-repath`), then the clone is
+  defined (`clone`: new UUID, MAC, UEFI vars). Writing to a base would
+  corrupt its clones, which is why the original gets its own difference
+  disk too. Refused, with the reason, when the VM is on, has more than one
+  disk, has snapshots (they live inside the base) or its disk is outside
+  /var/lib/libvirt/images. Every failure step removes what it created.
+- **Disk tools** (Storage, a fold per disk in Vexyon's pool), all through
+  libvirt (the images are root:root; no `qemu-img` from the shell):
+  - Enlarge: `blockresize` running, `vol-resize` off; never shrinks (no
+    `--shrink`); refused with snapshots (qcow2 cannot resize then). The
+    dialog says how to grow the partition inside Windows/Linux.
+  - Compact / Convert qcow2 ↔ raw: `vol-create-from` (a new copy; compacting
+    drops unused clusters, a linked clone's disk becomes independent), the
+    VM switched to it, and only then the old file deleted — and not at all
+    if another VM uses it or any volume has it as its BASE (checked in the
+    backing chains: `domblklist` does not show bases). VM off, no
+    snapshots (a copy does not carry internal snapshots).
+  - Export a copy as VDI, VMDK, qcow2 or raw: `vol-create-from` into a
+    temporary volume, `vol-download --sparse` into the user's file (never
+    over an existing one), the temporary volume deleted. The VM does not
+    change.
+- **USB filters**: `usb-add` now writes `<source startupPolicy='optional'>`:
+  matched by vendor and product on any port, taken at each start if
+  present, and the VM starts without it if not. The Ports and USB section
+  says so, and that a device plugged in while running must be attached
+  again (no watcher daemon).
+- **Record the VM window**: a button (only with the recorder module on and
+  virt-viewer present) that opens the shell's screen recorder picker,
+  whose Window step records the VM's window. No new recording code.
+- **Settings → Virtualization → What VMs cannot do here**: seamless mode
+  (SPICE has none), Ctrl+C/Ctrl+V of files, virtio-gpu 3D in Windows,
+  single-GPU passthrough, Wi-Fi bridging and host → own bridged VM, USB
+  hot-plug auto-attach.
+- **Bug fixed** (from the UI step): with the Snapshots tab open, picking
+  another VM loaded only its snapshots, so the summary card lost OS, disk
+  and network. The detail is always loaded now.
+- I18n: 35 new Spanish strings.
+
+### Verified (lab: real libvirtd 12.2 + QEMU 10.2.4 TCG, headless sway + Quickshell 0.3.2, throwaway `vxt-*` VMs)
+
+- Tree: s1 → s2, revert to s1 → s3: s1 at the root, s2 and s3 indented,
+  s3 marked current; the summary card full on that tab after the fix.
+- Linked clone from the UI: refused on a VM with snapshots (message,
+  nothing created); on the Windows 11 test VM → two difference disks over
+  `vxt-win.qcow2`, original switched to its own, clone with a new UUID,
+  MAC and UEFI vars; BOTH started at the same time (CPU model switched to
+  qemu64 by hand for TCG — lab only).
+- Compact from the UI on that VM's difference disk → a standalone file (no
+  backing), the VM on it, the old difference disk deleted, the base kept
+  (the clone still uses it). The "used elsewhere" check, run on its own:
+  base → in use (backing of the clone), each VM's disk → in use for anyone
+  else and free only for its owner.
+- Export VDI from the UI → `qemu-img info`: vdi, 20 GiB virtual, sparse;
+  no temporary volume left. Enlarge 20 → 30 GiB from the UI → 30 GiB.
+  Convert to raw from the UI → `<driver type='raw'>` on a new `.raw`, old
+  qcow2 deleted, the VM starts.
+- `startupPolicy='optional'` accepted by libvirt 12.2.
+- Spanish strings checked (0 missing); shared files byte-identical; no
+  QML warnings from the VM manager.
+
+### Not verified
+
+- A USB filter's VM actually starting without its device: this container
+  has no `/sys/bus/usb`, so libvirt cannot even enumerate USB here.
+- "Record the VM window": the recorder's Window step needs Hyprland (the
+  lab runs sway); the button only opens that picker.
+- Real guests: growing the partition inside Windows/Linux after Enlarge,
+  and performance of raw vs qcow2.
+
+### Not done yet (next part of phase 4, in this order)
+
+1. VM groups in the list (VirtualBox-style), stored per VM.
+2. Serial ports: list/add (pty, TCP, log file) beyond the text console.
+3. USB hot-plug filters through the display window
+   (`remote-viewer --spice-usbredir-auto-redirect-filter`), no daemon.
+4. From phase 2: unattended installation (Windows `autounattend.xml`,
+   cloud-init) — needs real ISOs and KVM to test.
+
 ## Session (VM manager, phase 3): graphics — virgl/Venus settings, VRAM, GPU passthrough, Windows 3D said as it is
 
 ### Why

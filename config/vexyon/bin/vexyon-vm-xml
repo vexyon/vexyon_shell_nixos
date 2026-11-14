@@ -663,7 +663,9 @@ def cmd_usb_add(root, argv):
     dev = devices(root)
     hd = ET.SubElement(dev, "hostdev",
                        {"mode": "subsystem", "type": "usb", "managed": "yes"})
-    s = ET.SubElement(hd, "source")
+    # Filtro por fabricante y producto, en cualquier puerto. `optional`: si al
+    # arrancar no está enchufado, la VM arranca sin él en vez de fallar.
+    s = ET.SubElement(hd, "source", {"startupPolicy": "optional"})
     ET.SubElement(s, "vendor", {"id": ven})
     ET.SubElement(s, "product", {"id": pro})
     return root
@@ -1070,6 +1072,36 @@ def cmd_rename(root, argv):
     return root
 
 
+def cmd_disk_repath(root, argv):
+    """disk-repath <target> <ruta-nueva> <formato> — el disco <target> pasa a
+    ser ese fichero (tras convertir/compactar, o el disco diferencial de un
+    clon enlazado)."""
+    target, path, fmt = argv[0], argv[1], argv[2]
+    if fmt not in ("qcow2", "raw"):
+        die("formato no válido para el disco de una VM: %s" % fmt)
+    for dsk in devices(root).findall("disk"):
+        t = dsk.find("target")
+        if t is None or t.get("dev") != target:
+            continue
+        s = dsk.find("source")
+        if s is None:
+            s = ET.SubElement(dsk, "source")
+        for attr in ("dev", "dir", "volume", "pool"):
+            s.attrib.pop(attr, None)
+        s.set("file", path)
+        dsk.set("type", "file")
+        drv = dsk.find("driver")
+        if drv is None:
+            drv = ET.SubElement(dsk, "driver", {"name": "qemu"})
+        drv.set("type", fmt)
+        # una cadena de respaldo escrita a mano ya no vale: libvirt la vuelve
+        # a leer de la cabecera del fichero nuevo
+        for bs in dsk.findall("backingStore"):
+            dsk.remove(bs)
+        return root
+    die("no hay ningún disco %s" % target)
+
+
 def cmd_clone(root, argv):
     """clone <nombre-nuevo> [viejo=nuevo ...] — copia lista para `define`.
 
@@ -1145,6 +1177,7 @@ COMMANDS = {
     "pci-add": cmd_pci_add,
     "pci-del": cmd_pci_del,
     "pci-list": cmd_pci_list,
+    "disk-repath": cmd_disk_repath,
     "webdav": cmd_webdav,
     "filetransfer": cmd_filetransfer,
     "firmware": cmd_firmware,

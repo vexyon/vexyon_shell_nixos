@@ -380,13 +380,18 @@ Singleton {
     // en esta tabla, así que además sale gratis: una llamada en vez de N+1.
     //   " snapA   2026-08-20 21:22:01 +0200   running"
     //   $1 = nombre, $NF = estado, lo de en medio = fecha (lleva espacios).
+    //  Árbol: `--parent` añade la columna del padre y `--topological` saca a
+    //  cada padre antes que sus hijos, así que la profundidad se calcula en
+    //  una pasada. La fecha son SIEMPRE tres campos ("2026-08-20 21:22:01
+    //  +0200"); el padre falta en las raíces. La actual (donde está la VM
+    //  ahora, el «Estado actual» de VirtualBox) viene de `snapshot-current`.
     function snapshots_(name) {
         if (!root.enabled || !name) return;
         root.snapshotsOf = name;
         snapLister.command = ["bash", "-c", root.sh +
-            "$V snapshot-list " + q(name) + " 2>/dev/null | tail -n +3 | " +
-            "awk 'NF { n=$1; st=$NF; c=\"\"; for (i=2; i<NF; i++) c = c (c==\"\" ? \"\" : \" \") $i; " +
-            "printf \"%s\\t%s\\t%s\\n\", n, c, st }'"];
+            "$V snapshot-list " + q(name) + " --parent --topological 2>/dev/null | tail -n +3 | " +
+            "awk 'NF { printf \"%s\\t%s %s %s\\t%s\\t%s\\n\", $1, $2, $3, $4, $5, $6 }'; " +
+            "printf '@@CUR\\t%s\\n' \"$($V snapshot-current " + q(name) + " --name 2>/dev/null)\""];
         snapLister.running = true;
     }
 
@@ -456,6 +461,14 @@ Singleton {
         // errores de QEMU/libvirt traducidos a lo que el usuario puede hacer.
         if (t.indexOf("@@SAVED") !== -1)
             return I18n.t("This VM has a saved state. Start it normally (or discard the saved state) before starting it with 3D acceleration.");
+        if (t.indexOf("@@HASSNAP") !== -1)
+            return I18n.t("This VM has snapshots. They live inside its disk file, so this cannot be done without losing them. Delete its snapshots first, or make a full clone.");
+        if (t.indexOf("@@NOTOFF") !== -1)
+            return I18n.t("Shut the VM down first.");
+        if (t.indexOf("@@NOTPOOL") !== -1)
+            return I18n.t("Only disks in /var/lib/libvirt/images (the ones Vexyon creates) can be managed here.");
+        if (t.indexOf("@@EXISTS") !== -1)
+            return I18n.t("A file with that name already exists. Choose another name.");
         if (t.indexOf("@@GPUBUSY") !== -1)
             return I18n.t("The GPU passed to this VM is in use on this computer, so it cannot be handed over. Close these programs first:") + " " + t.split("\t")[1];
         if (t.indexOf("venus") !== -1)
@@ -799,6 +812,98 @@ Singleton {
             "  || { echo 'el disco se ha desenchufado, pero el fichero no se pudo borrar' >&2; exit 1; }");
     }
     function baseName(p) { var a = String(p).split("/"); return a[a.length - 1]; }
+
+    // ---- herramientas de disco (agrandar, convertir, compactar, exportar) ---
+    //  Todo por libvirt: las imágenes son root:root en /var/lib/libvirt/images
+    //  y la shell no puede abrirlas con qemu-img. `vol-create-from` hace por
+    //  dentro un `qemu-img convert` (convertir y compactar son lo mismo: una
+    //  copia nueva sin los clústeres vacíos). Solo discos de ese pool.
+    function _volGuard(path) {
+        return "case " + q(path) + " in /var/lib/libvirt/images/*) ;; *) echo @@NOTPOOL >&2; exit 1;; esac; ";
+    }
+    function _offGuard(name) {
+        return "[ \"$($V domstate " + q(name) + " 2>/dev/null)\" = 'shut off' ] || { echo @@NOTOFF >&2; exit 1; }; ";
+    }
+    //  Las instantáneas internas viven DENTRO del qcow2: una copia (convert)
+    //  no las lleva, y en un clon enlazado la base quedaría con ellas.
+    function _noSnapGuard(name) {
+        return "[ -n \"$($V snapshot-list " + q(name) + " --name 2>/dev/null | tr -d '[:space:]')\" ] && { echo @@HASSNAP >&2; exit 1; }; ";
+    }
+    //  ¿Usa este fichero alguien más? Otra VM como disco, o un volumen como
+    //  BASE (clon enlazado: el disco diferencial lo nombra en su cabecera, y
+    //  `domblklist` no lo enseña). Si sí, no se borra. Sale con 0 = en uso.
+    function _usedElsewhere(name, path) {
+        return "{ for d in $($V list --all --name 2>/dev/null); do [ \"$d\" = " + q(name) + " ] && continue; " +
+               "$V domblklist --inactive \"$d\" 2>/dev/null | awk 'NR>2 {print $2}' | grep -qxF " + q(path) + " && exit 0; done; " +
+               "for v in $($V vol-list default 2>/dev/null | awk 'NR>2 && NF {print $1}'); do " +
+               "$V vol-dumpxml --pool default \"$v\" 2>/dev/null | sed -n '/<backingStore>/,/<\\/backingStore>/p' | " +
+               "grep -qF " + q("<path>" + path + "</path>") + " && exit 0; done; exit 1; }";
+    }
+    //  Agrandar. Nunca encoger: sin --shrink libvirt se niega a reducir. Con
+    //  la VM encendida, blockresize (el invitado ve el disco más grande al
+    //  momento); dentro hay que agrandar la partición, y la UI lo dice. qcow2
+    //  se niega a cambiar de tamaño con instantáneas internas dentro.
+    function growDisk(name, target, path, gb) {
+        root.run("disk-grow", root._volGuard(path) + root._noSnapGuard(name) +
+            "if [ \"$($V domstate " + q(name) + " 2>/dev/null)\" = running ]; then " +
+              "$V blockresize " + q(name) + " " + q(target) + " " + Math.floor(gb) + "G >/dev/null; " +
+            "else $V vol-resize --pool default " + q(root.baseName(path)) + " " + Math.floor(gb) + "G >/dev/null; fi");
+    }
+    //  Convertir (qcow2 / raw) o compactar (qcow2 → qcow2): copia NUEVA, la VM
+    //  pasa a usarla, y SOLO ENTONCES se borra la vieja (y solo si nada más la
+    //  usa). Si algo falla antes, la VM sigue con su disco de siempre. Un
+    //  disco de clon enlazado sale independiente (la copia lee toda la cadena).
+    function convertDisk(name, target, path, fmt) {
+        var base = root.baseName(path);
+        var stem = base.replace(/\.(qcow2|raw|img|vdi|vmdk)$/, "").replace(/-[0-9]{14}$/, "");
+        var ext = fmt === "raw" ? "raw" : "qcow2";
+        root.run("disk-convert", root._volGuard(path) + root._offGuard(name) + root._noSnapGuard(name) +
+            "nv=" + q(stem) + "-$(date +%Y%m%d%H%M%S)." + ext + "; t=$(mktemp) || exit 1; " +
+            "printf '<volume><name>%s</name><capacity>0</capacity><target><format type=\"%s\"/></target></volume>' \"$nv\" " + q(fmt) + " > \"$t\"; " +
+            "$V vol-create-from default \"$t\" " + q(base) + " --inputpool default >/dev/null; rc=$?; rm -f \"$t\"; [ $rc -eq 0 ] || exit 1; " +
+            "$V dumpxml --inactive " + q(name) + " | " + q(root.xmlBin) + " disk-repath " + q(target) + " \"/var/lib/libvirt/images/$nv\" " + q(fmt) +
+              " | $V define /dev/stdin >/dev/null || { $V vol-delete --pool default \"$nv\" >/dev/null 2>&1; exit 1; }; " +
+            "( " + root._usedElsewhere(name, path) + " ) || $V vol-delete --pool default " + q(base) + " >/dev/null");
+    }
+    //  Exportar una COPIA (qcow2, raw, VDI de VirtualBox, VMDK de VMware) a
+    //  una carpeta del usuario: se hace en el pool y se descarga con
+    //  vol-download, que la deja como fichero del usuario. La VM no cambia.
+    function exportDisk(name, path, fmt, rawDest) {
+        var dest = root.expandPath(rawDest);
+        root.run("disk-export", root._volGuard(path) + root._offGuard(name) +
+            "[ -e " + q(dest) + " ] && { echo @@EXISTS >&2; exit 1; }; mkdir -p \"$(dirname " + q(dest) + ")\" || exit 1; " +
+            "nv=vexyon-export-$$-$(date +%s)." + q(fmt) + "; t=$(mktemp) || exit 1; " +
+            "printf '<volume><name>%s</name><capacity>0</capacity><target><format type=\"%s\"/></target></volume>' \"$nv\" " + q(fmt) + " > \"$t\"; " +
+            "$V vol-create-from default \"$t\" " + q(root.baseName(path)) + " --inputpool default >/dev/null; rc=$?; rm -f \"$t\"; [ $rc -eq 0 ] || exit 1; " +
+            "$V vol-download --pool default \"$nv\" " + q(dest) + " --sparse; rc=$?; " +
+            "$V vol-delete --pool default \"$nv\" >/dev/null 2>&1; exit $rc");
+    }
+
+    // ---- clon enlazado --------------------------------------------------------
+    //  Como el de VirtualBox: el clon no copia el disco, guarda solo lo que
+    //  cambia. El disco actual de la original se CONGELA como base y las dos
+    //  VMs reciben un disco diferencial (qcow2 con esa base): así la original
+    //  sigue funcionando sin estropear al clon (escribir en una base rompe a
+    //  todos sus clones). Solo con la VM apagada, un disco y sin instantáneas
+    //  (vivirían en la base). Borrar una de las dos no toca la base.
+    function linkedCloneVm(name, newName) {
+        var src = "", target = "";
+        for (var i = 0; i < root.detail.disks.length; i++)
+            if (root.detail.disks[i].device === "disk") { src = root.detail.disks[i].path; target = root.detail.disks[i].target; break; }
+        var base = root.baseName(src);
+        var stem = base.replace(/\.(qcow2|raw|img)$/, "").replace(/-[0-9]{14}$/, "");
+        root.run("clone-linked", root._volGuard(src) + root._offGuard(name) + root._noSnapGuard(name) +
+            "cap=$($V vol-info --pool default " + q(base) + " --bytes 2>/dev/null | awk '/^Capacity:/ {print $2}'); [ -n \"$cap\" ] || exit 1; " +
+            "fmt=$($V vol-dumpxml --pool default " + q(base) + " | sed -n \"s/.*<format type='\\([a-z0-9]*\\)'.*/\\1/p\" | head -1); " +
+            "nv=" + q(newName + ".qcow2") + "; ov=" + q(stem) + "-$(date +%Y%m%d%H%M%S).qcow2; " +
+            "$V vol-create-as default \"$nv\" \"${cap}b\" --format qcow2 --backing-vol " + q(base) + " --backing-vol-format \"$fmt\" >/dev/null || exit 1; " +
+            "$V vol-create-as default \"$ov\" \"${cap}b\" --format qcow2 --backing-vol " + q(base) + " --backing-vol-format \"$fmt\" >/dev/null " +
+              "|| { $V vol-delete --pool default \"$nv\" >/dev/null 2>&1; exit 1; }; " +
+            "$V dumpxml --inactive " + q(name) + " | " + q(root.xmlBin) + " disk-repath " + q(target) + " \"/var/lib/libvirt/images/$ov\" qcow2 " +
+              "| $V define /dev/stdin >/dev/null || { $V vol-delete --pool default \"$nv\"; $V vol-delete --pool default \"$ov\"; exit 1; } >/dev/null 2>&1; " +
+            "$V dumpxml --inactive " + q(name) + " | " + q(root.xmlBin) + " clone " + q(newName) +
+              " \"/var/lib/libvirt/images/$ov=/var/lib/libvirt/images/$nv\" | $V define /dev/stdin >/dev/null");
+    }
 
     // ---- CD / DVD ----------------------------------------------------------
     //  ⚠️ `--eject` necesita `--force` cuando el invitado tiene la bandeja
@@ -2591,12 +2696,17 @@ Singleton {
         id: snapLister
         stdout: StdioCollector {
             onStreamFinished: {
-                var out = [], ls = this.text.split("\n");
+                var out = [], ls = this.text.split("\n"), depth = {}, cur = "";
                 for (var i = 0; i < ls.length; i++) {
                     if (ls[i].trim() === "") continue;
                     var f = ls[i].split("\t");
-                    out.push({ name: f[0], created: f[1] || "", state: f[2] || "" });
+                    if (f[0] === "@@CUR") { cur = f[1] || ""; continue; }
+                    var parent = f[3] || "";
+                    depth[f[0]] = parent !== "" && depth[parent] !== undefined ? depth[parent] + 1 : 0;
+                    out.push({ name: f[0], created: f[1] || "", state: f[2] || "", parent: parent,
+                               depth: depth[f[0]] });
                 }
+                for (var j = 0; j < out.length; j++) out[j].current = out[j].name === cur;
                 root.snapshots = out;
             }
         }
