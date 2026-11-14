@@ -20,6 +20,81 @@ VEXYON OUT-OF-THE-BOX POLICY Every Vexyon feature must ship together with all re
 
 PERMANENT POLICY: If Vexyon's installation changes, its GitHub README.md MUST be updated in the same development task. No exceptions.
 
+## Session (VM manager, UI): reorganized like VirtualBox, with an expert mode — no capability removed
+
+### Why
+
+The owner: too much information at once. Wanted: the VM list on the left,
+a clean summary on the right (state, OS, RAM, CPU, disk, network) with the
+main buttons (start, pause, shut down, console); a simple creation wizard
+with an "Advanced" button; per-VM settings in VirtualBox-like sections
+(General, System, Display, Storage, Network, Ports/USB, Shared folders,
+Snapshots), basics first and a fold "Advanced options"; the technical bits
+(IP, MAC, adapter model, disk format/bus/cache, libvirt XML, QEMU command
+line) in an expert mode, without leaving for a terminal. Before/after
+screenshots from the lab.
+
+### What changed (`modules/VmManager.qml`, `services/Vm.qml`, `bin/vexyon-vm-xml`, shared)
+
+- **Summary card** at the top of a VM: name, state chip, and chips for OS
+  (new: `<metadata><vexyon:vm os="…"/>` written at creation, libosinfo's id
+  read for VMs made by virt-manager/virt-install; `vexyon-vm-xml info` emits
+  `@@OS`), RAM, CPU, disk (sum of disk capacities), network (first adapter's
+  mode + IP).
+- **Main buttons**: Start/Resume, Pause, Shut down, Open display (or the text
+  console without virt-viewer). A quieter second row: Start with 3D, Text
+  console, Force off, Hard reset (still confirmed).
+- **Sections**: General (old Overview), System, Display, Storage, Network,
+  Ports and USB, Shared folders, Snapshots. The old "Devices" tab was split
+  (Display + clipboard/auto-resize → Display; audio + USB → Ports and USB;
+  shared folders → Shared folders; TPM → System's advanced fold). "Host
+  networks" is a header button with "Back to the VM" (it is not per VM).
+- **Folds**: new `Fold` component. System: CPU topology, firmware, boot order
+  and TPM; Storage: controllers; Network: card model, MAC, IPs, other
+  network/host bridge (phase 1). Closed by default, open in expert mode.
+- **Expert mode** (header switch, `shell.json vm.expert`): every fold open,
+  and General shows the saved libvirt XML in an editable box (Apply asks
+  first; the shell refuses an XML whose `<name>` or `<uuid>` differs from the
+  VM's — a `define` with another name would create a second VM; libvirt
+  validates the rest and its error is shown) and the QEMU command line
+  (`virsh domxml-to-native qemu-argv`, loaded separately with a 30 s limit
+  because libvirt can take long preparing the domain's networks — the XML
+  shows at once). Copy buttons. The XML travels base64-encoded by an own
+  UTF-8 encoder: `Qt.btoa(string)` is deprecated in Qt 6 and its output is
+  not the web's base64 (the first test got a corrupted XML).
+- **Creation wizard**: name, OS, ISO, RAM, CPU, disk, network (NAT by
+  default; Bridged; Private NAT; No network). "Advanced": firmware, TPM 2.0
+  toggle (forced on for Windows 11), chipset Q35/i440FX, disk bus
+  (automatic/virtio/SATA/virtio-SCSI/IDE), card model (automatic/
+  virtio-net/e1000e/rtl8139), other libvirt networks. `domainXml` honours
+  them (passt `<interface type='user'>` for Private NAT, `vexyon-lan` for
+  Bridged, made at first start).
+- **Bug fixed** (pre-existing): after creating a VM the window selected it
+  without loading its detail, so the tabs showed the previously selected
+  VM's hardware. Now `pick()`.
+- `vexyon-lan` in Host networks says Vexyon makes it and remakes it.
+- I18n: 30 new Spanish strings; 2 dead keys removed.
+
+### Verified (lab: headless sway, Quickshell 0.3.2, real libvirtd 12.2 with throwaway VMs)
+
+- Screenshots before (`/tmp/claude-0/shots/before/`: overview, system,
+  network, host networks) and after (`…/after/`: summary, system with the
+  fold open, display, storage, ports, shared folders, creation wizard,
+  host networks, Spanish). No QML warnings.
+- Wizard → a VM defined with the vexyon:vm metadata, i440FX, virtio disk and
+  a passt adapter; then selected with its summary (OS Linux · 2 GiB ·
+  2 vCPU · 20 GiB · NAT). (Lab-only patch: `type='qemu'`, no KVM here.)
+- Expert: XML shown at once; Apply with a memory change → the domain's
+  memory changed; Apply with another `<name>` → refused with the message,
+  no second VM; the same check refuses another `<uuid>` (run in bash).
+- Every section opened; expert switch persisted in shell.json.
+
+### Not verified
+
+- The narrow (< 760 px) layout of the new header and summary.
+- Real Windows/Linux guests; disk format/bus/cache editing is not new in
+  this step (the storage section kept what it had; more in phase 4).
+
 ## Session (VM manager, phase 1): networking — Bridged without setup, Private NAT with port forwarding, Docker and a closed firewall together
 
 ### Why

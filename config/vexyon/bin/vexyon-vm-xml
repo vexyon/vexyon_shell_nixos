@@ -97,6 +97,20 @@ def cmd_info(root, argv):
             be.get("type", "") if be is not None else "",
             ";".join(pf_specs(nic)))
 
+    # Sistema del invitado, para el resumen: el que apunta Vexyon al crear
+    # (<vexyon:vm os="…"/>) o el de libosinfo (virt-manager, virt-install).
+    os_kind = ""
+    md = root.find("metadata")
+    if md is not None:
+        for el in md.iter():
+            tag = el.tag.split("}")[-1]
+            if tag == "vm" and el.get("os"):
+                os_kind = el.get("os")
+                break
+            if tag == "os" and el.get("id") and not os_kind:
+                os_kind = el.get("id")
+    rec("@@OS", os_kind)
+
     for c in dev.findall("controller"):
         rec("@@CTRL", c.get("type", ""), c.get("index", ""), c.get("model", ""))
 

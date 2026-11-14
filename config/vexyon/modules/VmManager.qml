@@ -52,7 +52,8 @@ FloatingWindow {
     // en modo estrecho: false = se ve la lista, true = se ve el detalle
     property bool showDetail: false
     // pestaña del detalle
-    property string tab: "overview"
+    property string tab: "general"
+    property string prevTab: "general"
 
     readonly property var sel: {
         for (var i = 0; i < Vm.vms.length; i++) if (Vm.vms[i].name === vm.selected) return Vm.vms[i];
@@ -142,6 +143,32 @@ FloatingWindow {
     //  virtio, que en Windows es un adaptador sin driver.
     property string newNicModel: "virtio"
     property string newNicMode: "nat"
+    //  Resumen de la VM elegida: SO, RAM, CPU, disco y red, en chips.
+    readonly property var summaryChips: {
+        if (!vm.sel) return [];
+        var c = [];
+        var os = Vm.detailOf === vm.selected ? Vm.osLabel(Vm.detail.os) : "";
+        if (os !== "") c.push({ g: Icons.desktop, l: I18n.t("OS"), v: os });
+        c.push({ g: Icons.server, l: "RAM", v: vm.fmtMem(vm.sel.maxMemKib) });
+        c.push({ g: Icons.microchip, l: "CPU", v: vm.sel.vcpus + " vCPU" });
+        if (Vm.detailOf === vm.selected) {
+            var disks = Vm.detail.disks, gb = 0, n = 0;
+            for (var i = 0; i < disks.length; i++)
+                if (disks[i].device === "disk") { n++; gb += (disks[i].capacity || 0) / 1073741824; }
+            if (n > 0) c.push({ g: Icons.drive, l: I18n.t("Disk"), v: (gb >= 10 ? Math.round(gb) : Math.round(gb * 10) / 10) + " GiB" + (n > 1 ? " (" + n + ")" : "") });
+            var nics = Vm.detail.nics;
+            if (nics.length > 0) {
+                var m = vm.nicModeOf(nics[0]);
+                var lbl = m === "nat" ? I18n.t("NAT") : m === "bridged" ? I18n.t("Bridged")
+                        : m === "private" ? I18n.t("Private NAT") : nics[0].source;
+                c.push({ g: Icons.ethernet, l: I18n.t("Network"), v: lbl + (nics[0].addrs.length ? " · " + nics[0].addrs[0].split("/")[0] : "")
+                         + (nics.length > 1 ? " (+" + (nics.length - 1) + ")" : "") });
+            } else c.push({ g: Icons.noNetwork, l: I18n.t("Network"), v: I18n.t("none") });
+        }
+        return c;
+    }
+    // System → «Opciones avanzadas» abierto: el TPM va en él.
+    readonly property bool sysAdvOpen: sysFold.open
     readonly property bool hasDefaultNet: {
         for (var i = 0; i < Vm.networks.length; i++)
             if (Vm.networks[i].name === Vm.protectedNet) return true;
@@ -189,7 +216,7 @@ FloatingWindow {
         if (vm.selected === "") return;
         if (vm.tab === "snapshots") Vm.snapshots_(vm.selected);
         else Vm.loadDetail(vm.selected);
-        if (vm.tab === "devices") Vm.loadHostUsb();
+        if (vm.tab === "ports") Vm.loadHostUsb();
     }
 
     //  Mientras esta ventana está abierta, el servicio escucha los eventos de
@@ -262,7 +289,9 @@ FloatingWindow {
             }
         }
         function onActionDone(action, ok) {
-            if (ok && action === "create") { vm.creating = false; vm.selected = vm.newName; }
+            //  pick(), no solo `selected`: sin loadDetail las pestañas seguían
+            //  enseñando el hardware de la VM que estaba elegida antes.
+            if (ok && action === "create") { vm.creating = false; vm.pick(vm.newName); }
             // Tras renombrar, la VM vieja ya no existe: soltar la selección para
             // que onRefreshed elija la primera y no se quede apuntando a un
             // nombre muerto.
@@ -676,6 +705,34 @@ FloatingWindow {
                         text: I18n.t("Working…"); color: Theme.subtext0
                         font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
                     }
+                    //  Modo experto: abre de entrada todos los «Opciones
+                    //  avanzadas» y enseña el XML y la línea de QEMU.
+                    Rectangle {
+                        implicitWidth: exRow.implicitWidth + 16; implicitHeight: 28
+                        radius: Theme.radius
+                        color: vm.expert ? Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.2)
+                                         : (exMa.containsMouse ? Theme.surface1 : "transparent")
+                        border.width: 1; border.color: vm.expert ? Theme.accent : Theme.overlay0
+                        RowLayout {
+                            id: exRow
+                            anchors.centerIn: parent
+                            spacing: 6
+                            Text { text: Icons.sliders; color: vm.expert ? Theme.accent : Theme.subtext0; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2 }
+                            Text { text: I18n.t("Expert mode"); color: vm.expert ? Theme.text : Theme.subtext0; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2 }
+                        }
+                        MouseArea { id: exMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: vm.setExpert(!vm.expert) }
+                    }
+                    //  Redes de libvirt del anfitrión: no son de ninguna VM.
+                    IconButton {
+                        icon: Icons.ethernet
+                        iconColor: vm.tab === "networks" ? Theme.accent : Theme.text
+                        onClicked: {
+                            if (vm.tab === "networks") { vm.tab = vm.prevTab; return; }
+                            vm.prevTab = vm.tab;
+                            vm.tab = "networks";
+                            if (vm.narrow) vm.showDetail = true;
+                        }
+                    }
                     IconButton {
                         icon: Icons.plus
                         iconColor: Theme.accent
@@ -1011,7 +1068,7 @@ FloatingWindow {
                     // sin selección (solo puede pasar en ancho)
                     Text {
                         anchors.centerIn: parent
-                        visible: vm.sel === null
+                        visible: vm.sel === null && vm.tab !== "networks"
                         text: I18n.t("Select a virtual machine")
                         color: Theme.overlay2
                         font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize
@@ -1021,22 +1078,126 @@ FloatingWindow {
                         anchors.fill: parent
                         anchors.margins: 14
                         spacing: 12
-                        visible: vm.sel !== null
+                        visible: vm.sel !== null || vm.tab === "networks"
 
-                        // ---- barra de acciones: Flow, no Row ----
+                        // ---- resumen limpio de la VM (lo primero que se ve) ----
+                        Rectangle {
+                            Layout.fillWidth: true
+                            visible: vm.tab !== "networks"
+                            implicitHeight: sumCol.implicitHeight + 22
+                            radius: Theme.radius + 2
+                            color: Theme.surface0
+                            border.width: 1; border.color: Theme.overlay0
+                            ColumnLayout {
+                                id: sumCol
+                                anchors.left: parent.left; anchors.right: parent.right
+                                anchors.top: parent.top; anchors.margins: 11
+                                spacing: 8
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 10
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: vm.selected
+                                        color: Theme.text; elide: Text.ElideRight
+                                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize + 3; font.bold: true
+                                    }
+                                    Rectangle {
+                                        implicitWidth: stTxt.implicitWidth + 18; implicitHeight: 24
+                                        radius: 12
+                                        color: !vm.sel ? Theme.surface1
+                                             : vm.sel.state === "running" ? Qt.rgba(Theme.green.r, Theme.green.g, Theme.green.b, 0.18)
+                                             : vm.sel.state === "paused" ? Qt.rgba(Theme.yellow.r, Theme.yellow.g, Theme.yellow.b, 0.18)
+                                             : Theme.surface1
+                                        Text {
+                                            id: stTxt
+                                            anchors.centerIn: parent
+                                            text: vm.sel ? vm.stateLabel(vm.sel.state) : ""
+                                            color: !vm.sel ? Theme.subtext0 : vm.sel.state === "running" ? Theme.green
+                                                 : vm.sel.state === "paused" ? Theme.yellow : Theme.subtext0
+                                            font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2; font.bold: true
+                                        }
+                                    }
+                                }
+                                Flow {
+                                    Layout.fillWidth: true
+                                    spacing: 8
+                                    Repeater {
+                                        model: vm.summaryChips
+                                        delegate: Rectangle {
+                                            required property var modelData
+                                            implicitWidth: chRow.implicitWidth + 18; implicitHeight: 28
+                                            radius: Theme.radius
+                                            color: Theme.surface1
+                                            RowLayout {
+                                                id: chRow
+                                                anchors.centerIn: parent
+                                                spacing: 6
+                                                Text { text: modelData.g; color: Theme.accent; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2 }
+                                                Text { text: modelData.l; color: Theme.subtext0; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3 }
+                                                Text { text: modelData.v; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2; font.bold: true }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---- botones principales ----
                         Flow {
                             Layout.fillWidth: true
+                            visible: vm.tab !== "networks"
                             spacing: 6
-
                             ActBtn {
                                 glyph: Icons.play; label: I18n.t("Start")
                                 tint: Theme.green
+                                visible: !vm.sel || vm.sel.state !== "paused"
                                 enabled: !Vm.busy && vm.sel && vm.sel.state === "shut off"
                                 onClicked: Vm.start(vm.selected)
                             }
+                            ActBtn {
+                                glyph: Icons.play; label: I18n.t("Resume")
+                                tint: Theme.green
+                                visible: vm.sel && vm.sel.state === "paused"
+                                enabled: !Vm.busy
+                                onClicked: Vm.resume(vm.selected)
+                            }
+                            ActBtn {
+                                glyph: Icons.pause; label: I18n.t("Pause")
+                                tint: Theme.yellow
+                                enabled: !Vm.busy && vm.sel && vm.sel.state === "running"
+                                onClicked: Vm.suspend(vm.selected)
+                            }
+                            ActBtn {
+                                glyph: Icons.power; label: I18n.t("Shut down")
+                                enabled: !Vm.busy && vm.sel && (vm.sel.state === "running" || vm.sel.state === "paused")
+                                onClicked: Vm.shutdown(vm.selected)
+                            }
+                            //  La consola: la pantalla (virt-viewer) si está; si no,
+                            //  la de texto. Sin virt-viewer NO se rompe nada.
+                            ActBtn {
+                                glyph: Icons.desktop; label: I18n.t("Open display")
+                                tint: Theme.blue
+                                visible: Vm.has.viewer
+                                enabled: vm.sel && vm.sel.state !== "shut off"
+                                onClicked: Vm.openViewer(vm.selected)
+                            }
+                            ActBtn {
+                                glyph: Icons.bars; label: I18n.t("Text console")
+                                tint: Theme.mauve
+                                visible: !Vm.has.viewer
+                                enabled: vm.sel && vm.sel.state !== "shut off"
+                                onClicked: Vm.openConsole(vm.selected)
+                            }
+                        }
+                        // ---- el resto, más discreto ----
+                        Flow {
+                            Layout.fillWidth: true
+                            visible: vm.tab !== "networks"
+                            spacing: 6
                             // Aceleración 3D en la dGPU (híbrida) o en la GPU principal
                             // cuando ya es la dGPU (MUX, torre). Arranque transitorio:
-                            // la definición guardada no cambia (Vm.start).
+                            // la definición guardada de la VM no cambia.
                             ActBtn {
                                 glyph: Icons.play
                                 label: Vm.dgpu.state === "on" ? I18n.t("Start with 3D (dedicated GPU)")
@@ -1047,22 +1208,11 @@ FloatingWindow {
                                 onClicked: Vm.start(vm.selected, true)
                             }
                             ActBtn {
-                                glyph: Icons.pause; label: I18n.t("Pause")
-                                tint: Theme.yellow
-                                enabled: !Vm.busy && vm.sel && vm.sel.state === "running"
-                                onClicked: Vm.suspend(vm.selected)
-                            }
-                            ActBtn {
-                                glyph: Icons.play; label: I18n.t("Resume")
-                                tint: Theme.green
-                                visible: vm.sel && vm.sel.state === "paused"
-                                enabled: !Vm.busy
-                                onClicked: Vm.resume(vm.selected)
-                            }
-                            ActBtn {
-                                glyph: Icons.power; label: I18n.t("Shut down")
-                                enabled: !Vm.busy && vm.sel && (vm.sel.state === "running" || vm.sel.state === "paused")
-                                onClicked: Vm.shutdown(vm.selected)
+                                glyph: Icons.bars; label: I18n.t("Text console")
+                                tint: Theme.mauve
+                                visible: Vm.has.viewer
+                                enabled: vm.sel && vm.sel.state !== "shut off"
+                                onClicked: Vm.openConsole(vm.selected)
                             }
                             // ---- destructivas: SIEMPRE con confirmación ----
                             ActBtn {
@@ -1082,35 +1232,31 @@ FloatingWindow {
                                     I18n.t("Hard reset"), true, function() { Vm.reset_(vm.selected); })
                             }
                         }
-
-                        // ---- abrir la VM ----
-                        Flow {
-                            Layout.fillWidth: true
-                            spacing: 6
-                            ActBtn {
-                                glyph: Icons.desktop; label: I18n.t("Open display")
-                                tint: Theme.blue
-                                // Sin virt-viewer NO se rompe nada: el botón
-                                // desaparece y queda la consola de texto.
-                                visible: Vm.has.viewer
-                                enabled: vm.sel && vm.sel.state !== "shut off"
-                                onClicked: Vm.openViewer(vm.selected)
-                            }
-                            ActBtn {
-                                glyph: Icons.bars; label: I18n.t("Text console")
-                                tint: Theme.mauve
-                                enabled: vm.sel && vm.sel.state !== "shut off"
-                                onClicked: Vm.openConsole(vm.selected)
-                            }
-                        }
                         // Qué hace (y qué NO) la aceleración 3D, o por qué está gris.
                         Text {
                             Layout.fillWidth: true
-                            visible: Vm.dgpu.state !== "none" && Vm.has.viewer
+                            visible: vm.tab !== "networks" && Vm.dgpu.state !== "none" && Vm.has.viewer
                             text: vm.dgpuNote()
                             color: !vm.can3d ? Theme.yellow : Theme.subtext0
                             wrapMode: Text.Wrap
                             font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
+                        }
+                        // ---- redes del anfitrión: no son de una VM ----
+                        RowLayout {
+                            Layout.fillWidth: true
+                            visible: vm.tab === "networks"
+                            spacing: 10
+                            Text {
+                                Layout.fillWidth: true
+                                text: I18n.t("Host networks")
+                                color: Theme.text
+                                font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize + 2; font.bold: true
+                            }
+                            ActBtn {
+                                visible: vm.sel !== null
+                                glyph: Icons.back; label: I18n.t("Back to the VM")
+                                onClicked: vm.tab = vm.prevTab
+                            }
                         }
 
                         // ---- pestañas ----
@@ -1121,16 +1267,20 @@ FloatingWindow {
                             Layout.fillWidth: true
                             Layout.topMargin: 4
                             Layout.bottomMargin: 4
+                            visible: vm.tab !== "networks"
                             spacing: 8
                             Repeater {
+                                //  Las secciones de VirtualBox. Lo básico arriba en cada
+                                //  una y «Opciones avanzadas» plegado debajo.
                                 model: [
-                                    { k: "overview",  l: I18n.t("Overview") },
+                                    { k: "general",   l: I18n.t("General") },
                                     { k: "system",    l: I18n.t("System") },
+                                    { k: "display",   l: I18n.t("Display") },
                                     { k: "storage",   l: I18n.t("Storage") },
                                     { k: "network",   l: I18n.t("Network") },
-                                    { k: "devices",   l: I18n.t("Devices") },
-                                    { k: "snapshots", l: I18n.t("Snapshots") },
-                                    { k: "networks",  l: I18n.t("Host networks") }
+                                    { k: "ports",     l: I18n.t("Ports and USB") },
+                                    { k: "shared",    l: I18n.t("Shared folders") },
+                                    { k: "snapshots", l: I18n.t("Snapshots") }
                                 ]
                                 delegate: Rectangle {
                                     required property var modelData
@@ -1176,7 +1326,7 @@ FloatingWindow {
                                 // ======== resumen ========
                                 ColumnLayout {
                                     Layout.fillWidth: true
-                                    visible: vm.tab === "overview"
+                                    visible: vm.tab === "general"
                                     spacing: 8
                                     Repeater {
                                         model: vm.sel ? [
@@ -1303,6 +1453,99 @@ FloatingWindow {
                                             I18n.t("Removes the VM definition, its snapshots and its disk image. This cannot be undone."),
                                             I18n.t("Delete"), true, function() { Vm.remove(vm.selected, true); })
                                     }
+
+                                    // ---- experto: XML de libvirt y línea de QEMU ----
+                                    Fold {
+                                        id: xmlFold
+                                        title: I18n.t("Expert: libvirt XML and QEMU command line")
+                                        onOpenChanged: if (open && vm.selected !== "") Vm.loadExpert(vm.selected)
+                                        Component.onCompleted: if (open && vm.selected !== "") Vm.loadExpert(vm.selected)
+                                        Connections {
+                                            target: vm
+                                            function onSelectedChanged() { if (xmlFold.open && vm.selected !== "") Vm.loadExpert(vm.selected); }
+                                        }
+                                        Note {
+                                            text: I18n.t("The VM's saved definition, as libvirt keeps it. Editing it changes the VM directly: libvirt checks it when you apply, and the change takes effect at the next start.")
+                                        }
+                                        Rectangle {
+                                            Layout.fillWidth: true
+                                            implicitHeight: Math.min(420, xmlEdit.implicitHeight + 16)
+                                            radius: Theme.radius
+                                            color: Theme.mantle
+                                            border.width: 1; border.color: xmlEdit.activeFocus ? Theme.accent : Theme.overlay0
+                                            Flickable {
+                                                id: xmlFlick
+                                                anchors.fill: parent; anchors.margins: 8
+                                                contentWidth: width; contentHeight: xmlEdit.implicitHeight
+                                                clip: true; boundsBehavior: Flickable.StopAtBounds
+                                                TextEdit {
+                                                    id: xmlEdit
+                                                    width: xmlFlick.width
+                                                    text: Vm.expertOf === vm.selected ? Vm.expertXml : ""
+                                                    color: Theme.text
+                                                    font.family: "monospace"; font.pixelSize: Theme.fontSize - 3
+                                                    wrapMode: TextEdit.WrapAnywhere
+                                                    selectByMouse: true
+                                                    selectionColor: Theme.accent
+                                                    selectedTextColor: Theme.onAccent
+                                                }
+                                            }
+                                        }
+                                        Flow {
+                                            Layout.fillWidth: true
+                                            spacing: 6
+                                            ActBtn {
+                                                glyph: Icons.check; label: I18n.t("Apply XML"); tint: Theme.accent
+                                                enabled: !Vm.busy && xmlEdit.text !== "" && xmlEdit.text !== Vm.expertXml
+                                                onClicked: vm.ask(I18n.t("Apply the edited XML?"),
+                                                    I18n.t("This replaces the VM's definition with what you wrote. libvirt refuses it if it is not valid."),
+                                                    I18n.t("Apply"), false,
+                                                    function() { Vm.applyXml(vm.selected, xmlEdit.text); })
+                                            }
+                                            ActBtn {
+                                                glyph: Icons.refresh; label: I18n.t("Reload")
+                                                enabled: !Vm.busy
+                                                onClicked: { xmlEdit.text = ""; Vm.loadExpert(vm.selected); }
+                                            }
+                                            ActBtn {
+                                                glyph: Icons.clipboard; label: I18n.t("Copy XML")
+                                                onClicked: Quickshell.execDetached(["wl-copy", xmlEdit.text])
+                                            }
+                                        }
+                                        Text {
+                                            text: I18n.t("QEMU command line"); color: Theme.subtext1
+                                            font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2; font.bold: true
+                                        }
+                                        Rectangle {
+                                            Layout.fillWidth: true
+                                            implicitHeight: Math.min(260, qemuTxt.implicitHeight + 16)
+                                            radius: Theme.radius
+                                            color: Theme.mantle
+                                            border.width: 1; border.color: Theme.overlay0
+                                            Flickable {
+                                                anchors.fill: parent; anchors.margins: 8
+                                                contentWidth: width; contentHeight: qemuTxt.implicitHeight
+                                                clip: true; boundsBehavior: Flickable.StopAtBounds
+                                                TextEdit {
+                                                    id: qemuTxt
+                                                    width: parent.width
+                                                    readOnly: true
+                                                    text: Vm.expertOf !== vm.selected ? ""
+                                                          : (Vm.expertQemuBusy ? I18n.t("Generating…") : Vm.expertQemu)
+                                                    color: Theme.subtext1
+                                                    font.family: "monospace"; font.pixelSize: Theme.fontSize - 3
+                                                    wrapMode: TextEdit.WrapAnywhere
+                                                    selectByMouse: true
+                                                    selectionColor: Theme.accent
+                                                }
+                                            }
+                                        }
+                                        ActBtn {
+                                            glyph: Icons.clipboard; label: I18n.t("Copy command line")
+                                            enabled: !Vm.expertQemuBusy && Vm.expertQemu !== ""
+                                            onClicked: Quickshell.execDetached(["wl-copy", Vm.expertQemu])
+                                        }
+                                    }
                                 }
 
                                 // ======== sistema ========
@@ -1365,109 +1608,112 @@ FloatingWindow {
                                         }
                                     }
 
-                                    Sec { text: I18n.t("CPU TOPOLOGY") }
-                                    Note { text: I18n.t("Sockets × cores × threads must equal the vCPU count. Leave at 0 to let libvirt decide.") }
-                                    RowLayout {
-                                        Layout.fillWidth: true
-                                        spacing: 8
-                                        Field { id: topoS; label: I18n.t("Sockets"); numeric: true
-                                                placeholder: Vm.detail.cpu && Vm.detail.cpu.sockets !== "" ? Vm.detail.cpu.sockets : "0" }
-                                        Field { id: topoC; label: I18n.t("Cores"); numeric: true
-                                                placeholder: Vm.detail.cpu && Vm.detail.cpu.cores !== "" ? Vm.detail.cpu.cores : "0" }
-                                        Field { id: topoT; label: I18n.t("Threads"); numeric: true
-                                                placeholder: Vm.detail.cpu && Vm.detail.cpu.threads !== "" ? Vm.detail.cpu.threads : "0" }
-                                        ActBtn {
-                                            Layout.alignment: Qt.AlignBottom
-                                            Layout.bottomMargin: 12
-                                            glyph: Icons.check; label: I18n.t("Apply")
-                                            enabled: !Vm.busy
-                                            onClicked: Vm.setCpuTopology(vm.selected,
-                                                parseInt(topoS.text || "0", 10) || 0,
-                                                parseInt(topoC.text || "0", 10) || 0,
-                                                parseInt(topoT.text || "0", 10) || 0)
-                                        }
-                                    }
-
-                                    Sec { text: I18n.t("FIRMWARE") }
-                                    Segmented {
-                                        Layout.fillWidth: true
-                                        value: Vm.detail.firmware
-                                        options: [ { key: "bios", label: "BIOS" }, { key: "uefi", label: "UEFI" } ]
-                                        onPicked: function(k) {
-                                            if (k === Vm.detail.firmware) return;
-                                            vm.ask(I18n.t("Change firmware?"),
-                                                I18n.t("A guest installed under one firmware usually will not boot under the other. Only change this on a VM you have not installed yet."),
-                                                I18n.t("Change"), true, function() { Vm.setFirmware(vm.selected, k); });
-                                        }
-                                    }
-
-                                    Sec { text: I18n.t("BOOT ORDER") }
-                                    Note { text: I18n.t("The VM tries each entry in order. Use the arrows to reorder.") }
-                                    Repeater {
-                                        model: Vm.detail.boot
-                                        delegate: RowLayout {
-                                            required property var modelData
-                                            required property int index
+                                    Fold {
+                                        id: sysFold
+                                        Sec { text: I18n.t("CPU TOPOLOGY") }
+                                        Note { text: I18n.t("Sockets × cores × threads must equal the vCPU count. Leave at 0 to let libvirt decide.") }
+                                        RowLayout {
                                             Layout.fillWidth: true
                                             spacing: 8
-                                            Text {
-                                                Layout.preferredWidth: 20
-                                                text: (index + 1) + "."
-                                                color: Theme.subtext0
-                                                font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1
+                                            Field { id: topoS; label: I18n.t("Sockets"); numeric: true
+                                                    placeholder: Vm.detail.cpu && Vm.detail.cpu.sockets !== "" ? Vm.detail.cpu.sockets : "0" }
+                                            Field { id: topoC; label: I18n.t("Cores"); numeric: true
+                                                    placeholder: Vm.detail.cpu && Vm.detail.cpu.cores !== "" ? Vm.detail.cpu.cores : "0" }
+                                            Field { id: topoT; label: I18n.t("Threads"); numeric: true
+                                                    placeholder: Vm.detail.cpu && Vm.detail.cpu.threads !== "" ? Vm.detail.cpu.threads : "0" }
+                                            ActBtn {
+                                                Layout.alignment: Qt.AlignBottom
+                                                Layout.bottomMargin: 12
+                                                glyph: Icons.check; label: I18n.t("Apply")
+                                                enabled: !Vm.busy
+                                                onClicked: Vm.setCpuTopology(vm.selected,
+                                                    parseInt(topoS.text || "0", 10) || 0,
+                                                    parseInt(topoC.text || "0", 10) || 0,
+                                                    parseInt(topoT.text || "0", 10) || 0)
                                             }
-                                            Text {
+                                        }
+
+                                        Sec { text: I18n.t("FIRMWARE") }
+                                        Segmented {
+                                            Layout.fillWidth: true
+                                            value: Vm.detail.firmware
+                                            options: [ { key: "bios", label: "BIOS" }, { key: "uefi", label: "UEFI" } ]
+                                            onPicked: function(k) {
+                                                if (k === Vm.detail.firmware) return;
+                                                vm.ask(I18n.t("Change firmware?"),
+                                                    I18n.t("A guest installed under one firmware usually will not boot under the other. Only change this on a VM you have not installed yet."),
+                                                    I18n.t("Change"), true, function() { Vm.setFirmware(vm.selected, k); });
+                                            }
+                                        }
+
+                                        Sec { text: I18n.t("BOOT ORDER") }
+                                        Note { text: I18n.t("The VM tries each entry in order. Use the arrows to reorder.") }
+                                        Repeater {
+                                            model: Vm.detail.boot
+                                            delegate: RowLayout {
+                                                required property var modelData
+                                                required property int index
                                                 Layout.fillWidth: true
-                                                text: modelData === "hd" ? I18n.t("Hard disk")
-                                                    : modelData === "cdrom" ? I18n.t("Optical drive")
-                                                    : modelData === "network" ? I18n.t("Network (PXE)") : modelData
-                                                color: Theme.text
-                                                font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1
-                                            }
-                                            ActBtn {
-                                                glyph: Icons.arrowUp; enabled: !Vm.busy && index > 0
-                                                onClicked: {
-                                                    var l = Vm.detail.boot.slice();
-                                                    var t = l[index]; l[index] = l[index - 1]; l[index - 1] = t;
-                                                    Vm.setBootOrder(vm.selected, l);
+                                                spacing: 8
+                                                Text {
+                                                    Layout.preferredWidth: 20
+                                                    text: (index + 1) + "."
+                                                    color: Theme.subtext0
+                                                    font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1
                                                 }
-                                            }
-                                            ActBtn {
-                                                glyph: Icons.arrowDown
-                                                enabled: !Vm.busy && index < Vm.detail.boot.length - 1
-                                                onClicked: {
-                                                    var l = Vm.detail.boot.slice();
-                                                    var t = l[index]; l[index] = l[index + 1]; l[index + 1] = t;
-                                                    Vm.setBootOrder(vm.selected, l);
+                                                Text {
+                                                    Layout.fillWidth: true
+                                                    text: modelData === "hd" ? I18n.t("Hard disk")
+                                                        : modelData === "cdrom" ? I18n.t("Optical drive")
+                                                        : modelData === "network" ? I18n.t("Network (PXE)") : modelData
+                                                    color: Theme.text
+                                                    font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1
                                                 }
-                                            }
-                                            ActBtn {
-                                                glyph: Icons.close; danger: true; tint: Theme.red
-                                                enabled: !Vm.busy && Vm.detail.boot.length > 1
-                                                onClicked: {
-                                                    var l = Vm.detail.boot.slice();
-                                                    l.splice(index, 1);
-                                                    Vm.setBootOrder(vm.selected, l);
+                                                ActBtn {
+                                                    glyph: Icons.arrowUp; enabled: !Vm.busy && index > 0
+                                                    onClicked: {
+                                                        var l = Vm.detail.boot.slice();
+                                                        var t = l[index]; l[index] = l[index - 1]; l[index - 1] = t;
+                                                        Vm.setBootOrder(vm.selected, l);
+                                                    }
+                                                }
+                                                ActBtn {
+                                                    glyph: Icons.arrowDown
+                                                    enabled: !Vm.busy && index < Vm.detail.boot.length - 1
+                                                    onClicked: {
+                                                        var l = Vm.detail.boot.slice();
+                                                        var t = l[index]; l[index] = l[index + 1]; l[index + 1] = t;
+                                                        Vm.setBootOrder(vm.selected, l);
+                                                    }
+                                                }
+                                                ActBtn {
+                                                    glyph: Icons.close; danger: true; tint: Theme.red
+                                                    enabled: !Vm.busy && Vm.detail.boot.length > 1
+                                                    onClicked: {
+                                                        var l = Vm.detail.boot.slice();
+                                                        l.splice(index, 1);
+                                                        Vm.setBootOrder(vm.selected, l);
+                                                    }
                                                 }
                                             }
                                         }
-                                    }
-                                    Flow {
-                                        Layout.fillWidth: true
-                                        spacing: 6
-                                        Repeater {
-                                            model: [ { k: "hd", l: I18n.t("Hard disk") },
-                                                     { k: "cdrom", l: I18n.t("Optical drive") },
-                                                     { k: "network", l: I18n.t("Network (PXE)") } ]
-                                            delegate: ActBtn {
-                                                required property var modelData
-                                                glyph: Icons.plus
-                                                label: modelData.l
-                                                enabled: !Vm.busy && Vm.detail.boot.indexOf(modelData.k) === -1
-                                                onClicked: {
-                                                    var l = Vm.detail.boot.slice();
-                                                    l.push(modelData.k);
-                                                    Vm.setBootOrder(vm.selected, l);
+                                        Flow {
+                                            Layout.fillWidth: true
+                                            spacing: 6
+                                            Repeater {
+                                                model: [ { k: "hd", l: I18n.t("Hard disk") },
+                                                         { k: "cdrom", l: I18n.t("Optical drive") },
+                                                         { k: "network", l: I18n.t("Network (PXE)") } ]
+                                                delegate: ActBtn {
+                                                    required property var modelData
+                                                    glyph: Icons.plus
+                                                    label: modelData.l
+                                                    enabled: !Vm.busy && Vm.detail.boot.indexOf(modelData.k) === -1
+                                                    onClicked: {
+                                                        var l = Vm.detail.boot.slice();
+                                                        l.push(modelData.k);
+                                                        Vm.setBootOrder(vm.selected, l);
+                                                    }
                                                 }
                                             }
                                         }
@@ -1480,57 +1726,6 @@ FloatingWindow {
                                     visible: vm.tab === "storage"
                                     spacing: 10
 
-                                    Sec { text: I18n.t("CONTROLLERS") }
-                                    Flow {
-                                        Layout.fillWidth: true
-                                        spacing: 6
-                                        Repeater {
-                                            model: Vm.detail.ctrls.filter(function(c) { return c.type !== "pci" && c.type !== "usb"; })
-                                            delegate: Rectangle {
-                                                required property var modelData
-                                                implicitWidth: cTxt.implicitWidth + 20
-                                                implicitHeight: 26
-                                                radius: Theme.radius
-                                                color: Theme.surface0
-                                                border.width: 1; border.color: Theme.overlay0
-                                                Text {
-                                                    id: cTxt
-                                                    anchors.centerIn: parent
-                                                    text: modelData.type + (modelData.model !== "" ? " · " + modelData.model : "")
-                                                          + " #" + modelData.index
-                                                    color: Theme.subtext1
-                                                    font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Flow {
-                                        Layout.fillWidth: true
-                                        spacing: 6
-                                        ActBtn {
-                                            glyph: Icons.plus; label: I18n.t("Add virtio-SCSI controller")
-                                            enabled: !Vm.busy
-                                            onClicked: Vm.addController(vm.selected, "scsi", "virtio-scsi")
-                                        }
-                                    }
-
-                                    //  ⚠️ El "cargo el driver y sigue sin salir ningún
-                                    //  disco" tenía DOS mitades, y las dos se dicen aquí:
-                                    //
-                                    //   1. `virsh attach-disk --targetbus scsi` no declara
-                                    //      modelo y libvirt elegía **lsilogic**, para la
-                                    //      que ni Windows ni virtio-win tienen driver
-                                    //      (vioscsi solo se engancha a virtio-scsi). Eso ya
-                                    //      está arreglado: Vm.scsiGuard fuerza virtio-scsi
-                                    //      antes de enchufar cualquier disco SCSI.
-                                    //   2. virtio-blk y virtio-scsi NECESITAN el driver de
-                                    //      virtio-win, que NO viene en el ISO de Windows y
-                                    //      hay que descargar aparte. Sin él no hay nada que
-                                    //      cargar en "Cargar controlador", por mucho que se
-                                    //      abra esa pantalla. SATA no necesita nada.
-                                    Note {
-                                        text: I18n.t("Windows has no built-in driver for virtio or virtio-SCSI disks. Put the system disk on SATA and the installer sees it with no driver at all. To use virtio you must first download the separate virtio-win ISO, add it as a second optical drive here, and load vioscsi (or viostor) from it in the installer's \"Load driver\" screen — it is not on the Windows ISO.")
-                                    }
 
                                     Sec { text: I18n.t("DISKS") }
                                     Repeater {
@@ -1694,6 +1889,60 @@ FloatingWindow {
                                             I18n.t("Add"),
                                             function(v) { Vm.addCdrom(vm.selected, v.iso); })
                                     }
+
+Fold {
+                                        Sec { text: I18n.t("CONTROLLERS") }
+                                        Flow {
+                                            Layout.fillWidth: true
+                                            spacing: 6
+                                            Repeater {
+                                                model: Vm.detail.ctrls.filter(function(c) { return c.type !== "pci" && c.type !== "usb"; })
+                                                delegate: Rectangle {
+                                                    required property var modelData
+                                                    implicitWidth: cTxt.implicitWidth + 20
+                                                    implicitHeight: 26
+                                                    radius: Theme.radius
+                                                    color: Theme.surface0
+                                                    border.width: 1; border.color: Theme.overlay0
+                                                    Text {
+                                                        id: cTxt
+                                                        anchors.centerIn: parent
+                                                        text: modelData.type + (modelData.model !== "" ? " · " + modelData.model : "")
+                                                              + " #" + modelData.index
+                                                        color: Theme.subtext1
+                                                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Flow {
+                                            Layout.fillWidth: true
+                                            spacing: 6
+                                            ActBtn {
+                                                glyph: Icons.plus; label: I18n.t("Add virtio-SCSI controller")
+                                                enabled: !Vm.busy
+                                                onClicked: Vm.addController(vm.selected, "scsi", "virtio-scsi")
+                                            }
+                                        }
+
+                                        //  ⚠️ El "cargo el driver y sigue sin salir ningún
+                                        //  disco" tenía DOS mitades, y las dos se dicen aquí:
+                                        //
+                                        //   1. `virsh attach-disk --targetbus scsi` no declara
+                                        //      modelo y libvirt elegía **lsilogic**, para la
+                                        //      que ni Windows ni virtio-win tienen driver
+                                        //      (vioscsi solo se engancha a virtio-scsi). Eso ya
+                                        //      está arreglado: Vm.scsiGuard fuerza virtio-scsi
+                                        //      antes de enchufar cualquier disco SCSI.
+                                        //   2. virtio-blk y virtio-scsi NECESITAN el driver de
+                                        //      virtio-win, que NO viene en el ISO de Windows y
+                                        //      hay que descargar aparte. Sin él no hay nada que
+                                        //      cargar en "Cargar controlador", por mucho que se
+                                        //      abra esa pantalla. SATA no necesita nada.
+                                        Note {
+                                            text: I18n.t("Windows has no built-in driver for virtio or virtio-SCSI disks. Put the system disk on SATA and the installer sees it with no driver at all. To use virtio you must first download the separate virtio-win ISO, add it as a second optical drive here, and load vioscsi (or viostor) from it in the installer's \"Load driver\" screen — it is not on the Windows ISO.")
+                                        }
+}
                                 }
 
                                 // ======== red de la VM ========
@@ -2018,18 +2267,12 @@ FloatingWindow {
                                     }
                                 }
 
-                                // ======== dispositivos ========
+                                // ======== pantalla / puertos / TPM / carpetas (antes «Dispositivos») ========
                                 ColumnLayout {
                                     Layout.fillWidth: true
-                                    visible: vm.tab === "devices"
+                                    visible: vm.tab === "display"
                                     spacing: 10
 
-                                    // El inventario USB se relee al ENTRAR en la
-                                    // pestaña. `onTabChanged` de la ventana solo
-                                    // cubre los cambios de pestaña; esto cubre
-                                    // además el caso de que la pestaña ya fuera
-                                    // la activa al construirse la vista.
-                                    onVisibleChanged: if (visible) Vm.loadHostUsb()
 
                                     Sec { text: I18n.t("DISPLAY") }
                                     Segmented {
@@ -2058,6 +2301,11 @@ FloatingWindow {
                                         tone: "warn"
                                         text: I18n.t("Windows has no built-in driver for virtio-gpu — a Windows guest falls back to the basic adapter at a fixed resolution. Use QXL there.")
                                     }
+                                }
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    visible: vm.tab === "system" && vm.sysAdvOpen
+                                    spacing: 10
 
                                     //  ⚠️ EL TPM QUE FALTABA. Windows 11 aborta su
                                     //  comprobación de requisitos con "El equipo debe
@@ -2099,6 +2347,11 @@ FloatingWindow {
                                         tone: "warn"
                                         text: I18n.t("This VM has a TPM but is set to BIOS firmware. Windows 11 needs both, and it will still report the machine as unsupported until the firmware is UEFI.")
                                     }
+                                }
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    visible: vm.tab === "ports"
+                                    spacing: 10
 
                                     Sec { text: I18n.t("AUDIO") }
                                     Segmented {
@@ -2109,6 +2362,11 @@ FloatingWindow {
                                                    { key: "none", label: I18n.t("No sound card") } ]
                                         onPicked: function(k) { Vm.setSound(vm.selected, k); }
                                     }
+                                }
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    visible: vm.tab === "display"
+                                    spacing: 10
 
                                     Sec { text: I18n.t("CLIPBOARD AND AUTO-RESIZE") }
                                     RowLayout {
@@ -2201,6 +2459,18 @@ FloatingWindow {
                                     Note {
                                         text: I18n.t("Windows: install spice-guest-tools inside the guest. It is a separate download from the virtio-win ISO used for the disk and network drivers, and it also brings the QXL display driver.")
                                     }
+                                }
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    visible: vm.tab === "ports"
+                                    spacing: 10
+                                    // El inventario USB se relee al ENTRAR en la
+                                    // pestaña. `onTabChanged` de la ventana solo
+                                    // cubre los cambios de pestaña; esto cubre
+                                    // además el caso de que la pestaña ya fuera
+                                    // la activa al construirse la vista.
+                                    onVisibleChanged: if (visible) Vm.loadHostUsb()
+                                    Component.onCompleted: if (visible) Vm.loadHostUsb()
 
                                     Sec { text: I18n.t("USB PASSTHROUGH") }
                                     Note {
@@ -2260,6 +2530,11 @@ FloatingWindow {
                                             }
                                         }
                                     }
+                                }
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    visible: vm.tab === "shared"
+                                    spacing: 10
 
                                     Sec { text: I18n.t("SHARED FOLDERS") }
                                     Note {
@@ -2697,6 +2972,13 @@ FloatingWindow {
                                                         color: Theme.subtext0
                                                         font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
                                                     }
+                                                    Text {
+                                                        visible: modelData.name === Vm.lanNet
+                                                        Layout.fillWidth: true
+                                                        text: I18n.t("Made by Vexyon for Bridged adapters (macvtap on the wired card). If you delete it, it is made again when a bridged VM starts.")
+                                                        color: Theme.subtext0; wrapMode: Text.Wrap
+                                                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
+                                                    }
                                                 }
                                             }
                                         }
@@ -2713,6 +2995,7 @@ FloatingWindow {
         Rectangle {
             anchors.fill: parent
             visible: vm.creating
+            onVisibleChanged: if (visible) Vm.loadHostIfaces()
             color: "#000000aa"
             MouseArea { anchors.fill: parent; onClicked: vm.creating = false }
 
@@ -2758,35 +3041,14 @@ FloatingWindow {
                             font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
                         }
 
-                        // En estrecho se apilan; en ancho van en fila.
-                        GridLayout {
-                            Layout.fillWidth: true
-                            columns: createCol.width < 380 ? 1 : 3
-                            columnSpacing: 8
-                            rowSpacing: 8
-                            Field { id: cMem;  label: I18n.t("Memory (MiB)"); numeric: true; text: "2048" }
-                            Field { id: cCpu;  label: I18n.t("vCPUs");        numeric: true; text: "2" }
-                            Field { id: cDisk; label: I18n.t("Disk (GiB)");   numeric: true; text: "20" }
-                        }
-
-                        Text {
-                            Layout.fillWidth: true
-                            text: I18n.t("Boot ISO (optional)"); color: Theme.subtext0
-                            font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
-                        }
-                        Field { id: cIso; label: I18n.t("Path to an .iso file"); pick: "file"; pickKind: "iso"
-                                placeholder: Quickshell.env("HOME") + "/…/linux.iso" }
-
                         //  ⚠️ ESTE SELECTOR NO ES UNA ETIQUETA. De él salen la
                         //  controladora del disco, el modelo de la tarjeta de
                         //  red y si hay TPM — las tres cosas que hacían que una
                         //  VM de Windows creada aquí no viera su disco, no
                         //  tuviera red y no pasara de la pantalla de requisitos.
-                        //  Ver Vm.osDiskBus / osNicModel / osNeedsTpm.
-                        //
-                        //  Se rellena solo con el nombre de la ISO (`touched`
-                        //  deja de seguirlo en cuanto el usuario elige a mano,
-                        //  para no pisarle la elección si luego cambia la ISO).
+                        //  Ver Vm.osDiskBus / osNicModel / osNeedsTpm. Se rellena
+                        //  solo con el nombre de la ISO (`touched` deja de
+                        //  seguirlo en cuanto el usuario elige a mano).
                         Text {
                             Layout.fillWidth: true
                             text: I18n.t("Guest operating system"); color: Theme.subtext0
@@ -2808,52 +3070,18 @@ FloatingWindow {
                                 }
                             }
                         }
-                        Text {
-                            Layout.fillWidth: true
-                            visible: cOs.value !== "linux"
-                            text: cOs.value === "win11"
-                                  ? I18n.t("Windows 11: the disk goes on SATA and the network card is e1000e (Windows has no built-in virtio driver for either), plus a 2.0 TPM and UEFI, which its setup refuses to continue without.")
-                                  : I18n.t("Windows: the disk goes on SATA and the network card is e1000e. Windows has no built-in virtio driver for either, so with virtio the installer shows no disk and the guest gets no network.")
-                            color: Theme.subtext0; wrapMode: Text.Wrap
-                            font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
-                        }
-                        Text {
-                            Layout.fillWidth: true
-                            visible: cOs.value === "win11" && Vm.detected && !Vm.has.swtpm
-                            text: I18n.t("swtpm is missing on this computer, so the TPM cannot be emulated and the VM will fail to start. Settings → Virtualization says how to put it back.")
-                            color: Theme.red; wrapMode: Text.Wrap
-                            font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
-                        }
+                        Field { id: cIso; label: I18n.t("Installation ISO (optional)"); pick: "file"; pickKind: "iso"
+                                placeholder: Quickshell.env("HOME") + "/…/linux.iso" }
 
-                        Text {
+                        // En estrecho se apilan; en ancho van en fila.
+                        GridLayout {
                             Layout.fillWidth: true
-                            text: I18n.t("Firmware"); color: Theme.subtext0
-                            font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
-                        }
-                        Segmented {
-                            id: cFw
-                            Layout.fillWidth: true
-                            //  Windows 11 NO admite BIOS: exige UEFI con arranque
-                            //  seguro además del TPM. Se muestra fijado en UEFI y
-                            //  Vm.domainXml lo impone igualmente, para que no
-                            //  dependa de que el selector esté sincronizado.
-                            value: cOs.value === "win11" ? "uefi" : "bios"
-                            options: [ { key: "bios", label: "BIOS" }, { key: "uefi", label: "UEFI" } ]
-                            onPicked: function(k) { if (cOs.value !== "win11") cFw.value = k; }
-                        }
-                        Text {
-                            Layout.fillWidth: true
-                            visible: cOs.value === "win11"
-                            text: I18n.t("Windows 11 requires UEFI, so the firmware is fixed here.")
-                            color: Theme.subtext0; wrapMode: Text.Wrap
-                            font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
-                        }
-                        Text {
-                            Layout.fillWidth: true
-                            visible: cFw.value === "uefi" && Vm.detected && !Vm.has.uefi
-                            text: I18n.t("This host does not report UEFI firmware support; the VM may fail to start.")
-                            color: Theme.yellow; wrapMode: Text.Wrap
-                            font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
+                            columns: createCol.width < 380 ? 1 : 3
+                            columnSpacing: 8
+                            rowSpacing: 8
+                            Field { id: cMem;  label: I18n.t("Memory (MiB)"); numeric: true; text: "2048" }
+                            Field { id: cCpu;  label: I18n.t("vCPUs");        numeric: true; text: "2" }
+                            Field { id: cDisk; label: I18n.t("Disk (GiB)");   numeric: true; text: "20" }
                         }
 
                         Text {
@@ -2864,16 +3092,118 @@ FloatingWindow {
                         Segmented {
                             id: cNet
                             Layout.fillWidth: true
-                            value: "default"
-                            options: {
-                                var o = [];
-                                for (var i = 0; i < Vm.networks.length; i++)
-                                    o.push({ key: Vm.networks[i].name, label: Vm.networks[i].name });
-                                if (o.length === 0) o.push({ key: "default", label: "default (NAT)" });
-                                o.push({ key: "none", label: I18n.t("No network") });
-                                return o;
-                            }
+                            value: "nat"
+                            options: vm.nicModeOptions.slice(0, 3).concat([ { key: "none", label: I18n.t("No network") } ])
                             onPicked: function(k) { cNet.value = k; }
+                        }
+                        Note {
+                            visible: cNet.value === "bridged" && Vm.hostIfacesRead && Vm.lanState !== "ok"
+                            tone: "warn"
+                            text: vm.lanWhyNot
+                        }
+                        Note {
+                            visible: cOs.value !== "linux"
+                            text: cOs.value === "win11"
+                                  ? I18n.t("Windows 11: the disk goes on SATA and the network card is e1000e (Windows has no built-in virtio driver for either), plus a 2.0 TPM and UEFI, which its setup refuses to continue without.")
+                                  : I18n.t("Windows: the disk goes on SATA and the network card is e1000e. Windows has no built-in virtio driver for either, so with virtio the installer shows no disk and the guest gets no network.")
+                        }
+                        Text {
+                            Layout.fillWidth: true
+                            visible: (cOs.value === "win11" || cTpm.checked) && Vm.detected && !Vm.has.swtpm
+                            text: I18n.t("swtpm is missing on this computer, so the TPM cannot be emulated and the VM will fail to start. Settings → Virtualization says how to put it back.")
+                            color: Theme.red; wrapMode: Text.Wrap
+                            font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 3
+                        }
+
+                        // ---- avanzado ----
+                        Fold {
+                            title: I18n.t("Advanced")
+                            Text {
+                                text: I18n.t("Firmware"); color: Theme.subtext0
+                                font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
+                            }
+                            Segmented {
+                                id: cFw
+                                Layout.fillWidth: true
+                                //  Windows 11 NO admite BIOS: exige UEFI con arranque
+                                //  seguro además del TPM. Vm.domainXml lo impone igual.
+                                value: cOs.value === "win11" ? "uefi" : "bios"
+                                options: [ { key: "bios", label: "BIOS" }, { key: "uefi", label: "UEFI" } ]
+                                onPicked: function(k) { if (cOs.value !== "win11") cFw.value = k; }
+                            }
+                            Note {
+                                visible: cOs.value === "win11"
+                                text: I18n.t("Windows 11 requires UEFI, so the firmware is fixed here.")
+                            }
+                            Note {
+                                visible: cFw.value === "uefi" && Vm.detected && !Vm.has.uefi
+                                tone: "warn"
+                                text: I18n.t("This host does not report UEFI firmware support; the VM may fail to start.")
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 10
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: I18n.t("TPM 2.0 (emulated)"); color: Theme.subtext0
+                                    font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
+                                }
+                                Toggle {
+                                    id: cTpm
+                                    checked: cOs.value === "win11"
+                                    onToggled: function(v) { if (cOs.value !== "win11") cTpm.checked = v; }
+                                }
+                            }
+                            Text {
+                                text: I18n.t("Chipset"); color: Theme.subtext0
+                                font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
+                            }
+                            Segmented {
+                                id: cChip
+                                Layout.fillWidth: true
+                                value: "q35"
+                                options: [ { key: "q35", label: I18n.t("Q35 (modern, PCI Express)") },
+                                           { key: "pc", label: I18n.t("i440FX (old guests)") } ]
+                                onPicked: function(k) { cChip.value = k; }
+                            }
+                            Text {
+                                text: I18n.t("Disk bus"); color: Theme.subtext0
+                                font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
+                            }
+                            Segmented {
+                                id: cBus
+                                Layout.fillWidth: true
+                                value: "auto"
+                                options: [ { key: "auto", label: I18n.t("Automatic") }, { key: "virtio", label: "virtio" },
+                                           { key: "sata", label: "SATA" }, { key: "scsi", label: "virtio-SCSI" }, { key: "ide", label: "IDE" } ]
+                                onPicked: function(k) { cBus.value = k; }
+                            }
+                            Text {
+                                text: I18n.t("Network card model"); color: Theme.subtext0
+                                font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
+                            }
+                            Segmented {
+                                id: cNicModel
+                                Layout.fillWidth: true
+                                value: "auto"
+                                options: [ { key: "auto", label: I18n.t("Automatic") }, { key: "virtio", label: "virtio-net" },
+                                           { key: "e1000e", label: "e1000e" }, { key: "rtl8139", label: "rtl8139" } ]
+                                onPicked: function(k) { cNicModel.value = k; }
+                            }
+                            Text {
+                                visible: cNetOther.options.length > 0
+                                text: I18n.t("Or another libvirt network"); color: Theme.subtext0
+                                font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 2
+                            }
+                            Segmented {
+                                id: cNetOther
+                                Layout.fillWidth: true
+                                visible: options.length > 0
+                                value: cNet.value.indexOf("net:") === 0 ? cNet.value.slice(4) : ""
+                                options: Vm.networks.filter(function(n) { return n.name !== "default" && n.name !== Vm.lanNet; })
+                                             .map(function(n) { return { key: n.name, label: n.name }; })
+                                onPicked: function(k) { cNet.value = "net:" + k; }
+                            }
                         }
 
                         Flow {
@@ -2886,8 +3216,10 @@ FloatingWindow {
                                 tint: Theme.accent
                                 enabled: !Vm.busy && cName.text !== "" && cName.valid
                                          && cMem.text !== "" && cCpu.text !== "" && cDisk.text !== ""
+                                         && (cNet.value !== "bridged" || Vm.lanState === "ok")
                                 onClicked: {
                                     vm.newName = cName.text;
+                                    var nm = cNet.value;
                                     Vm.createVm({
                                         name: cName.text,
                                         memMib: parseInt(cMem.text, 10),
@@ -2896,7 +3228,12 @@ FloatingWindow {
                                         iso: cIso.text.trim(),
                                         firmware: cFw.value,
                                         osType: cOs.value,
-                                        network: cNet.value
+                                        netMode: nm.indexOf("net:") === 0 ? "network" : nm,
+                                        network: nm.indexOf("net:") === 0 ? nm.slice(4) : (nm === "none" ? "none" : "default"),
+                                        machine: cChip.value,
+                                        bus: cBus.value === "auto" ? "" : cBus.value,
+                                        nicModel: cNicModel.value === "auto" ? "" : cNicModel.value,
+                                        tpm: cTpm.checked
                                     });
                                 }
                             }

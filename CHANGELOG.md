@@ -10,6 +10,22 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
 
 ### Changed
 
+- **VM manager reorganized, nothing removed.** A summary card (state, OS,
+  RAM, CPU, disk, network) with Start/Resume, Pause, Shut down and the
+  display as main buttons; Force off, Hard reset, the text console and
+  Start with 3D in a quieter row. Sections like VirtualBox's — General,
+  System, Display, Storage, Network, Ports and USB, Shared folders,
+  Snapshots — each with the basics first and an "Advanced options" fold
+  (CPU topology, firmware, boot order and TPM; storage controllers; network
+  card model, MAC, IPs). Host networks moved to a header button. Expert mode
+  (remembered) opens every fold and shows the VM's libvirt XML — editable,
+  refused if its name or UUID changes — and the QEMU command line. The
+  creation wizard asks name, OS, ISO, RAM, CPU, disk and network (NAT by
+  default); "Advanced" has firmware, TPM, chipset (Q35/i440FX), disk bus
+  and network card model. The guest OS is recorded in the VM's metadata for
+  the summary. Fixed: after creating a VM its tabs showed the previously
+  selected VM's hardware.
+
 - **VM networking, phase 1: Bridged and Private NAT with port forwarding,
   without touching anything.** Each adapter now has a mode: NAT (default),
   Bridged or Private NAT + port forwarding (or any other libvirt network).

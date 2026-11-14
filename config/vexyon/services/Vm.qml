@@ -1036,6 +1036,66 @@ Singleton {
             root.addNic(name, mode === "nat" ? "default" : mode, model);
         }
     }
+    // ---- modo experto: XML de libvirt y línea de QEMU ----------------------
+    //  Se leen al abrir el bloque experto (una vez, no se vigilan). El XML es
+    //  la definición guardada (--inactive), la que se edita; la línea de QEMU
+    //  es la que libvirt generaría para arrancarla (domxml-to-native).
+    property string expertXml: ""
+    property string expertQemu: ""
+    property string expertOf: ""
+    //  base64 de un texto en UTF-8. (Qt.btoa(string) está obsoleto en Qt 6 y
+    //  no da el base64 de la web: el XML llegaba roto a `base64 -d`.)
+    function b64utf8(str) {
+        var bin = unescape(encodeURIComponent(String(str)));
+        var tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        var out = "";
+        for (var i = 0; i < bin.length; i += 3) {
+            var a = bin.charCodeAt(i), b = bin.charCodeAt(i + 1), c = bin.charCodeAt(i + 2);
+            var n = (a << 16) | ((isNaN(b) ? 0 : b) << 8) | (isNaN(c) ? 0 : c);
+            out += tbl.charAt((n >> 18) & 63) + tbl.charAt((n >> 12) & 63)
+                 + (isNaN(b) ? "=" : tbl.charAt((n >> 6) & 63))
+                 + (isNaN(c) ? "=" : tbl.charAt(n & 63));
+        }
+        return out;
+    }
+    property bool expertQemuBusy: false
+    function loadExpert(name) {
+        if (!root.enabled || !name) return;
+        root.expertOf = name;
+        expertProc.command = ["bash", "-c", root.sh + "$V dumpxml --inactive " + q(name) + " 2>&1"];
+        expertProc.running = true;
+        //  Aparte y con límite: libvirt puede tardar en generarla (prepara las
+        //  redes del dominio, macvtap incluido) y el XML no tiene que esperarla.
+        root.expertQemu = "";
+        root.expertQemuBusy = true;
+        qemuProc.command = ["bash", "-c", root.sh +
+            "timeout 30 $V domxml-to-native qemu-argv --domain " + q(name) + " 2>&1 || " +
+            "echo " + q(I18n.t("libvirt did not produce the command line in time.")) ];
+        qemuProc.running = true;
+    }
+    //  Guardar un XML editado a mano. Se comprueba que sigue siendo ESTA VM
+    //  (mismo <name> y mismo <uuid>): un `define` con otro nombre crearía otra
+    //  VM en vez de cambiar esta. libvirt valida el resto y su error se ve.
+    function applyXml(name, xml) {
+        var b64 = root.b64utf8(xml);
+        root.run("xml-edit",
+            "T=$(mktemp) || exit 1; trap 'rm -f \"$T\"' EXIT; printf '%s' " + q(b64) + " | base64 -d > \"$T\" || exit 1; " +
+            "U=$($V domuuid " + q(name) + " 2>/dev/null); " +
+            "grep -q \"<name>\"" + q(root.xmlEsc(name)) + "\"</name>\" \"$T\" || { echo " + q(I18n.t("The XML must keep this VM's <name>.")) + " >&2; exit 1; }; " +
+            "{ ! grep -q '<uuid>' \"$T\" || grep -q \"<uuid>$U</uuid>\" \"$T\"; } || { echo " + q(I18n.t("The XML must keep this VM's <uuid>.")) + " >&2; exit 1; }; " +
+            "$V define \"$T\" >/dev/null");
+    }
+    Process {
+        id: expertProc
+        stdout: StdioCollector { onStreamFinished: root.expertXml = this.text }
+    }
+    Process {
+        id: qemuProc
+        stdout: StdioCollector {
+            onStreamFinished: { root.expertQemu = this.text.trim(); root.expertQemuBusy = false; }
+        }
+    }
+
     //  Leer las tarjetas del anfitrión (y sobre cuál está `vexyon-lan`). Solo
     //  lectura de /sys y una ruta: se pide al abrir la sección de red.
     function loadHostIfaces() {
@@ -1807,7 +1867,7 @@ Singleton {
               "$V pool-build default >/dev/null 2>&1; $V pool-autostart default >/dev/null 2>&1; }; " +
             "$V pool-start default >/dev/null 2>&1; " +
             // red por defecto, solo si la VM la pide
-            (o.network === "none" ? "" :
+            (o.network === "none" || o.netMode === "private" || o.netMode === "bridged" ? "" :
               "$V net-info " + q(o.network) + " >/dev/null 2>&1 && " +
               "{ $V net-start " + q(o.network) + " >/dev/null 2>&1; $V net-autostart " + q(o.network) + " >/dev/null 2>&1; }; ") +
             // disco
@@ -1878,6 +1938,19 @@ Singleton {
     //  de crear nada. Se acierta con los nombres que reparte Microsoft
     //  ("Win11_25H2_Spanish_x64_v2.iso", "SERVER_EVAL_x64FRE_es-es.iso") sin
     //  leer un solo byte del fichero.
+    //  Etiqueta del sistema del invitado para el resumen (de @@OS).
+    function osLabel(os) {
+        var o = String(os || "");
+        if (o === "") return "";
+        if (o === "linux") return "Linux";
+        if (o === "windows") return "Windows";
+        if (o === "win11") return "Windows 11";
+        //  id de libosinfo: http://microsoft.com/win/11, http://debian.org/debian/12…
+        var m = o.match(/microsoft\.com\/win\/([^\/]+)/);
+        if (m) return "Windows " + m[1];
+        var parts = o.replace(/^https?:\/\//, "").split("/");
+        return parts.length >= 3 ? parts[1] + " " + parts[2] : o;
+    }
     function guessOsType(iso) {
         var f = String(iso || "").toLowerCase().split("/").pop();
         if (f === "") return "linux";
@@ -1903,11 +1976,16 @@ Singleton {
         lines.push("  <memory unit='MiB'>" + mem + "</memory>");
         lines.push("  <currentMemory unit='MiB'>" + mem + "</currentMemory>");
         lines.push("  <vcpu>" + Math.max(1, o.vcpus) + "</vcpu>");
+        //  Qué sistema es, para el resumen del gestor (libvirt guarda
+        //  <metadata> tal cual y no lo interpreta).
+        lines.push("  <metadata><vexyon:vm xmlns:vexyon='https://github.com/vexyon/vm' os='" + root.xmlEsc(osType) + "'/></metadata>");
         // firmware='efi' = autoselección por los descriptores JSON que trae
         // QEMU. Es la razón por la que NixOS 26.05 pudo retirar el submódulo
         // virtualisation.libvirtd.qemu.ovmf: ya no hay que declarar rutas.
         lines.push("  <os" + (uefi ? " firmware='efi'" : "") + ">");
-        lines.push("    <type arch='x86_64' machine='q35'>hvm</type>");
+        //  Chipset: q35 (PCI Express, el de siempre) o i440fx para invitados
+        //  viejos (Opciones avanzadas del asistente).
+        lines.push("    <type arch='x86_64' machine='" + (o.machine === "pc" ? "pc" : "q35") + "'>hvm</type>");
         if (o.iso && o.iso !== "") lines.push("    <boot dev='cdrom'/>");
         lines.push("    <boot dev='hd'/>");
         lines.push("  </os>");
@@ -1945,11 +2023,20 @@ Singleton {
             lines.push("      <readonly/>");
             lines.push("    </disk>");
         }
-        if (o.network && o.network !== "none") {
+        //  virtio-net SOLO para invitados con driver en caja. Ver osNicModel().
+        var nicModel = o.nicModel || root.osNicModel(osType);
+        if (o.netMode === "private") {
+            //  NAT privada (passt): ni Docker ni el cortafuegos la tocan.
+            lines.push("    <interface type='user'>");
+            lines.push("      <model type='" + root.xmlEsc(nicModel) + "'/>");
+            lines.push("      <backend type='passt'/>");
+            lines.push("    </interface>");
+        } else if (o.network && o.network !== "none") {
+            //  Puente = la red `vexyon-lan`, que se asegura al arrancar (_netsUp).
+            var net = o.netMode === "bridged" ? root.lanNet : o.network;
             lines.push("    <interface type='network'>");
-            lines.push("      <source network='" + root.xmlEsc(o.network) + "'/>");
-            //  virtio-net SOLO para invitados con driver en caja. Ver osNicModel().
-            lines.push("      <model type='" + root.osNicModel(osType) + "'/>");
+            lines.push("      <source network='" + root.xmlEsc(net) + "'/>");
+            lines.push("      <model type='" + root.xmlEsc(nicModel) + "'/>");
             lines.push("    </interface>");
         }
         // serie + consola: sin esto `virsh console` no tiene a qué conectarse
@@ -1978,7 +2065,7 @@ Singleton {
         //  TPM 2.0 emulado por swtpm, SOLO para el invitado que lo exige. El
         //  respaldo `emulator` lo levanta libvirtd por VM; swtpm no tiene que
         //  estar en el PATH del usuario (en NixOS systemd se lo da al servicio).
-        if (root.osNeedsTpm(osType)) {
+        if (root.osNeedsTpm(osType) || o.tpm === true) {
             lines.push("    <tpm model='tpm-crb'>");
             lines.push("      <backend type='emulator' version='2.0'/>");
             lines.push("    </tpm>");
@@ -2362,7 +2449,7 @@ Singleton {
     function parseDetail(text) {
         var d = { disks: [], nics: [], ctrls: [], video: null, cpu: null, boot: [],
                   chans: [], fs: [], usbdevs: [], graphics: null, redir: 0,
-                  desc: "", title: "", firmware: "bios", sound: "", tpm: null };
+                  desc: "", title: "", firmware: "bios", sound: "", tpm: null, os: "" };
         var sizes = {};
         var lines = text.split("\n");
         for (var i = 0; i < lines.length; i++) {
@@ -2405,6 +2492,7 @@ Singleton {
             case "@@SOUND": d.sound = f[1] || ""; break;
             case "@@REDIR": d.redir = parseInt(f[1], 10) || 0; break;
             case "@@DESC":  d.desc = f[1] || ""; break;
+            case "@@OS":    d.os = f[1] || ""; break;
             case "@@TITLE": d.title = f[1] || ""; break;
             }
         }
