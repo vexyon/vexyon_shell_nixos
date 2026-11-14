@@ -258,6 +258,18 @@ in
       '';
     };
 
+    vm.guestTools = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Ship the VM guest tools disc (the virtio-win ISO, about 750 MB) at
+        /run/current-system/sw/share/vexyon/virtio-win.iso, so the VM manager
+        can insert it into Windows guests: virtio drivers, the QXL display
+        driver, the SPICE agent and the QEMU guest agent, all installed by its
+        virtio-win-guest-tools.exe. Only with libvirt enabled.
+      '';
+    };
+
     gpu.pin = lib.mkOption {
       type = lib.types.bool;
       default = true;
@@ -332,6 +344,17 @@ in
     ])
     # La ventana de las VMs. Solo con libvirt: sin él no hay nada que mirar.
     ++ lib.optional libvirtOn pkgs.virt-viewer
+    # Las «Guest Additions» de Windows: el ISO de virtio-win TAL CUAL (el
+    # `src` de pkgs.virtio-win: la descarga oficial de Fedora con su hash, que
+    # además sirve la caché binaria), en una ruta fija que el gestor de VMs
+    # busca. virtio-win-guest-tools.exe trae drivers virtio, QXL, el agente
+    # SPICE y qemu-guest-agent (manifiesto del instalador, 0.1.285).
+    ++ lib.optional (libvirtOn && cfg.vm.guestTools) (
+      pkgs.runCommand "vexyon-virtio-win-iso" { } ''
+        mkdir -p $out/share/vexyon
+        ln -s ${pkgs.virtio-win.src} $out/share/vexyon/virtio-win.iso
+      ''
+    )
     # Los temas de cursor. Tienen que estar en systemPackages y no solo en el
     # entorno del usuario: en NixOS no hay /usr/share/icons y XCursor resuelve
     # los temas por /run/current-system/sw/share/icons, que es también donde

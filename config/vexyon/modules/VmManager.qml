@@ -1940,7 +1940,7 @@ Fold {
                                         //      cargar en "Cargar controlador", por mucho que se
                                         //      abra esa pantalla. SATA no necesita nada.
                                         Note {
-                                            text: I18n.t("Windows has no built-in driver for virtio or virtio-SCSI disks. Put the system disk on SATA and the installer sees it with no driver at all. To use virtio you must first download the separate virtio-win ISO, add it as a second optical drive here, and load vioscsi (or viostor) from it in the installer's \"Load driver\" screen — it is not on the Windows ISO.")
+                                            text: I18n.t("Windows has no built-in driver for virtio or virtio-SCSI disks. Put the system disk on SATA and the installer sees it with no driver at all. For virtio, the guest tools disc (Display → Guest tools; already in a drive on Windows VMs made here) has the driver: in the installer's \"Load driver\" screen pick viostor (or vioscsi) from it.")
                                         }
 }
                                 }
@@ -2368,27 +2368,55 @@ Fold {
                                     visible: vm.tab === "display"
                                     spacing: 10
 
+                                    // ---- «Guest Additions» ----
+                                    //  Windows: TODO va en virtio-win-guest-tools.exe del ISO de
+                                    //  virtio-win (drivers virtio, QXL, agente SPICE 0.10.5 y
+                                    //  qemu-guest-agent: leído del manifiesto de su instalador).
+                                    //  El ISO lo instala el módulo / el instalador; aquí solo se mete.
+                                    Sec { text: I18n.t("GUEST TOOLS") }
+                                    Note {
+                                        text: I18n.t("Windows: open the guest tools disc inside the VM and run virtio-win-guest-tools.exe. It installs the virtio drivers (disk, network, display), the SPICE agent (shared clipboard, auto-resize, files dropped on the window) and the QEMU guest agent. New Windows VMs made here already have the disc in a drive.")
+                                    }
+                                    Flow {
+                                        Layout.fillWidth: true
+                                        spacing: 6
+                                        ActBtn {
+                                            glyph: Icons.download
+                                            label: I18n.t("Insert the guest tools disc"); tint: Theme.teal
+                                            enabled: !Vm.busy && Vm.guestToolsIso !== "" && !Vm.guestToolsInserted
+                                            onClicked: Vm.insertGuestTools(vm.selected)
+                                        }
+                                    }
+                                    Note {
+                                        visible: Vm.guestToolsInserted
+                                        text: I18n.t("The guest tools disc is already in this VM's CD drive.")
+                                    }
+                                    Note {
+                                        visible: Vm.detected && Vm.guestToolsIso === ""
+                                        tone: "warn"
+                                        text: I18n.t("The guest tools disc (virtio-win) is missing on this computer. Re-run Vexyon's installer (Arch) or rebuild (NixOS) to put it back.")
+                                    }
+                                    Note {
+                                        text: I18n.t("Linux: install spice-vdagent (clipboard, auto-resize, dropped files) and qemu-guest-agent inside the guest; desktop distributions usually include them.")
+                                    }
+                                    Note {
+                                        text: I18n.t("Debian / Ubuntu:") + "  sudo apt install spice-vdagent qemu-guest-agent"
+                                    }
+                                    Note {
+                                        text: I18n.t("Arch / Ryoku Linux:") + "  sudo pacman -S spice-vdagent qemu-guest-agent"
+                                              + "  ·  sudo systemctl enable --now spice-vdagentd qemu-guest-agent"
+                                    }
+                                    Note {
+                                        text: I18n.t("Fedora / RHEL:") + "  sudo dnf install spice-vdagent qemu-guest-agent"
+                                    }
+
                                     Sec { text: I18n.t("CLIPBOARD AND AUTO-RESIZE") }
                                     RowLayout {
                                         Layout.fillWidth: true
                                         spacing: 10
                                         Text {
                                             Layout.fillWidth: true
-                                            text: I18n.t("SPICE guest agent channel")
-                                            color: Theme.text; wrapMode: Text.Wrap
-                                            font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1
-                                        }
-                                        Toggle {
-                                            checked: Vm.hasSpiceAgent
-                                            onToggled: function(v) { Vm.setSpiceAgent(vm.selected, v); }
-                                        }
-                                    }
-                                    RowLayout {
-                                        Layout.fillWidth: true
-                                        spacing: 10
-                                        Text {
-                                            Layout.fillWidth: true
-                                            text: I18n.t("Share clipboard with the guest")
+                                            text: I18n.t("Share clipboard with the guest (text and images)")
                                             color: Theme.text; wrapMode: Text.Wrap
                                             font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1
                                         }
@@ -2397,67 +2425,36 @@ Fold {
                                             onToggled: function(v) { Vm.setClipboard(vm.selected, v); }
                                         }
                                     }
-                                    //  ⚠️ ESTO NO ES UN FALLO DEL SHELL Y NO SE VA A
-                                    //  FALSEAR. Que la pantalla del invitado siga al
-                                    //  tamaño de la ventana lo hace el AGENTE DE DENTRO
-                                    //  del invitado, no el anfitrión: virt-viewer pide el
-                                    //  cambio de resolución por el canal
-                                    //  `com.redhat.spice.0` y quien lo atiende y llama al
-                                    //  servidor gráfico es spice-vdagent. Sin agente no
-                                    //  hay a quién pedírselo y la imagen se queda a su
-                                    //  resolución fija con bandas negras.
-                                    //
-                                    //  Por eso Ubuntu redimensiona y Arch, Ryoku y Windows
-                                    //  no: Ubuntu Desktop trae spice-vdagent instalado de
-                                    //  serie, los otros no. Es la ÚNICA diferencia — el
-                                    //  lado del anfitrión (SPICE, el canal, `virt-viewer
-                                    //  --auto-resize=always`) ya está puesto en las cuatro.
-                                    //
-                                    //  Lo único que puede hacer el shell es DECIR QUÉ
-                                    //  FALTA, con el nombre exacto del paquete de cada
-                                    //  invitado, en vez de dejarlo indescifrable.
                                     Note {
                                         tone: Vm.hasSpiceAgent ? "info" : "warn"
-                                        text: I18n.t("Needs spice-vdagent installed and running INSIDE the guest. Without it neither the shared clipboard nor the display resizing to fill the window can work — the host side alone is not enough.")
-                                    }
-                                    //  ⚠️ SON DOS CONDICIONES, NO UNA, y las dos hacen
-                                    //  falta. Se midieron por separado en esta torre:
-                                    //
-                                    //   * sin agente (Ryoku en vivo): el canal sale
-                                    //     state='disconnected' y no pasa nada;
-                                    //   * con agente pero con qxl (Ubuntu 26.04 en vivo):
-                                    //     el canal sale 'connected', el anfitrión manda
-                                    //     "monitor #0: 2536x1325" y el invitado NO lo
-                                    //     aplica: sigue en 1024x768;
-                                    //   * con agente y virtio-gpu: 2536x1325, o sea la
-                                    //     ventana entera.
-                                    //
-                                    //  Y por eso el Ubuntu del usuario ya redimensionaba:
-                                    //  cumple las dos (trae spice-vdagent y su dominio ya
-                                    //  venía con virtio-gpu).
-                                    Note {
-                                        text: I18n.t("Two things are needed and both are guest-side or hardware-side: the agent below, and a virtio-gpu display for Linux guests (Devices → Display). With QXL the guest never applies the resize, even with the agent running.")
+                                        text: I18n.t("Needs the SPICE agent running INSIDE the guest (the guest tools above). Without it neither the shared clipboard nor the display resizing to fill the window can work — the host side alone is not enough.")
                                     }
                                     Note {
-                                        text: I18n.t("Ubuntu Desktop ships the agent and its VM already used virtio-gpu, which is why only Ubuntu guests resized out of the box. New VMs made here now pick the right display for the guest automatically.")
+                                        text: I18n.t("Auto-resize also needs the right display for the guest: virtio-gpu for Linux, QXL for Windows (above). New VMs made here pick it automatically.")
                                     }
-                                    Note {
-                                        text: I18n.t("Debian / Ubuntu:") + "  sudo apt install spice-vdagent"
-                                    }
-                                    Note {
-                                        text: I18n.t("Arch / Ryoku Linux:") + "  sudo pacman -S spice-vdagent"
-                                              + "  ·  sudo systemctl enable --now spice-vdagentd"
-                                    }
-                                    Note {
-                                        text: I18n.t("Fedora / RHEL:") + "  sudo dnf install spice-vdagent"
-                                    }
-                                    //  En Windows el equivalente NO está en virtio-win: va
-                                    //  en spice-guest-tools, que es otra descarga distinta
-                                    //  y hasta ahora no se nombraba en ninguna parte de la
-                                    //  ventana. De ahí que en Windows no hubiera ni pista
-                                    //  de qué instalar.
-                                    Note {
-                                        text: I18n.t("Windows: install spice-guest-tools inside the guest. It is a separate download from the virtio-win ISO used for the disk and network drivers, and it also brings the QXL display driver.")
+                                    Fold {
+                                        Repeater {
+                                            model: [
+                                                { l: I18n.t("SPICE agent channel"), on: Vm.hasSpiceAgent, f: function(v) { Vm.setSpiceAgent(vm.selected, v); } },
+                                                { l: I18n.t("QEMU guest agent channel (IP addresses, clean shutdown)"), on: Vm.hasGuestAgent, f: function(v) { Vm.setGuestAgent(vm.selected, v); } },
+                                                { l: I18n.t("Drop files on the VM window to copy them in"), on: Vm.fileTransferOn, f: function(v) { Vm.setFileTransfer(vm.selected, v); } }
+                                            ]
+                                            delegate: RowLayout {
+                                                required property var modelData
+                                                Layout.fillWidth: true
+                                                spacing: 10
+                                                Text {
+                                                    Layout.fillWidth: true
+                                                    text: modelData.l
+                                                    color: Theme.text; wrapMode: Text.Wrap
+                                                    font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1
+                                                }
+                                                Toggle {
+                                                    checked: modelData.on
+                                                    onToggled: function(v) { modelData.f(v); }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 ColumnLayout {
@@ -2535,6 +2532,33 @@ Fold {
                                     Layout.fillWidth: true
                                     visible: vm.tab === "shared"
                                     spacing: 10
+
+                                    Sec { text: I18n.t("FILES BETWEEN THIS COMPUTER AND THE VM") }
+                                    Note {
+                                        tone: "warn"
+                                        text: I18n.t("Copying files with Ctrl+C in your file manager and Ctrl+V inside the VM (or back) is not possible: the SPICE clipboard carries text and images only. That is a limit of SPICE, not something to switch on.")
+                                    }
+                                    Note {
+                                        text: I18n.t("What works: drag files from your file manager onto the VM's display window to copy them in (needs the SPICE agent); a shared folder with virtiofs below (Linux; Windows needs WinFsp and the virtio-win viofs service); or a folder shared from the display window (WebDAV, below).")
+                                    }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 10
+                                        Text {
+                                            Layout.fillWidth: true
+                                            text: I18n.t("Share a folder from the display window (WebDAV)")
+                                            color: Theme.text; wrapMode: Text.Wrap
+                                            font.family: Theme.fontFamily; font.pixelSize: Theme.fontSize - 1
+                                        }
+                                        Toggle {
+                                            checked: Vm.hasWebdav
+                                            onToggled: function(v) { Vm.setWebdav(vm.selected, v); }
+                                        }
+                                    }
+                                    Note {
+                                        visible: Vm.hasWebdav
+                                        text: I18n.t("In the display window: menu → Preferences → Share folder. Inside the guest, spice-webdavd must be installed (Windows: its installer from spice-space.org; Linux: the spice-webdavd package); the folder then appears as a network drive.")
+                                    }
 
                                     Sec { text: I18n.t("SHARED FOLDERS") }
                                     Note {

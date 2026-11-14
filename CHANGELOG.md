@@ -10,6 +10,22 @@ and [vexyon_shell_nixos](https://github.com/vexyon/vexyon_shell_nixos)
 
 ### Changed
 
+- **VM guest tools without manual steps (phase 2).** The guest tools disc
+  (virtio-win 0.1.285: virtio drivers, QXL display driver, SPICE agent and
+  QEMU guest agent in one `virtio-win-guest-tools.exe`) now ships with
+  Vexyon: NixOS through the new option `services.vexyon.vm.guestTools`
+  (default on), Arch through the installer, which downloads the official
+  ISO and checks its SHA-256. Windows VMs are born with it in a second CD
+  drive; any VM gets it with one button in Display → Guest tools, which
+  also names the two Linux packages. New VMs get the QEMU guest agent and
+  WebDAV channels; switches for the agent channels and file dropping are in
+  the Display section's advanced options. The clipboard says what it
+  carries (text and images), and Shared folders says plainly that SPICE
+  cannot copy files with Ctrl+C/Ctrl+V and what works instead: dragging
+  onto the VM window, virtiofs folders (Linux), or a WebDAV share from the
+  VM window. Fixed: a VM whose definition libvirt refused left its new disk
+  behind, so a retry with the same name failed.
+
 - **VM manager reorganized, nothing removed.** A summary card (state, OS,
   RAM, CPU, disk, network) with Start/Resume, Pause, Shut down and the
   display as main buttons; Force off, Hard reset, the text console and

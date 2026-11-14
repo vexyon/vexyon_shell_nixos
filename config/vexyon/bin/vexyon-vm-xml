@@ -163,8 +163,10 @@ def cmd_info(root, argv):
 
     for g in dev.findall("graphics"):
         cb = g.find("clipboard")
+        ft = g.find("filetransfer")
         rec("@@GRAPHICS", g.get("type", ""),
-            cb.get("copypaste", "") if cb is not None else "")
+            cb.get("copypaste", "") if cb is not None else "",
+            ft.get("enable", "yes") if ft is not None else "yes")
 
     # TPM: la UI necesita saber si HAY y de qué versión. Windows 11 se planta
     # en "El equipo debe admitir TPM 2.0" si no hay ninguno, y desde el XML del
@@ -306,6 +308,67 @@ def cmd_spice_agent(root, argv):
         ET.SubElement(ch, "target", {"type": "virtio", "name": SPICE_AGENT})
     elif not on and have is not None:
         dev.remove(have)
+    return root
+
+
+GUEST_AGENT = "org.qemu.guest_agent.0"
+WEBDAV = "org.spice-space.webdav.0"
+
+
+def find_channel(dev, name):
+    for ch in dev.findall("channel"):
+        t = ch.find("target")
+        if t is not None and t.get("name") == name:
+            return ch
+    return None
+
+
+def cmd_guest_agent(root, argv):
+    """guest-agent on|off — el canal de qemu-guest-agent del INVITADO.
+
+    Con él (y el agente instalado dentro: en Windows lo trae
+    virtio-win-guest-tools.exe) libvirt sabe las IP de la VM aunque esté en
+    puente o en NAT privada, y «Apagar» le pide al sistema que se apague."""
+    on = argv[0] == "on"
+    dev = devices(root)
+    have = find_channel(dev, GUEST_AGENT)
+    if on and have is None:
+        ch = ET.SubElement(dev, "channel", {"type": "unix"})
+        ET.SubElement(ch, "target", {"type": "virtio", "name": GUEST_AGENT})
+    elif not on and have is not None:
+        dev.remove(have)
+    return root
+
+
+def cmd_webdav(root, argv):
+    """webdav on|off — compartir una carpeta DESDE LA VENTANA de la VM.
+
+    virt-viewer/remote-viewer comparte una carpeta de este equipo por WebDAV
+    a través de este canal SPICE; dentro hace falta spice-webdavd (Windows:
+    el instalador de spice-webdavd; Linux: el paquete spice-webdavd)."""
+    on = argv[0] == "on"
+    dev = devices(root)
+    have = find_channel(dev, WEBDAV)
+    if on and have is None:
+        ch = ET.SubElement(dev, "channel", {"type": "spiceport"})
+        ET.SubElement(ch, "source", {"channel": WEBDAV})
+        ET.SubElement(ch, "target", {"type": "virtio", "name": WEBDAV})
+    elif not on and have is not None:
+        dev.remove(have)
+    return root
+
+
+def cmd_filetransfer(root, argv):
+    """filetransfer on|off — arrastrar ficheros de este equipo a la ventana de
+    la VM (SPICE; el agente del invitado los guarda dentro)."""
+    on = argv[0] == "on"
+    for g in devices(root).findall("graphics"):
+        if g.get("type") != "spice":
+            continue
+        ft = g.find("filetransfer")
+        if ft is None:
+            ft = ET.SubElement(g, "filetransfer")
+        ft.set("enable", "yes" if on else "no")
     return root
 
 
@@ -854,6 +917,9 @@ COMMANDS = {
     "nic-user": cmd_nic_user,
     "pf-set": cmd_pf_set,
     "nic-mac": cmd_nic_mac,
+    "guest-agent": cmd_guest_agent,
+    "webdav": cmd_webdav,
+    "filetransfer": cmd_filetransfer,
     "firmware": cmd_firmware,
     "rename": cmd_rename,
     "clone": cmd_clone,

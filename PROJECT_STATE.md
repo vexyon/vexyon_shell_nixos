@@ -20,6 +20,115 @@ VEXYON OUT-OF-THE-BOX POLICY Every Vexyon feature must ship together with all re
 
 PERMANENT POLICY: If Vexyon's installation changes, its GitHub README.md MUST be updated in the same development task. No exceptions.
 
+## Session (VM manager, phase 2): guest tools without manual steps; clipboard and files said as they are
+
+### Why
+
+The owner wants VirtualBox-style "Guest Additions" with no manual steps:
+the virtio-win drivers and SPICE tools for Windows, spice-vdagent and
+qemu-guest-agent for Linux, a shared clipboard with text and images, and an
+honest answer for files (SPICE cannot copy files with Ctrl+C/Ctrl+V, so do
+not hide it: offer dragging onto the window, virtiofs and WebDAV, and say
+which is which). On Arch virtio-win is only in the AUR, so the installer has
+to fetch it with a checksum.
+
+### What changed
+
+- **The guest tools disc ships with Vexyon** (the virtio-win ISO, 0.1.285-1,
+  ~750 MB). Its `virtio-win-guest-tools.exe` bundles — read from the bundle
+  manifest inside this ISO, not assumed — the virtio drivers, the QXL display
+  driver (spice-driver 0.21.2), the SPICE guest agent 0.10.5 and qemu-ga
+  110.0.2: one installer for everything Windows needs.
+  - NixOS (`nix/module.nix`): new option `services.vexyon.vm.guestTools`
+    (default `true`, only with libvirt on) puts `pkgs.virtio-win.src` — the
+    official Fedora download with nixpkgs' hash — at
+    `/run/current-system/sw/share/vexyon/virtio-win.iso`. Only the ISO, not
+    the unpacked `virtio-win` package. It is substituted from
+    cache.nixos.org (checked with `nix path-info --store
+    https://cache.nixos.org`).
+  - Arch (`install.sh`): downloads the same file from fedorapeople.org,
+    checks the SHA-256 nixpkgs pins (`e14cf2b9…6331`), installs it as
+    `/usr/local/share/vexyon/virtio-win.iso` (root, 0644; not
+    `/usr/share/virtio-win`, which an AUR package would own). Skipped when
+    the right file is already there; downloaded to `/var/tmp` (not the
+    tmpfs `/tmp`); a failed download or checksum installs nothing and the VM
+    manager says the disc is missing and to re-run the installer.
+  - The VM manager also finds `/usr/share/virtio-win/virtio-win.iso` (AUR
+    and other distributions' packages).
+- **New VMs** get, besides the SPICE agent channel they already had, the
+  QEMU guest agent channel (`org.qemu.guest_agent.0`: IP addresses of
+  bridged/Private NAT VMs through `domifaddr --source agent`, clean
+  shutdown) and the SPICE WebDAV channel (`org.spice-space.webdav.0`).
+  Windows VMs are born with the guest tools disc in a second SATA CD drive.
+- **Display → Guest tools**: what to run in Windows, an "Insert the guest
+  tools disc" button (fills an empty CD drive, otherwise adds a SATA one;
+  greyed out with "already in this VM's CD drive" when it is), a warning
+  when the disc is missing on the host, and the two Linux packages with the
+  command for Debian/Ubuntu, Arch and Fedora. Advanced: switches for the
+  SPICE agent channel, the QEMU guest agent channel and file dropping
+  (`<filetransfer enable>`), so VMs made elsewhere can get them.
+- **Clipboard** says "text and images" (what the SPICE agent carries).
+- **Shared folders → Files between this computer and the VM**: a warning
+  that Ctrl+C/Ctrl+V of files is impossible with SPICE (a SPICE limit, not a
+  switch), then what does work: dragging files onto the display window,
+  virtiofs shared folders (Linux; Windows needs WinFsp and virtio-win's
+  viofs service), and sharing a folder from the display window over WebDAV
+  (switch for the channel + where to click + spice-webdavd inside).
+- `bin/vexyon-vm-xml`: `guest-agent`, `webdav`, `filetransfer` commands;
+  `info` reports file transfer.
+- **Bug fixed** (pre-existing): when libvirt refused a new VM's XML (e.g. no
+  UEFI firmware), the disk volume created a moment before stayed, and
+  retrying with the same name failed with "storage volume already exists".
+  Now that volume is deleted — only that one: `vol-create-as` fails on an
+  existing volume, so the delete is never reached for a disk that was there
+  before.
+- I18n: 18 Spanish strings added or reworded; the ones they replace removed.
+
+### Not done in this phase (and why)
+
+- **Unattended installation** (Windows `autounattend.xml`, Linux
+  cloud-init). Viable — `virt-install --unattended` / a generated answer
+  disc — but not implemented: it needs a user name and password in the
+  wizard, per-OS answer files and a test with real Windows and Linux ISOs on
+  KVM, none of which this lab has (no KVM, no Windows ISO). Left for a
+  later step rather than shipped untested.
+
+### Verified (lab: headless sway, Quickshell 0.3.2, real libvirtd 12.2, throwaway VMs)
+
+- Wizard → "vxt-win", Windows 11: defined with `<metadata … os="win11">`,
+  `firmware='efi'` (the secure EDK2 build, SMM on), TPM 2.0 CRB emulator,
+  SATA system disk `sda`, the guest tools ISO as a SATA CD-ROM `sdc`, an
+  e1000e card, QXL, and the three channels (SPICE agent, QEMU guest agent,
+  WebDAV). (Lab-only: `type='qemu'`, EDK2 descriptors and swtpm linked by
+  hand; the warnings the wizard showed before that — no swtpm, no UEFI —
+  were correct.)
+- The volume clean-up: with no UEFI firmware the define failed and no
+  `vxt-win.qcow2` was left; the next attempt went through.
+- "Insert the guest tools disc" on a running VM: saved to the definition
+  (libvirt cannot hot-add a SATA drive; the note says it applies at the next
+  start), the ISO in a SATA CD drive; then the button greyed out with the
+  "already in" note.
+- `install.sh` download step with the real URL: right checksum installs,
+  wrong checksum installs nothing. `bash -n`; `shellcheck` — only the
+  pre-existing SC2154 at the `trap` line.
+- `vexyon-vm-xml` py_compile; Spanish strings checked (0 missing); shared
+  files byte-identical (only the allowed platform files differ).
+- NixOS VM test `modules-gating` (driver built with these pins, run without
+  KVM; its system now includes the guest tools ISO): passed, "test script
+  finished in 492.35s", exit 0. Full NixOS evaluation of the test machine
+  with `services.vexyon.enable` (the ISO derivation in its closure) and
+  `nix build .#vexyon-shell`: OK. `nix-instantiate --parse nix/module.nix`:
+  OK.
+
+### Not verified
+
+- Anything inside a real guest: running `virtio-win-guest-tools.exe` in
+  Windows, the clipboard with images, dragging files onto the window, the
+  WebDAV share, qemu-guest-agent IPs. Needs a real Windows/Linux VM on KVM
+  (the owner's tower or laptop).
+- The Arch installer end to end on an Arch/CachyOS machine (the download
+  step was run on its own here).
+
 ## Session (VM manager, UI): reorganized like VirtualBox, with an expert mode — no capability removed
 
 ### Why

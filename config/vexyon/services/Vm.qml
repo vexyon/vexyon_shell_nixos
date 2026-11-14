@@ -107,6 +107,26 @@ Singleton {
             if (root.detail.chans[i].name === "com.redhat.spice.0") return true;
         return false;
     }
+    function hasChannel(n) {
+        for (var i = 0; i < root.detail.chans.length; i++)
+            if (root.detail.chans[i].name === n) return true;
+        return false;
+    }
+    readonly property bool hasGuestAgent: root.hasChannel("org.qemu.guest_agent.0")
+    readonly property bool hasWebdav: root.hasChannel("org.spice-space.webdav.0")
+    readonly property bool fileTransferOn: !!root.detail.graphics && root.detail.graphics.filetransfer !== false
+    //  ¿Ya lleva la VM seleccionada el disco de herramientas en un lector?
+    readonly property bool guestToolsInserted: {
+        if (root.guestToolsIso === "") return false;
+        for (var i = 0; i < root.detail.disks.length; i++)
+            if (root.detail.disks[i].device === "cdrom" && root.detail.disks[i].path === root.guestToolsIso) return true;
+        return false;
+    }
+    //  Las «Guest Additions»: el ISO de virtio-win (drivers virtio, driver de
+    //  pantalla QXL, agente SPICE y qemu-guest-agent para Windows, todo en
+    //  virtio-win-guest-tools.exe). Lo deja el módulo de NixOS / el instalador
+    //  de Arch; "" = no está (Ajustes → Virtualización dice cómo recuperarlo).
+    property string guestToolsIso: ""
     readonly property bool clipboardOn: root.detail.graphics
                                         && root.detail.graphics.clipboard === "yes"
 
@@ -310,6 +330,7 @@ Singleton {
     function detect() {
         if (!root.enabled) return;
         detector.running = true;
+        root.probeGuestTools();
     }
 
     // ¿Se ha leído el estado alguna vez en esta sesión? La pastilla de barra la
@@ -1244,6 +1265,32 @@ Singleton {
     }
     function setSpiceAgent(name, on) { root.run("spice-agent", root.editXml(name, "spice-agent " + (on ? "on" : "off"))); }
     function setClipboard(name, on) { root.run("clipboard", root.editXml(name, "clipboard " + (on ? "on" : "off"))); }
+    function setGuestAgent(name, on) { root.run("guest-agent", root.editXml(name, "guest-agent " + (on ? "on" : "off"))); }
+    function setWebdav(name, on) { root.run("webdav", root.editXml(name, "webdav " + (on ? "on" : "off"))); }
+    function setFileTransfer(name, on) { root.run("filetransfer", root.editXml(name, "filetransfer " + (on ? "on" : "off"))); }
+    //  Meter el disco de las herramientas: en una unidad óptica vacía si la
+    //  hay; si no, en una unidad nueva. Nada que descargar a mano.
+    function insertGuestTools(name) {
+        if (root.guestToolsIso === "") return;
+        for (var i = 0; i < root.detail.disks.length; i++) {
+            var d = root.detail.disks[i];
+            if (d.device === "cdrom" && (d.path === "" || d.path === root.guestToolsIso)) {
+                if (d.path === "") root.insertCd(name, d.target, root.guestToolsIso);
+                return;
+            }
+        }
+        root.addCdrom(name, root.guestToolsIso);
+    }
+    //  Dónde está el ISO: NixOS (módulo), Arch (install.sh), y la ruta del
+    //  paquete virtio-win de otras distribuciones / AUR.
+    Process {
+        id: gtProbe
+        command: ["bash", "-c", "for f in /run/current-system/sw/share/vexyon/virtio-win.iso " +
+                  "/usr/local/share/vexyon/virtio-win.iso /usr/share/virtio-win/virtio-win.iso; do " +
+                  "[ -r \"$f\" ] && { echo \"$f\"; break; }; done"]
+        stdout: StdioCollector { onStreamFinished: root.guestToolsIso = this.text.trim() }
+    }
+    function probeGuestTools() { if (!gtProbe.running) gtProbe.running = true; }
     function setDescription(name, text) { root.run("desc", root.editXml(name, "desc " + q(text))); }
     function addSharedFolder(name, rawPath, tag) {
         var path = root.expandPath(rawPath);
@@ -1875,7 +1922,12 @@ Singleton {
             "$V vol-create-as default " + q(o.name + ".qcow2") + " " + Math.max(1, o.diskGb) + "G --format qcow2 || exit 1; " +
             // dominio
             "t=$(mktemp) || exit 1; cat > \"$t\" <<'VEXYONXML'\n" + xml + "\nVEXYONXML\n" +
-            "$V define \"$t\"; rc=$?; rm -f \"$t\"; exit $rc");
+            // Si libvirt rechaza el XML (p. ej. no hay firmware UEFI), el disco
+            // recién creado se borra: lo acaba de crear ESTA llamada (si ya
+            // existía, vol-create-as falló arriba y nunca se llega aquí), y sin
+            // borrarlo el reintento con el mismo nombre choca con "ya existe".
+            "$V define \"$t\"; rc=$?; rm -f \"$t\"; " +
+            "[ $rc -eq 0 ] || $V vol-delete --pool default " + q(o.name + ".qcow2") + " >/dev/null 2>&1; exit $rc");
     }
 
     // ---- qué invitado se va a instalar --------------------------------------
@@ -2014,6 +2066,18 @@ Singleton {
         lines.push("    </disk>");
         // scsi necesita su controladora declarada; sata e ide las pone q35 solo.
         if (bus === "scsi") lines.push("    <controller type='scsi' model='virtio-scsi'/>");
+        //  Windows: el disco de las herramientas (virtio-win) va puesto desde
+        //  el principio — drivers para «Cargar controlador» en la instalación
+        //  y, después, virtio-win-guest-tools.exe. Sin pasos a mano.
+        var gtDev = (dev === "sda" ? "sdc" : "sdb");   // nunca choca con el disco ni con la ISO
+        if (osType !== "linux" && root.guestToolsIso !== "") {
+            lines.push("    <disk type='file' device='cdrom'>");
+            lines.push("      <driver name='qemu' type='raw'/>");
+            lines.push("      <source file='" + root.xmlEsc(root.guestToolsIso) + "'/>");
+            lines.push("      <target dev='" + gtDev + "' bus='sata'/>");
+            lines.push("      <readonly/>");
+            lines.push("    </disk>");
+        }
         if (o.iso && o.iso !== "") {
             lines.push("    <disk type='file' device='cdrom'>");
             lines.push("      <driver name='qemu' type='raw'/>");
@@ -2058,6 +2122,12 @@ Singleton {
         lines.push("    <channel type='spicevmc'>");
         lines.push("      <target type='virtio' name='com.redhat.spice.0'/>");
         lines.push("    </channel>");
+        //  qemu-guest-agent (IPs, apagado limpio) y compartir carpeta desde la
+        //  ventana de la VM (WebDAV): canales listos de fábrica; dentro solo
+        //  hace falta el agente correspondiente.
+        lines.push("    <channel type='unix'><target type='virtio' name='org.qemu.guest_agent.0'/></channel>");
+        lines.push("    <channel type='spiceport'><source channel='org.spice-space.webdav.0'/>"
+                 + "<target type='virtio' name='org.spice-space.webdav.0'/></channel>");
         // Dos canales de redirección USB por SPICE (lo que trae virt-manager
         // por defecto): permiten enchufar un USB al invitado desde el visor.
         lines.push("    <redirdev bus='usb' type='spicevmc'/>");
@@ -2487,7 +2557,7 @@ Singleton {
             case "@@CHAN":  d.chans.push({ name: f[1], type: f[2] }); break;
             case "@@FS":    d.fs.push({ tag: f[1], source: f[2], driver: f[3], mode: f[4] }); break;
             case "@@USBDEV": d.usbdevs.push({ vendor: f[1], product: f[2] }); break;
-            case "@@GRAPHICS": d.graphics = { type: f[1], clipboard: f[2] }; break;
+            case "@@GRAPHICS": d.graphics = { type: f[1], clipboard: f[2], filetransfer: f[3] !== "no" }; break;
             case "@@TPM":   d.tpm = { model: f[1], backend: f[2], version: f[3] }; break;
             case "@@SOUND": d.sound = f[1] || ""; break;
             case "@@REDIR": d.redir = parseInt(f[1], 10) || 0; break;
